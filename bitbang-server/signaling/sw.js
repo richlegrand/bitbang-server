@@ -15,14 +15,18 @@ self.addEventListener('activate', (event) => event.waitUntil(self.clients.claim(
 // Map of sessionId -> { clientId, uid, target }
 const sessions = new Map();
 
-self.addEventListener('message', (event) => {
+self.addEventListener('message', async (event) => {
     if (event.data?.type === 'setBootstrap' && event.data.sessionId) {
         const uid = event.data.uid || '';
 
-        // Remove stale sessions for the same UID (e.g. page refresh)
+        // Remove stale sessions for the same UID whose client is dead
+        // (e.g. page refresh). Preserve live sessions (other tabs).
         for (const [oldSid, oldSess] of sessions) {
             if (oldSess.uid === uid && oldSid !== event.data.sessionId) {
-                sessions.delete(oldSid);
+                const oldClient = await self.clients.get(oldSess.clientId);
+                if (!oldClient) {
+                    sessions.delete(oldSid);
+                }
             }
         }
 
