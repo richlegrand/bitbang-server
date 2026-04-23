@@ -1,0 +1,61 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <meta charset="utf-8">
+    <title>Loading...</title>
+    <style>
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+        }
+
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+            background: #fff;
+            color: #333;
+            min-height: 100vh;
+        }
+
+        #connection-ui {
+            padding: 12px 16px;
+        }
+
+        #connection-ui.debug {
+            font-family: "SF Mono", "Menlo", "Monaco", "Consolas", monospace;
+            font-size: 13px;
+            color: #333;
+        }
+
+        #connection-ui.debug .step {
+            line-height: 1.6;
+        }
+
+        #status {
+            font-size: 14px;
+        }
+
+        .error {
+            color: #c00;
+        }
+
+        /* PIN prompt */
+        #connection-ui.pin-mode {
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            min-height: 100vh;
+            background: #1a1a2e;
+            color: #eee;
+            text-align: center;
+            font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+        }
+    </style>
+</head>
+<body>
+    <div id="connection-ui">
+        <div id="status">Loading...</div>
+    </div>
+    <script src="/__bitbang__/bootstrap.js"></script>
+</body>
+</html>
