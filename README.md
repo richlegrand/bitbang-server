@@ -1,7 +1,5 @@
 # BitBang Server
 
-![Tests](https://github.com/richlegrand/bitbang-server/actions/workflows/tests.yml/badge.svg)
-
 Signaling server for [BitBang](https://github.com/richlegrand/bitbang). Handles WebSocket signaling between devices and browsers to establish WebRTC connections.
 
 ## Setup
