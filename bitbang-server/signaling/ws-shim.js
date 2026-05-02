@@ -76,8 +76,9 @@
             this.url = url;
             this._protocols = protocols;
 
-            // Request a streamId from the bootstrap and open the WS stream
-            parent.postMessage({ type: 'ws-open', pathname, protocols }, '*');
+            // Request a streamId from the bootstrap and open the WS stream.
+            // Include cookies so the target app can identify the session.
+            parent.postMessage({ type: 'ws-open', pathname, protocols, cookies: document.cookie }, '*');
 
             // Bootstrap will respond with ws-assign containing the streamId
             const assignHandler = (event) => {

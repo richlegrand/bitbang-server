@@ -729,10 +729,11 @@ class BitBangConnection {
                 streamId
             }, '*');
 
-            // Send SWSP SYN to device
+            // Send SWSP SYN to device (include cookies for session auth)
             const synPayload = JSON.stringify({
                 type: 'websocket',
-                pathname: msg.pathname
+                pathname: msg.pathname,
+                cookies: msg.cookies || '',
             });
             this.dataChannel.send(this.createFrame(streamId, FLAG_SYN, synPayload));
 
