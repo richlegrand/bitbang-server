@@ -273,6 +273,27 @@ async function proxyToDevice(event) {
     const session = sessions.get(sessionId);
     if (session) {
         bootstrap = await self.clients.get(session.clientId);
+
+        // Chrome may drop SW->client control after idle. The page is
+        // still alive (WebRTC works) but self.clients.get() returns null.
+        // Search all clients including uncontrolled ones.
+        if (!bootstrap) {
+            const allClients = await self.clients.matchAll({
+                type: 'window',
+                includeUncontrolled: true,
+            });
+            console.warn(`[SW] Stored client ${session.clientId} gone. ` +
+                `Searching ${allClients.length} window clients: ` +
+                allClients.map(c => `${c.id} url=${c.url.substring(0, 60)} vis=${c.visibilityState}`).join(' | '));
+            for (const c of allClients) {
+                if (!c.url.includes('/__device__/')) {
+                    bootstrap = c;
+                    session.clientId = c.id;
+                    console.log(`[SW] Re-associated session with client ${c.id}`);
+                    break;
+                }
+            }
+        }
     }
 
     console.log(`[SW] ${event.request.method} ${url.pathname} -> session: ${sessionId}, bootstrap: ${!!bootstrap}`);
@@ -332,7 +353,6 @@ async function proxyToDevice(event) {
     return new Promise((resolve) => {
         let streamController;
         let resolved = false;
-
         let timeout;
         if (!hasBody) {
             timeout = setTimeout(() => {
@@ -381,7 +401,8 @@ async function proxyToDevice(event) {
                                 }
                             }
 
-                            const shims = `<script>window.__bbSessionId='${sessionId}';${cookieSync}</script>`
+                            const shims = '<!DOCTYPE html>'
+                                + `<script>window.__bbSessionId='${sessionId}';${cookieSync}</script>`
                                 + '<script src="/__bitbang__/xhr-shim.js"></script>'
                                 + '<script src="/__bitbang__/ws-shim.js"></script>';
                             controller.enqueue(new TextEncoder().encode(shims));

@@ -14,13 +14,31 @@ import base64
 import hashlib
 import hmac
 from cryptography.hazmat.primitives import serialization, hashes
-from cryptography.hazmat.primitives.asymmetric import padding
+from cryptography.hazmat.primitives.asymmetric import padding, rsa, ec, ed25519
 from cryptography.hazmat.backends import default_backend
+
+# Minimum acceptable RSA key size. 2048 is the modern floor for new keys
+# (NIST SP 800-57). Smaller keys are rejected at registration time.
+MIN_RSA_KEY_SIZE = 2048
+
+# Supported EC curve. Only P-256 is accepted for ECDSA auth — other curves
+# require an explicit decision and protocol review.
+SUPPORTED_EC_CURVE = "secp256r1"
 
 log = logging.getLogger('bitbang')
 
 # UID format: 32 hex characters (128-bit hash of public key)
 UID_PATTERN = re.compile(r'^[a-f0-9]{32}$')
+
+# Domain separation tag prepended to the challenge nonce before signing.
+# Prevents cross-protocol attacks: without this prefix, a malicious server
+# could send nonce = SHA256(arbitrary_payload) and reuse the device's
+# signature in another context (e.g. firmware verification) that uses the
+# same RSA key. Binding every signature to its purpose makes a signature
+# from one context structurally invalid in any other.
+# Bumped only if the signing scheme itself changes (padding/hash/structure),
+# not when the surrounding protocol version changes.
+AUTH_DOMAIN = b"bitbang-auth-v1:"
 
 
 def validate_uid(uid: str) -> bool:
@@ -33,15 +51,47 @@ def uid_from_public_key_bytes(public_bytes: bytes) -> str:
     return hashlib.sha256(public_bytes).hexdigest()[:32]
 
 
+def validate_public_key(public_key):
+    """Validate a parsed public key against the protocol's supported types.
+
+    Returns None if acceptable, else a short error string suitable for sending
+    back to the device. The DER SubjectPublicKeyInfo encoding self-describes
+    the algorithm, so we trust the parsed object's type rather than carrying
+    a separate wire field.
+    """
+    if isinstance(public_key, rsa.RSAPublicKey):
+        if public_key.key_size < MIN_RSA_KEY_SIZE:
+            return f'RSA key too small ({public_key.key_size} < {MIN_RSA_KEY_SIZE})'
+        return None
+    if isinstance(public_key, ec.EllipticCurvePublicKey):
+        if public_key.curve.name != SUPPORTED_EC_CURVE:
+            return f'Unsupported EC curve: {public_key.curve.name}'
+        return None
+    if isinstance(public_key, ed25519.Ed25519PublicKey):
+        return None
+    return f'Unsupported public key type: {type(public_key).__name__}'
+
+
 def verify_signature(public_key, nonce: bytes, signature: bytes) -> bool:
-    """Verify challenge signature."""
+    """Verify a challenge signature, dispatching on key type.
+
+    Each supported key type pairs with a fixed signature scheme:
+      - RSA          -> RSASSA-PKCS1v1_5 + SHA-256
+      - EC (P-256)   -> ECDSA + SHA-256
+      - Ed25519      -> Ed25519 (no separate hash)
+
+    All schemes sign AUTH_DOMAIN + nonce (see AUTH_DOMAIN comment).
+    """
+    payload = AUTH_DOMAIN + nonce
     try:
-        public_key.verify(
-            signature,
-            nonce,
-            padding.PKCS1v15(),
-            hashes.SHA256()
-        )
+        if isinstance(public_key, rsa.RSAPublicKey):
+            public_key.verify(signature, payload, padding.PKCS1v15(), hashes.SHA256())
+        elif isinstance(public_key, ec.EllipticCurvePublicKey):
+            public_key.verify(signature, payload, ec.ECDSA(hashes.SHA256()))
+        elif isinstance(public_key, ed25519.Ed25519PublicKey):
+            public_key.verify(signature, payload)
+        else:
+            return False
         return True
     except Exception:
         return False
@@ -55,8 +105,8 @@ HTML_PORT = int(os.environ.get('PORT', '8081'))
 # SWSP protocol versioning. PROTOCOL_VERSION is what this server supports.
 # MINIMUM_PROTOCOL_VERSION is the oldest version accepted from devices.
 # Devices below the minimum receive a 'protocol_too_old' error with no retry.
-PROTOCOL_VERSION = 1
-MINIMUM_PROTOCOL_VERSION = 1
+PROTOCOL_VERSION = 2
+MINIMUM_PROTOCOL_VERSION = 2
 
 
 class SignalingServer:
@@ -174,8 +224,23 @@ class SignalingServer:
             await self._send_error(ws, 'UID does not match public key')
             return None
 
+        # Parse the key. The DER SubjectPublicKeyInfo encoding self-describes
+        # the algorithm, so we don't need a separate wire field — the parsed
+        # object's type tells us which signature scheme to use.
+        try:
+            public_key = serialization.load_der_public_key(public_bytes, backend=default_backend())
+        except Exception:
+            await self._send_error(ws, 'Invalid public_key format')
+            return None
+
+        # Reject unsupported key types / undersized RSA before issuing a challenge.
+        err = validate_public_key(public_key)
+        if err:
+            log.warning(f"Device {uid}: rejected key — {err}")
+            await self._send_error(ws, err)
+            return None
+
         # Issue challenge
-        public_key = serialization.load_der_public_key(public_bytes, backend=default_backend())
         nonce = os.urandom(32)
         await ws.send(json.dumps({
             'type': 'challenge',

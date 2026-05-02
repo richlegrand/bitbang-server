@@ -577,26 +577,23 @@ class BitBangConnection {
         const iframe = document.getElementById('device-frame');
         if (iframe) iframe.style.display = 'none';
         if (this.connectionUI) {
-            this.connectionUI.className = 'pin-mode';
+            this.connectionUI.className = '';
             const error = errorMessage
-                ? `<div style="color: #f44336; font-size: 14px; margin-bottom: 12px;">${errorMessage}${remaining != null ? ` (${remaining} attempts remaining)` : ''}</div>`
+                ? `<div style="color: #c00; margin-bottom: 8px;">${errorMessage}</div>`
                 : '';
             this.connectionUI.innerHTML = `
-                <div>
-                <div style="font-size: 18px; margin-bottom: 16px;">PIN Required</div>
+                <div style="font-size: 14px; margin-bottom: 8px;">PIN Required</div>
                 ${error}
-                <div style="display: flex; gap: 8px; justify-content: center;">
-                    <input type="password" id="pin-input" placeholder="Enter PIN"
-                           style="padding: 10px 16px; font-size: 16px; border: 1px solid #333;
-                                  border-radius: 6px; background: #0d0d1a; color: #eee;
-                                  width: 160px; outline: none; text-align: center;"
+                <div style="display: flex; gap: 6px; align-items: center;">
+                    <input type="password" id="pin-input" placeholder="PIN"
+                           style="padding: 4px 8px; font-size: 14px; border: 1px solid #ccc;
+                                  border-radius: 3px; width: 120px; outline: none;"
                            onkeydown="if(event.key==='Enter')document.getElementById('pin-submit').click()"
                            autofocus>
                     <button id="pin-submit"
-                            style="padding: 10px 20px; font-size: 16px; border: none;
-                                   border-radius: 6px; background: #4CAF50; color: white; cursor: pointer;"
-                            >Submit</button>
-                </div>
+                            style="padding: 4px 12px; font-size: 14px; border: 1px solid #ccc;
+                                   border-radius: 3px; background: #fff; cursor: pointer;"
+                            >OK</button>
                 </div>
             `;
             this.connectionUI.style.display = '';
@@ -774,6 +771,7 @@ class BitBangConnection {
         iframe.id = 'device-frame';
         iframe.sandbox = 'allow-scripts allow-forms allow-same-origin allow-popups allow-modals allow-downloads';
         iframe.allow = 'fullscreen';
+        iframe.scrolling = 'yes';
         iframe.style.cssText = `
             position: fixed; top: 0; left: 0;
             width: 100%; height: 100%;
@@ -781,6 +779,15 @@ class BitBangConnection {
         `;
 
         iframe.onload = () => {
+            // Constrain the iframe body to the viewport so modal height
+            // calculations use the visible area, not the content height.
+            try {
+                const doc = iframe.contentDocument;
+                const s = doc.createElement('style');
+                s.textContent = 'html, body { height: 100% !important; overflow: auto !important; }';
+                doc.head.appendChild(s);
+            } catch (e) {}
+
             this.wireStreams(iframe);
             if (this.connectionUI) this.connectionUI.style.display = 'none';
 

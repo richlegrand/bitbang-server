@@ -48,9 +48,18 @@ def generate_identity():
     return private_key, uid, public_key_b64
 
 
+# Domain separation tag — must match AUTH_DOMAIN in signaling.py.
+# Prevents cross-protocol attacks where a signature produced for auth could
+# be reused as a signature in another context (e.g. firmware verification).
+AUTH_DOMAIN = b"bitbang-auth-v1:"
+
+# Must match PROTOCOL_VERSION in signaling.py
+PROTOCOL_VERSION = 2
+
+
 def sign_challenge(private_key, nonce):
-    """Sign a challenge nonce."""
-    return private_key.sign(nonce, padding.PKCS1v15(), hashes.SHA256())
+    """Sign a domain-separated challenge nonce."""
+    return private_key.sign(AUTH_DOMAIN + nonce, padding.PKCS1v15(), hashes.SHA256())
 
 
 class Stats:
@@ -197,6 +206,7 @@ async def _run_device(server, private_key, uid, public_key_b64, stats, ready_eve
                 "type": "register",
                 "uid": uid,
                 "public_key": public_key_b64,
+                "protocol": PROTOCOL_VERSION,
             }))
 
             while True:
