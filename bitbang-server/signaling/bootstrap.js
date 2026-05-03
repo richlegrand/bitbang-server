@@ -659,6 +659,7 @@ class BitBangConnection {
             sessionId: this.sessionId,
             uid: this.uid,
             target: target,
+            debug: this.debug,
         });
 
         // Brief delay for any pending tracks to arrive

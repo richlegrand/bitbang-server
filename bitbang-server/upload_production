@@ -1,0 +1,11 @@
+#!/bin/bash
+
+source .env
+
+TARDIR=signaling
+TARFILE=signaling.tgz
+
+find ${TARDIR} -type f \( -wholename "*.html" -o -wholename "*.png" -o -wholename "*.conf" -o -wholename "*.py" -o -wholename "*.ico" -o -wholename "*.jpg" -o -wholename "*.js" -o -wholename "*.env" -o -wholename "*.sh" \) | tar cvfz ${TARFILE} -T -
+
+scp -i ${SERVER_SSH_KEY} ${TARFILE} ${SERVER_SSH}:${SERVER_SSH_DIR}/${TARFILE}
+ssh ${SERVER_SSH} -i ${SERVER_SSH_KEY} "cd ${SERVER_SSH_DIR}; tar xvfz ${TARFILE}; sudo systemctl restart signaling.service"

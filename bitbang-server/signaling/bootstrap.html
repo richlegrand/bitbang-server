@@ -3,6 +3,21 @@
 <head>
     <meta charset="utf-8">
     <title>Loading...</title>
+    <script>
+        // ?debug loads eruda -- a floating console/network/storage panel for
+        // mobile, where browser DevTools aren't available. Loaded async so it
+        // doesn't block the connection sequence.
+        if (new URLSearchParams(location.search).has('debug')) {
+            const s = document.createElement('script');
+            s.src = 'https://cdn.jsdelivr.net/npm/eruda';
+            s.onload = () => {
+                if (!window.eruda) return;
+                eruda.init();
+                eruda.position({ x: window.innerWidth - 60, y: window.innerHeight - 60 });
+            };
+            document.head.appendChild(s);
+        }
+    </script>
     <style>
         * {
             margin: 0;

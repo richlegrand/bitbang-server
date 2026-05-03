@@ -34,8 +34,23 @@ self.addEventListener('message', async (event) => {
             clientId: event.source.id,
             uid: uid,
             target: event.data.target || 'device',
+            debug: !!event.data.debug,
         });
         console.log('[SW] Bootstrap registered, session:', event.data.sessionId);
+    } else if (event.data?.type === 'getCookies') {
+        // Iframe (ws-shim) asks for the current Cookie header value for a path.
+        // The SW jar is canonical -- reading document.cookie can be stale
+        // because Set-Cookie is stripped from responses.
+        const port = event.ports?.[0];
+        const session = sessions.get(event.data.sessionId);
+        if (!session || !port) {
+            port?.postMessage({ cookies: '' });
+            return;
+        }
+        await cookieJarReady;
+        const jarKey = `${session.uid}:${session.target}`;
+        const path = (event.data.path || '/').split('?')[0];
+        port.postMessage({ cookies: getCookieHeader(jarKey, path) || '' });
     }
 });
 
@@ -375,6 +390,12 @@ async function proxyToDevice(event) {
                 const setCookie = headers?.['Set-Cookie'] || headers?.['set-cookie'];
                 if (setCookie) {
                     storeCookies(jarKey, setCookie);
+                    // Notify iframes to update document.cookie so app code that
+                    // reads it (CSRF tokens, etc.) sees the new values. The SW
+                    // jar remains canonical for HTTP/WS authentication.
+                    const bc = new BroadcastChannel('bitbang-cookies');
+                    bc.postMessage({ sessionId, cookies: cookieJar.get(jarKey) || [] });
+                    bc.close();
                     delete headers['Set-Cookie'];
                     delete headers['set-cookie'];
                 }
@@ -401,8 +422,12 @@ async function proxyToDevice(event) {
                                 }
                             }
 
+                            const eruda = session?.debug
+                                ? '<script src="https://cdn.jsdelivr.net/npm/eruda" onload="eruda.init();eruda.position({x:innerWidth-60,y:innerHeight-60})"></script>'
+                                : '';
                             const shims = '<!DOCTYPE html>'
                                 + `<script>window.__bbSessionId='${sessionId}';${cookieSync}</script>`
+                                + eruda
                                 + '<script src="/__bitbang__/xhr-shim.js"></script>'
                                 + '<script src="/__bitbang__/ws-shim.js"></script>';
                             controller.enqueue(new TextEncoder().encode(shims));

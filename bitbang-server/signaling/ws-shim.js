@@ -17,6 +17,41 @@
     // Registry of active shim WebSockets by streamId
     const sockets = new Map();
 
+    // Mirror SW cookie-jar updates into document.cookie so app code that
+    // reads cookies directly (CSRF tokens, etc.) sees fresh values after
+    // AJAX responses with Set-Cookie. The SW strips Set-Cookie from the
+    // raw response, so without this mirror document.cookie goes stale.
+    try {
+        const cookieChannel = new BroadcastChannel('bitbang-cookies');
+        cookieChannel.onmessage = (event) => {
+            if (event.data?.sessionId !== window.__bbSessionId) return;
+            const cookies = event.data.cookies || [];
+            for (const c of cookies) {
+                document.cookie = `${c.name}=${c.value};path=${c.path}`;
+            }
+        };
+    } catch (e) {}
+
+    // Ask the SW for the current cookie header for a given path. The SW
+    // jar is the source of truth; document.cookie is a best-effort mirror.
+    function getCookiesFromSW(path) {
+        const sw = navigator.serviceWorker?.controller;
+        if (!sw || !window.__bbSessionId) return Promise.resolve('');
+        return new Promise((resolve) => {
+            const channel = new MessageChannel();
+            const timeout = setTimeout(() => resolve(''), 1000);
+            channel.port1.onmessage = (e) => {
+                clearTimeout(timeout);
+                resolve(e.data?.cookies || '');
+            };
+            sw.postMessage({
+                type: 'getCookies',
+                sessionId: window.__bbSessionId,
+                path,
+            }, [channel.port2]);
+        });
+    }
+
     // Listen for messages from the bootstrap parent
     window.addEventListener('message', (event) => {
         if (event.source !== parent) return;
@@ -77,8 +112,11 @@
             this._protocols = protocols;
 
             // Request a streamId from the bootstrap and open the WS stream.
-            // Include cookies so the target app can identify the session.
-            parent.postMessage({ type: 'ws-open', pathname, protocols, cookies: document.cookie }, '*');
+            // Cookies come from the SW jar (canonical) instead of document.cookie,
+            // which can be stale after AJAX Set-Cookie responses.
+            getCookiesFromSW(pathname).then((cookies) => {
+                parent.postMessage({ type: 'ws-open', pathname, protocols, cookies }, '*');
+            });
 
             // Bootstrap will respond with ws-assign containing the streamId
             const assignHandler = (event) => {
