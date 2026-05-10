@@ -7,17 +7,55 @@
  * are rewritten at the source by xhr-shim.js.
  */
 
+console.log('[SW] booted');
+
 self.addEventListener('install', () => self.skipWaiting());
 self.addEventListener('activate', (event) => event.waitUntil(self.clients.claim()));
 
 // -- Session tracking --------------------------------------------------------
 
-// Map of sessionId -> { clientId, uid, target }
+// Map of sessionId -> { clientId, uid, target }.
+// Persisted to Cache API so SW idle-termination (Chrome ~30s) doesn't drop
+// session records while the bootstrap window is still alive.
 const sessions = new Map();
+const SESSIONS_CACHE_KEY = '/__bitbang__/sessions';
+
+async function loadSessions() {
+    try {
+        const cache = await caches.open('bitbang-sessions');
+        const resp = await cache.match(SESSIONS_CACHE_KEY);
+        if (resp) {
+            const data = await resp.json();
+            const entries = Object.entries(data);
+            for (const [sid, sess] of entries) {
+                sessions.set(sid, sess);
+            }
+            if (entries.length > 0) {
+                console.log(`[SW] Restored ${entries.length} session(s) from cache`);
+            }
+        }
+    } catch (e) {}
+}
+
+function saveSessions() {
+    const data = {};
+    for (const [sid, sess] of sessions) data[sid] = sess;
+    caches.open('bitbang-sessions').then(cache => {
+        cache.put(SESSIONS_CACHE_KEY,
+            new Response(JSON.stringify(data), {
+                headers: { 'Content-Type': 'application/json' }
+            })
+        );
+    }).catch(() => {});
+}
+
+const sessionsReady = loadSessions();
 
 self.addEventListener('message', async (event) => {
     if (event.data?.type === 'setBootstrap' && event.data.sessionId) {
         const uid = event.data.uid || '';
+
+        await sessionsReady;
 
         // Remove stale sessions for the same UID whose client is dead
         // (e.g. page refresh). Preserve live sessions (other tabs).
@@ -35,8 +73,22 @@ self.addEventListener('message', async (event) => {
             uid: uid,
             target: event.data.target || 'device',
             debug: !!event.data.debug,
+            noCookieJar: !!event.data.noCookieJar,
         });
-        console.log('[SW] Bootstrap registered, session:', event.data.sessionId);
+        saveSessions();
+        console.log('[SW] Bootstrap registered, session:', event.data.sessionId,
+            event.data.noCookieJar ? '(nocookiejar)' : '');
+    } else if (event.data?.type === 'unsetBootstrap' && event.data.sessionId) {
+        // Best-effort cleanup from pagehide. Don't gate on event.source --
+        // it may be null when fired during page unload, and even when it's
+        // present, postMessage delivery from a closing page to a possibly-
+        // idle SW is unreliable. The findSession sweep below is the
+        // authoritative cleanup; this is just a fast path when it works.
+        await sessionsReady;
+        if (sessions.delete(event.data.sessionId)) {
+            saveSessions();
+            console.log('[SW] Bootstrap unregistered, session:', event.data.sessionId);
+        }
     } else if (event.data?.type === 'getCookies') {
         // Iframe (ws-shim) asks for the current Cookie header value for a path.
         // The SW jar is canonical -- reading document.cookie can be stale
@@ -51,6 +103,14 @@ self.addEventListener('message', async (event) => {
         const jarKey = `${session.uid}:${session.target}`;
         const path = (event.data.path || '/').split('?')[0];
         port.postMessage({ cookies: getCookieHeader(jarKey, path) || '' });
+    } else if (event.data?.type === 'cookieWrite') {
+        // App code in iframe wrote document.cookie. Mirror into the jar so
+        // the next outbound request includes it.
+        const session = sessions.get(event.data.sessionId);
+        if (!session) return;
+        await cookieJarReady;
+        const jarKey = `${session.uid}:${session.target}`;
+        storeCookies(jarKey, event.data.value);
     }
 });
 
@@ -64,6 +124,21 @@ self.addEventListener('message', async (event) => {
  *   5. Most recent session (sub-resources only)
  */
 async function findSession(event) {
+    await sessionsReady;
+
+    // Drop sessions whose owning client is gone. Without this, an auto-fetch
+    // (e.g. /favicon.ico right after a refresh) can match a stale uid-keyed
+    // entry from a previous page and get routed into the rescue path. The
+    // pagehide cleanup is best-effort; this sweep is authoritative.
+    let swept = false;
+    for (const [sid, sess] of sessions) {
+        if (!(await self.clients.get(sess.clientId))) {
+            sessions.delete(sid);
+            swept = true;
+        }
+    }
+    if (swept) saveSessions();
+
     const referer = event.request.referrer || '';
 
     // Strategy 1: referer has /__device__/<sid>
@@ -285,6 +360,7 @@ async function proxyToDevice(event) {
 
     // -- Find bootstrap client --
     let bootstrap = null;
+    await sessionsReady;
     const session = sessions.get(sessionId);
     if (session) {
         bootstrap = await self.clients.get(session.clientId);
@@ -300,18 +376,22 @@ async function proxyToDevice(event) {
             console.warn(`[SW] Stored client ${session.clientId} gone. ` +
                 `Searching ${allClients.length} window clients: ` +
                 allClients.map(c => `${c.id} url=${c.url.substring(0, 60)} vis=${c.visibilityState}`).join(' | '));
+            // Use a non-iframe window client to deliver this request, but
+            // do NOT rewrite session.clientId. If the matched id equals the
+            // stored id (SW-restart-with-same-page case), the rewrite is a
+            // no-op; if it differs (refresh case), the rewrite would attach
+            // the stale session to the new bootstrap, defeating the
+            // dead-clientId cleanup in setBootstrap and leaking entries.
             for (const c of allClients) {
                 if (!c.url.includes('/__device__/')) {
                     bootstrap = c;
-                    session.clientId = c.id;
-                    console.log(`[SW] Re-associated session with client ${c.id}`);
                     break;
                 }
             }
         }
     }
 
-    console.log(`[SW] ${event.request.method} ${url.pathname} -> session: ${sessionId}, bootstrap: ${!!bootstrap}`);
+    if (session?.debug) console.log(`[SW] ${event.request.method} ${url.pathname} -> session: ${sessionId}, bootstrap: ${!!bootstrap}`);
 
     if (!bootstrap) {
         console.warn('[SW] No bootstrap client found');
@@ -329,10 +409,14 @@ async function proxyToDevice(event) {
     );
 
     const reqHeaders = Object.fromEntries(event.request.headers);
-    await cookieJarReady;
-    const appCookies = getCookieHeader(jarKey, devicePath);
-    if (appCookies) {
-        reqHeaders['cookie'] = appCookies;
+    if (!session.noCookieJar) {
+        await cookieJarReady;
+        const appCookies = getCookieHeader(jarKey, devicePath);
+        if (appCookies) {
+            reqHeaders['cookie'] = appCookies;
+        } else {
+            delete reqHeaders['cookie'];
+        }
     } else {
         delete reqHeaders['cookie'];
     }
@@ -386,13 +470,36 @@ async function proxyToDevice(event) {
                 if (timeout) clearTimeout(timeout);
                 resolved = true;
 
-                // Store response cookies in our jar
+                // Store response cookies in our jar (skipped when ?nocookiejar is set)
                 const setCookie = headers?.['Set-Cookie'] || headers?.['set-cookie'];
-                if (setCookie) {
+                if (setCookie && !session.noCookieJar) {
                     storeCookies(jarKey, setCookie);
-                    // Notify iframes to update document.cookie so app code that
-                    // reads it (CSRF tokens, etc.) sees the new values. The SW
-                    // jar remains canonical for HTTP/WS authentication.
+                    // Surface cookies via a custom header so xhr-shim can
+                    // sync them into document.cookie *synchronously* in the
+                    // same Promise/event chain as the response, before app
+                    // code's handler runs. JSON-encoded so multiple Set-Cookie
+                    // values round-trip through a single header without
+                    // ambiguity from comma joins.
+                    //
+                    // Strip Domain= so the browser scopes the cookie to the
+                    // current document origin (bitba.ng) instead of silently
+                    // refusing the write when the upstream's Domain attribute
+                    // (e.g. octoprint.local, 192.168.1.10) doesn't match.
+                    // HttpOnly is also dropped -- it's silently ignored on JS
+                    // writes anyway, just cleaner to omit.
+                    const stripCookieAttrs = (s) => s.split(';')
+                        .map(p => p.trim())
+                        .filter(p => {
+                            const lower = p.toLowerCase();
+                            return !lower.startsWith('domain=') && lower !== 'httponly';
+                        })
+                        .join('; ');
+                    const list = (Array.isArray(setCookie) ? setCookie : [setCookie])
+                        .map(stripCookieAttrs);
+                    headers['X-BB-Set-Cookie'] = JSON.stringify(list);
+                    // Cross-tab fallback: another tab won't see X-BB-Set-Cookie
+                    // (different fetch). The broadcast keeps its document.cookie
+                    // eventually consistent.
                     const bc = new BroadcastChannel('bitbang-cookies');
                     bc.postMessage({ sessionId, cookies: cookieJar.get(jarKey) || [] });
                     bc.close();
@@ -413,12 +520,14 @@ async function proxyToDevice(event) {
                         // Inject shims + cookie sync into HTML navigation responses
                         if (ct.includes('text/html') && isNav) {
                             let cookieSync = '';
-                            const jar = cookieJar.get(jarKey);
-                            if (jar && jar.length > 0) {
-                                const now = Date.now();
-                                for (const c of jar) {
-                                    if (c.expires !== null && c.expires <= now) continue;
-                                    cookieSync += `document.cookie=${JSON.stringify(c.name + '=' + c.value + ';path=' + c.path)};`;
+                            if (!session?.noCookieJar) {
+                                const jar = cookieJar.get(jarKey);
+                                if (jar && jar.length > 0) {
+                                    const now = Date.now();
+                                    for (const c of jar) {
+                                        if (c.expires !== null && c.expires <= now) continue;
+                                        cookieSync += `document.cookie=${JSON.stringify(c.name + '=' + c.value + ';path=' + c.path)};`;
+                                    }
                                 }
                             }
 
@@ -426,7 +535,7 @@ async function proxyToDevice(event) {
                                 ? '<script src="https://cdn.jsdelivr.net/npm/eruda" onload="eruda.init();eruda.position({x:innerWidth-60,y:innerHeight-60})"></script>'
                                 : '';
                             const shims = '<!DOCTYPE html>'
-                                + `<script>window.__bbSessionId='${sessionId}';${cookieSync}</script>`
+                                + `<script>window.__bbSessionId='${sessionId}';window.__bbDebug=${!!session?.debug};${cookieSync}</script>`
                                 + eruda
                                 + '<script src="/__bitbang__/xhr-shim.js"></script>'
                                 + '<script src="/__bitbang__/ws-shim.js"></script>';

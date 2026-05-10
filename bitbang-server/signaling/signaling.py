@@ -277,13 +277,42 @@ class SignalingServer:
             if not reg_msg:
                 return
 
-            # Reject if another instance is already connected with this UID
+            # Preempt any existing connection with this UID. The new
+            # connection has proven key ownership, so it takes precedence
+            # (typically a device restart racing with its own stale ws).
             if uid in self.devices:
-                log.warning(f"Device {uid}: Rejected - already connected")
-                await self._send_error(websocket, 'UID already connected')
-                return
+                old_ws = self.devices[uid]
+                log.warning(f"Device {uid}: Preempting existing connection")
+                try:
+                    await old_ws.send(json.dumps({'type': 'error', 'message': 'preempted'}))
+                except Exception:
+                    pass
+                try:
+                    await old_ws.close(1000)
+                except Exception:
+                    pass
 
-            # Register device
+                # Boot any clients connected to the old device. Their existing
+                # WebRTC peer connections were negotiated with the previous
+                # device instance and won't carry over. Forcing a reconnect
+                # makes them re-issue 'request' and receive a fresh offer.
+                # Snapshot the list because client cleanup mutates self.clients.
+                stale = [(cid, cws) for cid, cws in self.clients.items()
+                         if cid.startswith(f"{uid}_")]
+                for cid, cws in stale:
+                    try:
+                        await cws.send(json.dumps({'type': 'error', 'message': 'device_preempted'}))
+                    except Exception:
+                        pass
+                    try:
+                        await cws.close(1000)
+                    except Exception:
+                        pass
+                    log.info(f"Booted client {cid} (device preempted)")
+
+            # Register device. The old handler's finally block will see that
+            # self.devices[uid] != its own ws (we're about to overwrite) and
+            # leave the registry alone.
             self.devices[uid] = my_ws
             custom_ice = reg_msg.get('ice_servers')
             if custom_ice:

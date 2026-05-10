@@ -61,6 +61,7 @@
         if (!ws) return;
 
         if (type === 'ws-opened') {
+            log('ws-opened, streamId=' + streamId);
             ws._readyState = NativeWebSocket.OPEN;
             ws.dispatchEvent(new Event('open'));
             if (ws.onopen) ws.onopen(new Event('open'));
@@ -69,21 +70,29 @@
             ws.dispatchEvent(evt);
             if (ws.onmessage) ws.onmessage(evt);
         } else if (type === 'ws-closed') {
+            log('ws-closed, streamId=' + streamId, 'code=' + code);
             ws._readyState = NativeWebSocket.CLOSED;
             sockets.delete(streamId);
             const evt = new CloseEvent('close', { code: code || 1000, reason: reason || '' });
             ws.dispatchEvent(evt);
             if (ws.onclose) ws.onclose(evt);
         } else if (type === 'ws-error') {
+            log('ws-error, streamId=' + streamId);
             const evt = new Event('error');
             ws.dispatchEvent(evt);
             if (ws.onerror) ws.onerror(evt);
         }
     });
 
+    function log(msg, ...args) {
+        if (!window.__bbDebug) return;
+        console.log('[ws-shim] ' + msg, ...args);
+    }
+
     class BitBangWebSocket extends EventTarget {
         constructor(url, protocols) {
             super();
+            log('constructed', url);
 
             this.onopen = null;
             this.onmessage = null;
@@ -115,6 +124,7 @@
             // Cookies come from the SW jar (canonical) instead of document.cookie,
             // which can be stale after AJAX Set-Cookie responses.
             getCookiesFromSW(pathname).then((cookies) => {
+                log('ws-open posted', pathname, 'cookies.len=' + cookies.length);
                 parent.postMessage({ type: 'ws-open', pathname, protocols, cookies }, '*');
             });
 
@@ -125,6 +135,7 @@
                     window.removeEventListener('message', assignHandler);
                     this._streamId = event.data.streamId;
                     sockets.set(this._streamId, this);
+                    log('ws-assign received, streamId=' + this._streamId);
                 }
             };
             window.addEventListener('message', assignHandler);

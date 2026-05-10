@@ -68,10 +68,74 @@
         return url;
     }
 
+    // -- Cookie sync ---------------------------------------------------------
+    //
+    // The SW renames device-set Set-Cookie headers to X-BB-Set-Cookie so
+    // they don't leak onto bitba.ng's own paths. We mirror them into
+    // document.cookie *synchronously in the same .then chain / event-loop
+    // tick* as the response arrives -- guaranteeing app code that reads
+    // document.cookie immediately after a fetch/XHR sees the fresh value.
+
+    function applyCookieHeader(headerValue) {
+        if (!headerValue) return;
+        try {
+            var list = JSON.parse(headerValue);
+            for (var i = 0; i < list.length; i++) {
+                document.cookie = list[i];
+            }
+        } catch (e) {}
+    }
+
+    // Forward writes back to the SW so the jar mirrors app-side mutations
+    // (preferences, JS-set tokens). Setter-only wrap leaves reads native --
+    // less invasive than a full getter override that some browsers reject.
+    try {
+        var cookieDesc = Object.getOwnPropertyDescriptor(Document.prototype, 'cookie');
+        if (cookieDesc && cookieDesc.configurable && cookieDesc.set && cookieDesc.get) {
+            Object.defineProperty(document, 'cookie', {
+                get: function() { return cookieDesc.get.call(document); },
+                set: function(value) {
+                    cookieDesc.set.call(document, value);
+                    var sw = navigator.serviceWorker && navigator.serviceWorker.controller;
+                    if (sw && window.__bbSessionId) {
+                        sw.postMessage({
+                            type: 'cookieWrite',
+                            sessionId: window.__bbSessionId,
+                            value: value,
+                        });
+                    }
+                },
+                configurable: true,
+            });
+        }
+    } catch (e) {}
+
     // -- Patch XMLHttpRequest ------------------------------------------------
 
-    var origOpen = XMLHttpRequest.prototype.open;
-    XMLHttpRequest.prototype.open = function(method, url) {
+    // Wrap the constructor so our readystatechange listener registers before
+    // any app code can attach its own. Listeners fire in registration order,
+    // so ours runs first -- document.cookie is fresh by the time the app's
+    // handler reads it.
+    var OrigXHR = window.XMLHttpRequest;
+    function WrappedXHR() {
+        var xhr = new OrigXHR();
+        xhr.addEventListener('readystatechange', function() {
+            if (xhr.readyState === 4) {
+                applyCookieHeader(xhr.getResponseHeader('X-BB-Set-Cookie'));
+            }
+        });
+        return xhr;
+    }
+    WrappedXHR.prototype = OrigXHR.prototype;
+    WrappedXHR.UNSENT = 0;
+    WrappedXHR.OPENED = 1;
+    WrappedXHR.HEADERS_RECEIVED = 2;
+    WrappedXHR.LOADING = 3;
+    WrappedXHR.DONE = 4;
+    window.XMLHttpRequest = WrappedXHR;
+
+    var origOpen = OrigXHR.prototype.open;
+    OrigXHR.prototype.open = function(method, url) {
         // Rewrite URL
         arguments[1] = rewriteUrl(url);
         // Force async=true. Sync XHR bypasses the service worker entirely
@@ -109,7 +173,12 @@
                     input = new Request(newUrl, input);
                 }
             }
-            return origFetch.call(this, input, init);
+            // Our .then runs before the caller's, so document.cookie is
+            // synced before any app handler sees the response.
+            return origFetch.call(this, input, init).then(function(response) {
+                applyCookieHeader(response.headers.get('X-BB-Set-Cookie'));
+                return response;
+            });
         };
     }
 })();

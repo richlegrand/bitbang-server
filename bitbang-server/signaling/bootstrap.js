@@ -5,6 +5,8 @@
  * and wires up media streams to the iframe.
  */
 
+console.log('[Bootstrap] script evaluated', performance.now().toFixed(1));
+
 const STATUS = {
     CONNECTING: "Connecting to server...",
     WAITING_OFFER: "Waiting for device...",
@@ -31,6 +33,7 @@ class BitBangConnection {
         this.nextStreamId = 1;        // streamId 0 is reserved for control
         this.wsStreams = new Map();    // streamId -> { iframe } for WebSocket bridging
         this.sessionId = Array.from(crypto.getRandomValues(new Uint8Array(4)), b => b.toString(16).padStart(2, '0')).join(''); // 8 hex chars
+        console.log('[Bootstrap] ctor', this.sessionId);
         this.localCandidateQueue = [];
         this.remoteCandidateQueue = [];
         this.remoteDescriptionSet = false;
@@ -39,6 +42,7 @@ class BitBangConnection {
         this.statusEl = document.getElementById('status');
         this.connectionUI = document.getElementById('connection-ui');
         this.debug = new URLSearchParams(window.location.search).has('debug');
+        this.noCookieJar = new URLSearchParams(window.location.search).has('nocookiejar');
 
         if (this.debug && this.connectionUI) {
             this.connectionUI.classList.add('debug');
@@ -132,12 +136,21 @@ class BitBangConnection {
             }
         });
 
+        // Drop our session entry when this window goes away (refresh or close)
+        // so the SW doesn't carry stale records into the next page load.
+        window.addEventListener('pagehide', () => {
+            navigator.serviceWorker.controller?.postMessage({
+                type: 'unsetBootstrap',
+                sessionId: this.sessionId,
+            });
+        });
+
         await navigator.serviceWorker.ready;
     }
 
     handleProxyRequest(data, responsePort) {
         const { method, url, headers, hasBody, contentLength } = data;
-        console.log(`[Bootstrap] Received proxy request: ${method} ${new URL(url).pathname}, DC state: ${this.dataChannel?.readyState}`);
+        if (this.debug) console.log(`[Bootstrap] Received proxy request: ${method} ${new URL(url).pathname}, DC state: ${this.dataChannel?.readyState}`);
 
         if (!this.dataChannel || this.dataChannel.readyState !== 'open') {
             console.warn('[Bootstrap] Data channel not open, rejecting request');
@@ -156,7 +169,10 @@ class BitBangConnection {
         // Use incrementing stream ID for SWSP
         const streamId = this.nextStreamId++;
 
-        // Timeout resets on activity (30s inactivity = timeout)
+        // Initial 30s timeout to catch "device not responding". Cleared once
+        // response headers arrive (SYN). After that we rely on FIN / data
+        // channel close to signal end -- inactivity is normal during streaming
+        // when the consumer (e.g. video player) backpressures the channel.
         let timeout;
         const resetTimeout = () => {
             clearTimeout(timeout);
@@ -277,7 +293,16 @@ class BitBangConnection {
                     this.handleRemoteCandidate(msg.candidate);
                 } else if (msg.type === 'error') {
                     clearTimeout(offerTimeout);
-                    reject(new Error(msg.message));
+                    if (msg.message === 'device_preempted') {
+                        // Server kicked us because a new device instance
+                        // registered with the same UID. App state on the old
+                        // device is gone -- a reload gives a clean session.
+                        this.showReloadScreen('Device reconnected. Reload to continue.');
+                    } else {
+                        // Other error events. reject() is a no-op once the
+                        // connect promise has resolved, but harmless then.
+                        reject(new Error(msg.message));
+                    }
                 }
             };
 
@@ -293,6 +318,14 @@ class BitBangConnection {
         this.streamNameMap = msg.streams || {};
         this.deviceName = msg.device_name || null;
         this.pc = this.createPeerConnection(msg.ice_servers);
+
+        if (this.debug) {
+            const lines = (msg.sdp || '').split('\n').filter(l => l.startsWith('a=candidate:'));
+            for (const line of lines) {
+                const m = line.match(/typ (\S+)/);
+                console.log(`[Bootstrap] offer candidate: ${m ? m[1] : '?'} ${line.trim()}`);
+            }
+        }
 
         await this.pc.setRemoteDescription({ type: 'offer', sdp: msg.sdp });
         this.remoteDescriptionSet = true;
@@ -317,31 +350,46 @@ class BitBangConnection {
 
     createPeerConnection(iceServers) {
         const config = { sdpSemantics: 'unified-plan' };
-        if (iceServers && iceServers.length > 0) {
+        // ?norelay drops STUN/TURN servers entirely so ICE only has host
+        // candidates. Diagnostic for "is host-to-host actually broken, or
+        // is it just losing the race to relay?"
+        const noRelay = new URLSearchParams(location.search).has('norelay');
+        if (iceServers && iceServers.length > 0 && !noRelay) {
             config.iceServers = iceServers;
         }
+        if (noRelay) console.log('[Bootstrap] norelay: forcing host-only ICE');
         const pc = new RTCPeerConnection(config);
 
         pc.onconnectionstatechange = () => {
+            if (this.debug) console.log(`[Bootstrap] connectionState -> ${pc.connectionState}`);
             if (pc.connectionState === 'connected') {
                 this.updateStatus(STATUS.CONNECTED);
-                // Delay connection type check — ICE may initially use TURN
-                // relay but switch to a direct path within seconds as better
-                // candidate pairs are discovered and promoted.
-                setTimeout(() => this.logConnectionType(pc), 3000);
+                this.pollConnectionType(pc);
             } else if (pc.connectionState === 'failed') {
                 this.showErrorScreen('Peer connection failed');
             }
         };
 
+        pc.oniceconnectionstatechange = () => {
+            if (this.debug) console.log(`[Bootstrap] iceConnectionState -> ${pc.iceConnectionState}`);
+        };
+
         pc.onicecandidate = (event) => {
             if (event.candidate) {
+                if (this.debug) {
+                    const c = event.candidate.candidate || '';
+                    // SDP candidate line: candidate:foundation comp proto prio addr port typ <type> ...
+                    const m = c.match(/typ (\S+)/);
+                    console.log(`[Bootstrap] local candidate: ${m ? m[1] : '?'} ${c}`);
+                }
                 const msg = { type: 'candidate', uid: this.uid, candidate: event.candidate };
                 if (this.ws?.readyState === WebSocket.OPEN && this.remoteDescriptionSet) {
                     this.ws.send(JSON.stringify(msg));
                 } else {
                     this.localCandidateQueue.push(msg);
                 }
+            } else if (this.debug) {
+                console.log('[Bootstrap] local candidate gathering complete');
             }
         };
 
@@ -367,6 +415,11 @@ class BitBangConnection {
     }
 
     handleRemoteCandidate(candidate) {
+        if (this.debug) {
+            const c = candidate?.candidate || '';
+            const m = c.match(/typ (\S+)/);
+            console.log(`[Bootstrap] remote candidate: ${m ? m[1] : '?'} ${c}`);
+        }
         if (this.remoteDescriptionSet && this.pc) {
             this.pc.addIceCandidate(candidate).catch(() => {});
         } else {
@@ -374,40 +427,36 @@ class BitBangConnection {
         }
     }
 
-    async logConnectionType(pc) {
-        try {
-            const stats = await pc.getStats();
-            // Find the nominated (active) candidate pair — not all succeeded pairs
-            let nominated = null;
-            for (const [, report] of stats) {
-                if (report.type === 'candidate-pair' && report.nominated && report.state === 'succeeded') {
-                    nominated = report;
-                    break;
-                }
-            }
-            // Fall back to any succeeded pair if no nominated flag
-            if (!nominated) {
+    // Poll every 2s and log when an ICE pair changes for any transport.
+    // OctoPrint has multiple transports (video + data channel) which ICE
+    // routes independently, so logging only the first hides cases where
+    // one transport is on direct and another is on relay.
+    pollConnectionType(pc) {
+        if (!this.debug) return;
+        const lastByTransport = new Map();
+        const tick = async () => {
+            if (pc.connectionState !== 'connected') return;
+            try {
+                const stats = await pc.getStats();
                 for (const [, report] of stats) {
-                    if (report.type === 'candidate-pair' && report.state === 'succeeded') {
-                        nominated = report;
-                        break;
-                    }
+                    if (report.type !== 'transport' || !report.selectedCandidatePairId) continue;
+                    const transportId = report.id;
+                    const selectedId = report.selectedCandidatePairId;
+                    if (lastByTransport.get(transportId) === selectedId) continue;
+                    lastByTransport.set(transportId, selectedId);
+                    const pair = stats.get(selectedId);
+                    const local = pair && stats.get(pair.localCandidateId);
+                    const remote = pair && stats.get(pair.remoteCandidateId);
+                    const localDesc = local ? `${local.candidateType} ${local.address}:${local.port}` : 'unknown';
+                    const remoteDesc = remote ? `${remote.candidateType} ${remote.address}:${remote.port}` : 'unknown';
+                    const isRelay = local?.candidateType === 'relay' || remote?.candidateType === 'relay';
+                    const dtlsState = report.dtlsState || '';
+                    console.log(`[Bootstrap] ICE pair (transport ${transportId}, dtls=${dtlsState}): ${isRelay ? 'TURN relay' : 'direct'} - local ${localDesc}, remote ${remoteDesc}`);
                 }
-            }
-            if (nominated) {
-                const local = stats.get(nominated.localCandidateId);
-                const remote = stats.get(nominated.remoteCandidateId);
-                const localDesc = local ? `${local.candidateType} ${local.address}:${local.port}` : 'unknown';
-                const remoteDesc = remote ? `${remote.candidateType} ${remote.address}:${remote.port}` : 'unknown';
-                if (local?.candidateType === 'relay' || remote?.candidateType === 'relay') {
-                    console.warn(`Using TURN relay - local: ${localDesc}, remote: ${remoteDesc}`);
-                } else {
-                    console.log(`Direct connection - local: ${localDesc}, remote: ${remoteDesc}`);
-                }
-            }
-        } catch (e) {
-            // Ignore stats errors
-        }
+            } catch (e) {}
+            setTimeout(tick, 2000);
+        };
+        tick();
     }
 
     handleDataChannelMessage(event) {
@@ -440,17 +489,16 @@ class BitBangConnection {
                 return;
             }
 
-            // Reset timeout on any data received
-            req.resetTimeout();
-
             if (frame.flags & FLAG_SYN) {
                 // Metadata frame - send headers to SW, it will create the stream
                 const text = new TextDecoder().decode(frame.payload);
                 const metadata = JSON.parse(text);
                 const status = metadata.status || 200;
-                console.log(`[Bootstrap] Response for stream ${frame.streamId}: ${status}`);
+                if (this.debug) console.log(`[Bootstrap] Response for stream ${frame.streamId}: ${status}`);
 
-                // Clear timeout on first response
+                // Clear timeout once response starts. After this, inactivity
+                // between chunks is normal (consumer backpressure for streams)
+                // and shouldn't kill the request.
                 clearTimeout(req.timeout);
 
                 req.responsePort.postMessage({
@@ -561,6 +609,22 @@ class BitBangConnection {
         }
     }
 
+    showReloadScreen(message) {
+        const iframe = document.getElementById('device-frame');
+        if (iframe) iframe.style.display = 'none';
+        if (this.connectionUI) {
+            this.connectionUI.className = '';
+            this.connectionUI.innerHTML = `
+                <div style="font-size: 14px; margin-bottom: 12px;">${message}</div>
+                <button id="bb-reload-btn"
+                        style="padding: 6px 14px; font-size: 14px; border: 1px solid #ccc;
+                               border-radius: 3px; background: #fff; cursor: pointer;">Reload</button>
+            `;
+            this.connectionUI.style.display = '';
+            document.getElementById('bb-reload-btn').onclick = () => location.reload();
+        }
+    }
+
     showErrorScreen(message) {
         if (this.connectionUI) {
             if (this.debug) {
@@ -614,16 +678,21 @@ class BitBangConnection {
     handleWSFrame(frame, ws) {
         if (frame.flags & FLAG_SYN) {
             // Device acknowledged the WebSocket open
+            if (this.debug) console.log(`[Bootstrap] ws SYN ack from device, streamId=${frame.streamId}`);
             ws.iframe.postMessage({ type: 'ws-opened', streamId: frame.streamId }, '*');
         }
 
         if (frame.flags & FLAG_FIN) {
-            // Device closed the WebSocket
+            // Device closed the WebSocket. Report 1006 (Abnormal Closure) so
+            // SockJS-style clients reconnect. Code 1000 means "application
+            // requested close" and SockJS treats it as terminal -- but a
+            // device-initiated FIN is the upstream WS dropping, not the app.
+            if (this.debug) console.log(`[Bootstrap] ws FIN from device, streamId=${frame.streamId}`);
             this.wsStreams.delete(frame.streamId);
             ws.iframe.postMessage({
                 type: 'ws-closed',
                 streamId: frame.streamId,
-                code: 1000
+                code: 1006
             }, '*');
             return;
         }
@@ -660,6 +729,7 @@ class BitBangConnection {
             uid: this.uid,
             target: target,
             debug: this.debug,
+            noCookieJar: this.noCookieJar,
         });
 
         // Brief delay for any pending tracks to arrive
@@ -722,6 +792,7 @@ class BitBangConnection {
             // Allocate a stream ID and send SYN with websocket type
             const streamId = this.nextStreamId++;
             this.wsStreams.set(streamId, { iframe: iframe.contentWindow });
+            if (this.debug) console.log(`[Bootstrap] ws-open ${msg.pathname}, streamId=${streamId}, cookies.len=${(msg.cookies || '').length}`);
 
             // Tell the shim which streamId was assigned
             iframe.contentWindow.postMessage({
@@ -737,6 +808,7 @@ class BitBangConnection {
                 cookies: msg.cookies || '',
             });
             this.dataChannel.send(this.createFrame(streamId, FLAG_SYN, synPayload));
+            if (this.debug) console.log(`[Bootstrap] ws SYN sent to device, streamId=${streamId}`);
 
         } else if (msg.type === 'ws-send') {
             const ws = this.wsStreams.get(msg.streamId);
@@ -864,6 +936,7 @@ class BitBangConnection {
 // that escapes the /__device__/ scope), skip initialization to avoid a second
 // WebRTC connection that would fail with "Device not found".
 (async function() {
+    console.log('[Bootstrap] IIFE running', window.location.href);
     if (window !== window.top) {
         console.warn('[Bootstrap] Skipping init — running inside iframe, not top-level');
         return;
