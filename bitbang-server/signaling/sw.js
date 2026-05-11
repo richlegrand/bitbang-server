@@ -126,6 +126,18 @@ self.addEventListener('message', async (event) => {
 async function findSession(event) {
     await sessionsReady;
 
+    // Top-level navigations to /<uid>/... are bootstrap-page loads — they
+    // must always fall through to the signaling server (which serves
+    // bootstrap.html), never get proxied to the device. Without this, a
+    // page reload while the old bootstrap window is still being torn down
+    // can match the stale session via Strategy 3 (uid-in-referer) and end
+    // up routing the reload through the device, which then 404s.
+    const reqUrl = new URL(event.request.url);
+    const isUidPath = /^\/[0-9a-f]{20,}/.test(reqUrl.pathname);
+    if (isUidPath && event.request.mode === 'navigate') {
+        return null;
+    }
+
     // Drop sessions whose owning client is gone. Without this, an auto-fetch
     // (e.g. /favicon.ico right after a refresh) can match a stale uid-keyed
     // entry from a previous page and get routed into the rescue path. The
@@ -167,8 +179,6 @@ async function findSession(event) {
     // Strategy 4: single-session fallback. Safe when there's only one
     // session. Excludes top-level UID paths (e.g. /bb29bead...) which
     // need the signaling server to load bootstrap.html.
-    const reqPath = new URL(event.request.url).pathname;
-    const isUidPath = /^\/[0-9a-f]{20,}/.test(reqPath);
     if (sessions.size === 1 && !isUidPath) {
         return Array.from(sessions.keys())[0];
     }

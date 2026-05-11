@@ -122,6 +122,16 @@ class SignalingServer:
         self.coturn_secret = os.environ.get('COTURN_SECRET')
         self.coturn_ttl = int(os.environ.get('COTURN_TTL', '86400'))
 
+        # Capacity gate on concurrent TURN allocations. 0 disables the gate.
+        # When the gate is active and len(self.turn_clients) >= the cap, new
+        # clients receive STUN-only ICE plus an advisory `turn_unavailable`
+        # flag in the offer envelope. The TTL-based end-of-session warning
+        # uses COTURN_TTL above; the client parses the credential username
+        # (an epoch expiry) to compute its own warning/end triggers.
+        self.turn_max_active = int(os.environ.get('TURN_MAX_ACTIVE', '0'))
+        self.turn_clients = set()           # client_ids currently granted TURN
+        self.client_turn_creds = {}         # client_id -> cached creds (generated once at request time, reused at offer time)
+
         self._register_routes()
 
     # -- Routes -----------------------------------------------------------
@@ -139,6 +149,8 @@ class SignalingServer:
                 'min_protocol': MINIMUM_PROTOCOL_VERSION,
                 'devices': len(self.devices),
                 'clients': len(self.clients),
+                'active_turn_clients': len(self.turn_clients),
+                'turn_max_active': self.turn_max_active,
             })
 
         @self.app.route('/__bitbang__/<path:filename>')
@@ -351,13 +363,17 @@ class SignalingServer:
 
                 if msg_type == 'offer':
                     if client_id and client_id in self.clients:
+                        ice_servers, turn_unavailable, _ = \
+                            self._ice_servers_for_client(uid, client_id)
                         forward_msg = {
                             'type': 'offer',
                             'sdp': msg['sdp'],
                             'client_id': client_id,
                             'streams': msg.get('streams', {}),
-                            'ice_servers': self.get_ice_servers_for_device(uid),
+                            'ice_servers': ice_servers,
                         }
+                        if turn_unavailable:
+                            forward_msg['turn_unavailable'] = True
                         if 'device_name' in msg:
                             forward_msg['device_name'] = msg['device_name']
                         await self.clients[client_id].send(json.dumps(forward_msg))
@@ -408,6 +424,8 @@ class SignalingServer:
         finally:
             if client_id in self.clients:
                 del self.clients[client_id]
+                self.turn_clients.discard(client_id)
+                self.client_turn_creds.pop(client_id, None)
                 log.info(f"Client disconnected: {client_id}")
 
     async def _client_message_loop(self, client_id, target_uid):
@@ -424,11 +442,23 @@ class SignalingServer:
             msg['client_id'] = client_id
 
             if msg_type == 'request':
-                ice_servers = self.get_ice_servers_for_device(target_uid)
+                # Decide capacity gating once, at request time. The decision
+                # is captured in self.turn_clients and reused at offer-forward
+                # time so device and client receive consistent ice_servers.
+                self._maybe_grant_turn(client_id, target_uid)
+                ice_servers, turn_unavailable, _ = \
+                    self._ice_servers_for_client(target_uid, client_id)
                 if ice_servers:
                     msg['ice_servers'] = ice_servers
                 if await self._forward_to_device(target_uid, msg):
-                    turn_status = "with TURN" if ice_servers else "direct only (no TURN credentials)"
+                    if turn_unavailable:
+                        turn_status = "STUN only (at capacity)"
+                    elif client_id in self.turn_clients:
+                        turn_status = "with TURN"
+                    elif target_uid in self.device_ice_servers:
+                        turn_status = "with device-supplied ICE"
+                    else:
+                        turn_status = "direct only (no TURN credentials)"
                     log.info(f"Forwarded request from client {client_id} to {target_uid} ({turn_status})")
                 else:
                     await self._send_error(websocket, 'Device not found')
@@ -451,7 +481,8 @@ class SignalingServer:
         """Generate ephemeral TURN credentials using TURN REST API (RFC 7635).
 
         coturn validates these using the same shared secret — no database or
-        API calls needed. Credentials are short-lived (default 24h).
+        API calls needed. Credentials are short-lived (set via COTURN_TTL).
+        Username is the expiry epoch as a string.
         """
         expiry = int(time.time()) + self.coturn_ttl
         username = str(expiry)
@@ -464,15 +495,43 @@ class SignalingServer:
              "username": username, "credential": password}
         ]
 
-    def get_ice_servers(self):
-        """Generate fresh TURN credentials for a connection, or empty if not configured."""
-        if self.coturn_host and self.coturn_secret:
-            return self._generate_coturn_credentials()
-        return []
+    def _maybe_grant_turn(self, client_id, target_uid):
+        """Capacity decision. Adds client_id to turn_clients iff under cap and
+        we'd otherwise be issuing our own coturn credentials. Idempotent."""
+        if target_uid in self.device_ice_servers:
+            return  # Device override path: no gating, not our bandwidth.
+        if not (self.coturn_host and self.coturn_secret):
+            return  # No coturn configured.
+        if client_id in self.turn_clients:
+            return  # Already granted (request was repeated).
+        if self.turn_max_active and len(self.turn_clients) >= self.turn_max_active:
+            return  # At capacity.
+        self.turn_clients.add(client_id)
 
-    def get_ice_servers_for_device(self, uid):
-        """Return device-specific ICE servers if set, otherwise fall back to coturn."""
-        return self.device_ice_servers.get(uid) or self.get_ice_servers()
+    def _ice_servers_for_client(self, target_uid, client_id):
+        """Returns (ice_servers, turn_unavailable, our_turn).
+
+        - our_turn=True iff the returned ice_servers came from OUR coturn
+          (so the time/data budget metadata applies). False for device
+          overrides, no-coturn, or capacity-gated STUN-only cases.
+        - turn_unavailable=True iff coturn IS configured but this client
+          was gated out by capacity. Surfaces to the client as the
+          "Server at capacity" banner.
+
+        Credentials are generated once per client and cached, so the
+        request-to-device and offer-to-client paths see identical creds."""
+        if target_uid in self.device_ice_servers:
+            return self.device_ice_servers[target_uid], False, False
+        if not (self.coturn_host and self.coturn_secret):
+            return [], False, False
+        if client_id in self.turn_clients:
+            creds = self.client_turn_creds.get(client_id)
+            if creds is None:
+                creds = self._generate_coturn_credentials()
+                self.client_turn_creds[client_id] = creds
+            return creds, False, True
+        # Coturn configured but client wasn't granted TURN — STUN-only.
+        return [{"urls": f"stun:{self.coturn_host}:3478"}], True, False
 
     # -- Server startup ---------------------------------------------------
 

@@ -41,8 +41,18 @@ class BitBangConnection {
 
         this.statusEl = document.getElementById('status');
         this.connectionUI = document.getElementById('connection-ui');
+        this.turnBannerEl = document.getElementById('turn-banner');
         this.debug = new URLSearchParams(window.location.search).has('debug');
         this.noCookieJar = new URLSearchParams(window.location.search).has('nocookiejar');
+        this._turnHoldPromise = null;
+        this._wasConnected = false;
+        this._usingRelay = false;
+        this._turnWarnTimer = null;
+        this._turnEndTimer = null;
+        this._turnExpiryMs = null;
+        this._turnDurationMin = null;  // captured at first-connect, reused in end message
+        this._turnUnavailable = false;
+        this._turnEnded = false;
 
         if (this.debug && this.connectionUI) {
             this.connectionUI.classList.add('debug');
@@ -317,6 +327,31 @@ class BitBangConnection {
         this.updateStatus(STATUS.CONNECTING_WEBRTC);
         this.streamNameMap = msg.streams || {};
         this.deviceName = msg.device_name || null;
+        this._turnUnavailable = !!msg.turn_unavailable;
+        // Surface "at capacity" immediately on receipt, not after connect:
+        // with ?relay + capacity gating the connection may never establish
+        // (no TURN server in iceServers + relay-only policy = no candidates),
+        // so _onFirstConnected won't ever fire and the user would otherwise
+        // get no feedback at all.
+        if (this._turnUnavailable) {
+            this._setRelayBanner('Relay server (TURN) is at capacity. Connection may fail — please try again later.');
+        }
+        // Coturn REST-API username format: "<expiry-epoch>[:<user_name>]".
+        // The expiry is set via COTURN_TTL in signaling/.env; the optional
+        // user_name suffix is the BitBang uid (used for per-uid quota in
+        // coturn). Match the leading integer up to either a colon or
+        // end-of-string. If multiple TURN entries are present, they share
+        // the same username.
+        this._turnExpiryMs = null;
+        if (Array.isArray(msg.ice_servers)) {
+            for (const s of msg.ice_servers) {
+                const m = s && s.username && /^(\d+)(:|$)/.exec(s.username);
+                if (m) {
+                    this._turnExpiryMs = parseInt(m[1], 10) * 1000;
+                    break;
+                }
+            }
+        }
         this.pc = this.createPeerConnection(msg.ice_servers);
 
         if (this.debug) {
@@ -350,14 +385,25 @@ class BitBangConnection {
 
     createPeerConnection(iceServers) {
         const config = { sdpSemantics: 'unified-plan' };
-        // ?norelay drops STUN/TURN servers entirely so ICE only has host
-        // candidates. Diagnostic for "is host-to-host actually broken, or
-        // is it just losing the race to relay?"
-        const noRelay = new URLSearchParams(location.search).has('norelay');
+        // Diagnostic flags:
+        //   ?norelay drops STUN/TURN servers entirely so ICE only has host
+        //     candidates ("is host-to-host actually broken, or is it just
+        //     losing the race to relay?").
+        //   ?relay sets iceTransportPolicy:'relay' so the browser only
+        //     gathers and uses relay candidates ("force the TURN path so
+        //     we can verify the relay-in-use banner / end-of-session UX").
+        // The two are mutually exclusive; norelay wins if both are set.
+        const params = new URLSearchParams(location.search);
+        const noRelay = params.has('norelay');
+        const forceRelay = params.has('relay') && !noRelay;
         if (iceServers && iceServers.length > 0 && !noRelay) {
             config.iceServers = iceServers;
         }
+        if (forceRelay) {
+            config.iceTransportPolicy = 'relay';
+        }
         if (noRelay) console.log('[Bootstrap] norelay: forcing host-only ICE');
+        if (forceRelay) console.log('[Bootstrap] relay: forcing relay-only ICE');
         const pc = new RTCPeerConnection(config);
 
         pc.onconnectionstatechange = () => {
@@ -365,13 +411,25 @@ class BitBangConnection {
             if (pc.connectionState === 'connected') {
                 this.updateStatus(STATUS.CONNECTED);
                 this.pollConnectionType(pc);
+                if (!this._wasConnected) {
+                    this._wasConnected = true;
+                    this._onFirstConnected(pc);
+                }
             } else if (pc.connectionState === 'failed') {
-                this.showErrorScreen('Peer connection failed');
+                if (this._wasConnected) {
+                    this._handlePostHandshakeFailure();
+                } else {
+                    this.showErrorScreen('Peer connection failed');
+                }
             }
         };
 
         pc.oniceconnectionstatechange = () => {
             if (this.debug) console.log(`[Bootstrap] iceConnectionState -> ${pc.iceConnectionState}`);
+            if (this._wasConnected && this._usingRelay
+                && (pc.iceConnectionState === 'failed' || pc.iceConnectionState === 'disconnected')) {
+                this._handlePostHandshakeFailure();
+            }
         };
 
         pc.onicecandidate = (event) => {
@@ -457,6 +515,121 @@ class BitBangConnection {
             setTimeout(tick, 2000);
         };
         tick();
+    }
+
+    // Returns true if any transport's selected ICE candidate pair has a
+    // TURN relay on either end.
+    async _isUsingRelay(pc) {
+        try {
+            const stats = await pc.getStats();
+            for (const [, report] of stats) {
+                if (report.type !== 'transport' || !report.selectedCandidatePairId) continue;
+                const pair = stats.get(report.selectedCandidatePairId);
+                if (!pair) continue;
+                const local = stats.get(pair.localCandidateId);
+                const remote = stats.get(pair.remoteCandidateId);
+                if (local?.candidateType === 'relay' || remote?.candidateType === 'relay') {
+                    return true;
+                }
+            }
+        } catch (e) {}
+        return false;
+    }
+
+    _setRelayBanner(text) {
+        if (!this.turnBannerEl) return;
+        this.turnBannerEl.textContent = text;
+        this.turnBannerEl.hidden = false;
+    }
+
+    // Fired once per session, the first time pc.connectionState reaches
+    // 'connected'. DTLS is up by then; candidate-pair byte counters are
+    // populated. We use this to:
+    //   (a) show the "TURN relay in use" banner if a relay pair has any
+    //       byte traffic (or if turn_unavailable was advertised);
+    //   (b) arm the 2-second loading-page hold so the banner is readable;
+    //   (c) start the data-budget / time-budget poll loop (Part 2).
+    async _onFirstConnected(pc) {
+        this._usingRelay = await this._isUsingRelay(pc);
+        if (this._usingRelay) {
+            if (this._turnExpiryMs) {
+                const minutes = Math.max(1, Math.round((this._turnExpiryMs - Date.now()) / 60_000));
+                this._turnDurationMin = minutes;
+                this._setRelayBanner(`Using temporary relay (TURN) for up to ${minutes} minute${minutes === 1 ? '' : 's'} — direct peer-to-peer was not possible.`);
+            } else {
+                this._setRelayBanner('Using temporary relay (TURN) — direct peer-to-peer was not possible.');
+            }
+            this._turnHoldPromise = new Promise(r => setTimeout(r, 2000));
+        } else if (this._turnUnavailable) {
+            // Banner was already set in handleOffer; just arm the hold so
+            // the visible message survives iframe handoff for ~2 s.
+            this._turnHoldPromise = new Promise(r => setTimeout(r, 2000));
+        }
+        // Arm the TTL-based end triggers if we're on a relay path and we
+        // know when the credential expires. Direct paths skip both.
+        if (this._usingRelay && this._turnExpiryMs) {
+            this._armTurnEndTimers();
+        }
+    }
+
+    // Schedule the title-change warning at expiry-60s and the reload screen
+    // at expiry. Both use absolute deltas from now, derived from the epoch
+    // expiry the server embedded in the TURN credential username.
+    _armTurnEndTimers() {
+        const now = Date.now();
+        const warnAt = this._turnExpiryMs - 60_000 - now;
+        const endAt = this._turnExpiryMs - now;
+        if (warnAt > 0) {
+            this._turnWarnTimer = setTimeout(() => {
+                if (!this._turnEnded) {
+                    document.title = '⚠ Relay ending soon — bitba.ng';
+                }
+            }, warnAt);
+        }
+        if (endAt > 0) {
+            this._turnEndTimer = setTimeout(() => {
+                if (this._turnEnded) return;
+                this._turnEnded = true;
+                this.showReloadScreen(this._endedMessage());
+            }, endAt);
+        } else {
+            // Already past expiry by the time we got here — fire immediately.
+            this._turnEnded = true;
+            this.showReloadScreen(this._endedMessage());
+        }
+    }
+
+    _endedMessage() {
+        if (this._turnDurationMin) {
+            const plural = this._turnDurationMin === 1 ? '' : 's';
+            return `Relay session ended after ${this._turnDurationMin} minute${plural}. Reload to continue.`;
+        }
+        return 'Relay session ended. Reload to continue.';
+    }
+
+    _clearTurnEndTimers() {
+        if (this._turnWarnTimer) {
+            clearTimeout(this._turnWarnTimer);
+            this._turnWarnTimer = null;
+        }
+        if (this._turnEndTimer) {
+            clearTimeout(this._turnEndTimer);
+            this._turnEndTimer = null;
+        }
+    }
+
+    // Idempotent. Called from either onconnectionstatechange === 'failed' or
+    // oniceconnectionstatechange transitions to failed/disconnected after we
+    // were once connected. Message text varies based on whether the session
+    // was actually using a TURN relay.
+    _handlePostHandshakeFailure() {
+        if (this._turnEnded) return;
+        this._turnEnded = true;
+        this._clearTurnEndTimers();
+        const msg = this._usingRelay
+            ? 'Connection lost — relay may have expired.'
+            : 'Connection lost. Reload to continue.';
+        this.showReloadScreen(msg);
     }
 
     handleDataChannelMessage(event) {
@@ -739,8 +912,13 @@ class BitBangConnection {
         const connectMsg = JSON.stringify({ type: 'connect', path: this.devicePath });
         this.dataChannel.send(this.createFrame(0, FLAG_SYN, connectMsg));
 
-        // Wait for 'ready' response from device
-        await new Promise(resolve => { this.connectResolve = resolve; });
+        // Wait for 'ready' response from device, AND for the optional 2 s
+        // TURN banner hold. The hold timer is armed in _onFirstConnected
+        // (which runs at DTLS-up, before this point), so the wait is
+        // concurrent with device app boot. On non-relay paths the hold is
+        // null and Promise.all skips immediately.
+        const connectPromise = new Promise(resolve => { this.connectResolve = resolve; });
+        await Promise.all([connectPromise, this._turnHoldPromise || Promise.resolve()]);
 
         // Listen for messages from the iframe (WebSocket shim + navigation)
         window.addEventListener('message', (event) => {
