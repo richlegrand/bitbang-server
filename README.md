@@ -2,6 +2,8 @@
 
 Signaling server for [BitBang](https://github.com/richlegrand/bitbang). Handles WebSocket signaling between devices and browsers to establish WebRTC connections.
 
+This is part of the [BitBang project](https://github.com/richlegrand/bitbang). 
+
 ## Setup
 
 Requires Python 3.10+ with a virtual environment:
@@ -38,3 +40,11 @@ Listens on port 8081. Use a reverse proxy (nginx/caddy) for TLS.
 ## Deployment
 
 The `upload` script tars the `signaling/` directory, uploads it to the server via SCP, extracts it, and restarts the `signaling.service` systemd unit.
+
+## License
+
+MIT. See [LICENSE](LICENSE).
+
+## Contributing
+
+This is a one-person project. Issues and PRs are welcome and genuinely appreciated. I'll do my best to respond promptly.
