@@ -1,0 +1,4 @@
+/signaling-go
+/signaling.log
+*.test
+*.out

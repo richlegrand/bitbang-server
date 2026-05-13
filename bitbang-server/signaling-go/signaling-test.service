@@ -1,0 +1,16 @@
+[Unit]
+Description=BitBang signaling server (Go, test deploy)
+After=network.target
+
+[Service]
+Type=simple
+WorkingDirectory=/opt/bitbang-test
+ExecStart=/opt/bitbang-test/signaling-go
+EnvironmentFile=/opt/bitbang-test/.env
+Restart=on-failure
+RestartSec=5
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target

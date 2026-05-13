@@ -856,16 +856,27 @@ class BitBangConnection {
         }
 
         if (frame.flags & FLAG_FIN) {
-            // Device closed the WebSocket. Report 1006 (Abnormal Closure) so
-            // SockJS-style clients reconnect. Code 1000 means "application
-            // requested close" and SockJS treats it as terminal -- but a
-            // device-initiated FIN is the upstream WS dropping, not the app.
-            if (this.debug) console.log(`[Bootstrap] ws FIN from device, streamId=${frame.streamId}`);
+            // Device closed the WebSocket. Parse the JSON close-info payload
+            // (added in adapter.py) for the actual close code + reason from
+            // the upstream WS. Fall back to 1006 if missing or malformed --
+            // we always want SockJS-style clients to retry (code 1000 would
+            // be treated as terminal).
+            let code = 1006;
+            let reason = '';
+            if (frame.payload && frame.payload.byteLength > 0) {
+                try {
+                    const info = JSON.parse(new TextDecoder().decode(frame.payload));
+                    if (typeof info.code === 'number') code = info.code;
+                    if (typeof info.reason === 'string') reason = info.reason;
+                } catch (e) {}
+            }
+            if (this.debug) console.log(`[Bootstrap] ws FIN from device, streamId=${frame.streamId} code=${code} reason=${JSON.stringify(reason)}`);
             this.wsStreams.delete(frame.streamId);
             ws.iframe.postMessage({
                 type: 'ws-closed',
                 streamId: frame.streamId,
-                code: 1006
+                code,
+                reason
             }, '*');
             return;
         }

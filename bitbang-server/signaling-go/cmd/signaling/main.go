@@ -1,0 +1,172 @@
+// Command signaling is the BitBang signaling server (Go port of signaling.py).
+//
+// Environment variables:
+//
+//	PORT             HTTP port to listen on (default 8081)
+//	COTURN_HOST      TURN server hostname; empty disables coturn
+//	COTURN_SECRET    TURN REST API shared secret
+//	COTURN_TTL       TURN credential lifetime in seconds (default 86400)
+//	TURN_MAX_ACTIVE  Max concurrent clients granted TURN (0 = no cap)
+//	LOG_LEVEL        DEBUG | INFO | WARN | ERROR (default INFO)
+//	STATIC_DIR       Path to static asset directory (default ../signaling)
+package main
+
+import (
+	"context"
+	"errors"
+	"log/slog"
+	"net/http"
+	"os"
+	"os/signal"
+	"strconv"
+	"strings"
+	"syscall"
+	"time"
+
+	"github.com/gorilla/websocket"
+
+	"bitbang-server-go/internal/handler"
+	"bitbang-server-go/internal/ratelimit"
+	"bitbang-server-go/internal/registry"
+	"bitbang-server-go/internal/turn"
+)
+
+func main() {
+	cfg := loadConfig()
+	logger := newLogger(cfg.LogLevel)
+	slog.SetDefault(logger)
+
+	devices := registry.NewMemoryRegistry()
+	clients := registry.NewClientRegistry()
+	turnProvider := turn.NewCoturn(cfg.CoturnHost, cfg.CoturnSecret, cfg.CoturnTTL, cfg.TURNMaxActive)
+	limiter := ratelimit.NoOp{}
+
+	if turnProvider.Configured() {
+		logger.Info("TURN: using coturn",
+			"host", turnProvider.Host(),
+			"ttl_s", cfg.CoturnTTL,
+			"max_active", cfg.TURNMaxActive)
+	} else {
+		logger.Info("TURN: no TURN server configured — devices must provide their own ICE servers")
+	}
+
+	deps := &handler.Deps{
+		Devices:      devices,
+		Clients:      clients,
+		TURN:         turnProvider,
+		Limiter:      limiter,
+		Log:          logger,
+		Upgrader:     websocket.Upgrader{CheckOrigin: func(*http.Request) bool { return true }},
+		PingInterval: 60 * time.Second,
+		PongWait:     300 * time.Second,
+	}
+
+	mux := http.NewServeMux()
+	mux.HandleFunc("GET /status", deps.Status)
+	mux.HandleFunc("GET /ws/device/{uid}", func(w http.ResponseWriter, r *http.Request) {
+		deps.DeviceWS(w, r, r.PathValue("uid"))
+	})
+	mux.HandleFunc("GET /ws/client/{uid}", func(w http.ResponseWriter, r *http.Request) {
+		deps.ClientWS(w, r, r.PathValue("uid"))
+	})
+	mux.Handle("/", handler.Static(cfg.StaticDir))
+
+	srv := &http.Server{
+		Addr:    cfg.Bind,
+		Handler: requestLogger(logger, mux),
+		// No ReadTimeout/WriteTimeout because WebSocket upgrades need
+		// long-lived connections. Idle timeout protects against slow
+		// HTTP clients on non-WS endpoints.
+		IdleTimeout: 120 * time.Second,
+	}
+
+	// Graceful shutdown: SIGINT/SIGTERM → Server.Shutdown with 2s grace,
+	// then hard exit. Matches Python signaling.py behavior.
+	stopChan := make(chan os.Signal, 1)
+	signal.Notify(stopChan, syscall.SIGINT, syscall.SIGTERM)
+
+	go func() {
+		sig := <-stopChan
+		logger.Info("shutting down", "signal", sig.String())
+		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+		defer cancel()
+		_ = srv.Shutdown(ctx)
+		// Hard exit even if Shutdown is hung on open WS connections.
+		// Daemon-style: don't wait for clients to disconnect gracefully.
+		os.Exit(0)
+	}()
+
+	logger.Info("listening", "addr", cfg.Bind, "static_dir", cfg.StaticDir)
+	if err := srv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
+		logger.Error("server exited", "err", err)
+		os.Exit(1)
+	}
+}
+
+type config struct {
+	Bind          string
+	CoturnHost    string
+	CoturnSecret  string
+	CoturnTTL     int
+	TURNMaxActive int
+	LogLevel      slog.Level
+	StaticDir     string
+}
+
+func loadConfig() config {
+	port := envOr("PORT", "8081")
+	staticDir := envOr("STATIC_DIR", "../signaling")
+	return config{
+		Bind:          "0.0.0.0:" + port,
+		CoturnHost:    os.Getenv("COTURN_HOST"),
+		CoturnSecret:  os.Getenv("COTURN_SECRET"),
+		CoturnTTL:     envOrInt("COTURN_TTL", 86400),
+		TURNMaxActive: envOrInt("TURN_MAX_ACTIVE", 0),
+		LogLevel:      parseLogLevel(envOr("LOG_LEVEL", "INFO")),
+		StaticDir:     staticDir,
+	}
+}
+
+func envOr(name, def string) string {
+	if v := os.Getenv(name); v != "" {
+		return v
+	}
+	return def
+}
+
+func envOrInt(name string, def int) int {
+	if v := os.Getenv(name); v != "" {
+		if n, err := strconv.Atoi(v); err == nil {
+			return n
+		}
+	}
+	return def
+}
+
+func parseLogLevel(s string) slog.Level {
+	switch strings.ToUpper(s) {
+	case "DEBUG":
+		return slog.LevelDebug
+	case "WARN", "WARNING":
+		return slog.LevelWarn
+	case "ERROR":
+		return slog.LevelError
+	default:
+		return slog.LevelInfo
+	}
+}
+
+func newLogger(level slog.Level) *slog.Logger {
+	return slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{
+		Level: level,
+	}))
+}
+
+// requestLogger logs HTTP requests at DEBUG level. WebSocket upgrades log
+// once and the handler takes over from there.
+func requestLogger(log *slog.Logger, next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		log.Debug("http", "method", r.Method, "path", r.URL.Path, "remote", r.RemoteAddr)
+		next.ServeHTTP(w, r)
+	})
+}

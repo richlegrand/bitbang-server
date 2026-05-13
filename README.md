@@ -20,7 +20,7 @@ The server generates ephemeral TURN credentials using the [TURN REST API](https:
 ```
 COTURN_HOST=turn.example.com
 COTURN_SECRET=your-shared-secret
-```
+``` 
 
 The `COTURN_SECRET` must match the `static-auth-secret` in your coturn server's `turnserver.conf`.
 
@@ -47,4 +47,4 @@ MIT. See [LICENSE](LICENSE).
 
 ## Contributing
 
-This is a one-person project. Issues and PRs are welcome and genuinely appreciated. I'll do my best to respond promptly.
+Issues and PRs are welcome. 
