@@ -59,6 +59,7 @@ func (d *Deps) DeviceWS(w http.ResponseWriter, r *http.Request, uid string) {
 	defer ws.Close()
 
 	d.setReadKeepalive(ws)
+	d.startPingLoop(ws)
 
 	connectAt := time.Now()
 	conn := &registry.DeviceConn{UID: uid, WS: ws, ConnectAt: connectAt}
@@ -272,6 +273,35 @@ func (d *Deps) setReadKeepalive(ws *websocket.Conn) {
 		_ = ws.SetReadDeadline(time.Now().Add(wait))
 		return nil
 	})
+}
+
+// startPingLoop launches a goroutine that sends ping control frames every
+// PingInterval. The peer's pong response resets the read deadline (see
+// SetPongHandler in setReadKeepalive); without this loop, idle connections
+// silently drop at PongWait even though the peer is alive. The goroutine
+// exits when WriteControl returns an error (i.e. the WS has been closed).
+//
+// Note: gorilla/websocket does NOT auto-send pings — unlike Python's
+// websockets library — so the application has to drive the keepalive.
+func (d *Deps) startPingLoop(ws *websocket.Conn) {
+	interval := d.PingInterval
+	if interval == 0 {
+		return
+	}
+	go func() {
+		ticker := time.NewTicker(interval)
+		defer ticker.Stop()
+		for range ticker.C {
+			err := ws.WriteControl(
+				websocket.PingMessage,
+				nil,
+				time.Now().Add(10*time.Second),
+			)
+			if err != nil {
+				return
+			}
+		}
+	}()
 }
 
 // shortClientID strips the device UID prefix for log brevity.

@@ -1,14 +1,14 @@
-// Command signaling is the BitBang signaling server (Go port of signaling.py).
+// Command signaling is the BitBang signaling server.
 //
 // Environment variables:
 //
-//	PORT             HTTP port to listen on (default 8081)
-//	COTURN_HOST      TURN server hostname; empty disables coturn
-//	COTURN_SECRET    TURN REST API shared secret
-//	COTURN_TTL       TURN credential lifetime in seconds (default 86400)
-//	TURN_MAX_ACTIVE  Max concurrent clients granted TURN (0 = no cap)
-//	LOG_LEVEL        DEBUG | INFO | WARN | ERROR (default INFO)
-//	STATIC_DIR       Path to static asset directory (default ../signaling)
+//	BITBANG_SERVER_PORT  HTTP port to listen on (default 8082)
+//	COTURN_HOST          TURN server hostname; empty disables coturn
+//	COTURN_SECRET        TURN REST API shared secret
+//	COTURN_TTL           TURN credential lifetime in seconds (default 86400)
+//	TURN_MAX_ACTIVE      Max concurrent clients granted TURN (0 = no cap)
+//	LOG_LEVEL            DEBUG | INFO | WARN | ERROR (default INFO)
+//	STATIC_DIR           Path to web/ asset directory (default ./web)
 package main
 
 import (
@@ -114,8 +114,8 @@ type config struct {
 }
 
 func loadConfig() config {
-	port := envOr("PORT", "8081")
-	staticDir := envOr("STATIC_DIR", "../signaling")
+	port := envOr("BITBANG_SERVER_PORT", "8082")
+	staticDir := envOr("STATIC_DIR", "./web")
 	return config{
 		Bind:          "0.0.0.0:" + port,
 		CoturnHost:    os.Getenv("COTURN_HOST"),

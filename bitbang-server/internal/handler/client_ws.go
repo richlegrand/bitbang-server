@@ -31,6 +31,7 @@ func (d *Deps) ClientWS(w http.ResponseWriter, r *http.Request, targetUID string
 	defer ws.Close()
 
 	d.setReadKeepalive(ws)
+	d.startPingLoop(ws)
 
 	clientID := targetUID + "_" + shortRandomHex(4)
 	connectAt := time.Now()

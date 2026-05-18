@@ -205,3 +205,15 @@ cython_debug/
 marimo/_static/
 marimo/_lsp/
 __marimo__/
+
+# BitBang signaling server
+# Runtime env files (contain COTURN_SECRET, ship to remote as .env)
+*.env
+# Deploy-time SSH config (machine-specific paths)
+*.deploy
+# Compiled signaling binary
+signaling-go
+# Deploy artifacts
+*.tgz
+*.test
+*.out

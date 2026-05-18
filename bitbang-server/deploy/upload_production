@@ -1,0 +1,50 @@
+#!/bin/bash
+# upload_production - build, ship, and restart the signaling server on
+# the production host.
+#
+# Reads deploy/production.deploy for SSH config (local, never ships).
+# Ships:   ./signaling-go (compiled), deploy/production.env (-> .env on
+#          remote), deploy/signaling.service, web/.
+# Restarts signaling.service on the remote.
+set -euo pipefail
+
+# Run from repo root (parent of deploy/).
+ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+cd "${ROOT}"
+
+source deploy/production.deploy
+
+# Cross-compile for linux/amd64. Static binary, no CGo runtime deps.
+echo "Building signaling-go for linux/amd64..."
+CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -o signaling-go ./cmd/signaling
+
+TARFILE=signaling-production.tgz
+SERVICE=signaling.service
+
+tar cvfz "${TARFILE}" \
+    signaling-go \
+    deploy/production.env \
+    deploy/"${SERVICE}" \
+    web
+
+scp -i "${SERVER_SSH_KEY}" "${TARFILE}" "${SERVER_SSH}:${SERVER_SSH_DIR}/${TARFILE}"
+
+ssh "${SERVER_SSH}" -i "${SERVER_SSH_KEY}" "
+    set -e
+    cd ${SERVER_SSH_DIR}
+    tar xvfz ${TARFILE}
+
+    # Move runtime env and service file to the locations systemd expects.
+    cp deploy/production.env .env
+    cp deploy/${SERVICE} ${SERVICE}
+
+    systemctl --user restart ${SERVICE}
+    sleep 0.5
+    systemctl --no-pager --lines=10 status ${SERVICE} || true
+"
+
+PORT=$(grep '^BITBANG_SERVER_PORT=' deploy/production.env | cut -d= -f2)
+echo
+echo "Deployed. /status:"
+ssh "${SERVER_SSH}" -i "${SERVER_SSH_KEY}" "curl -s http://localhost:${PORT}/status" || true
+echo

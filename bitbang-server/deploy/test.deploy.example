@@ -1,0 +1,6 @@
+# Deploy-time config for upload_test. Copy to test.deploy and fill in.
+# Sourced locally; never ships to the remote.
+
+SERVER_SSH=user@hostname
+SERVER_SSH_KEY=/path/to/ssh/key
+SERVER_SSH_DIR=/opt/bitbang-test

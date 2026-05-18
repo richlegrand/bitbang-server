@@ -1,0 +1,16 @@
+[Unit]
+Description=BitBang signaling server (production)
+After=network.target
+
+[Service]
+Type=simple
+WorkingDirectory=/opt/bitbang
+ExecStart=/opt/bitbang/signaling-go
+EnvironmentFile=/opt/bitbang/.env
+Restart=on-failure
+RestartSec=5
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target

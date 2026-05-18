@@ -1,3 +1,0 @@
-#!/bin/bash
-./upload_production
-./upload_test
