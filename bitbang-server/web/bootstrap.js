@@ -203,8 +203,10 @@ class BitBangConnection {
             isUpload: hasBody
         });
 
-        // Build request metadata with all headers
-        const requestMeta = { method, pathname: fullPath, headers };
+        // Build request metadata with all headers. SWSP v3 makes the
+        // stream `type` explicit on every SYN; v2 listeners that don't
+        // know the field default it to "http" — same effect.
+        const requestMeta = { type: 'http', method, pathname: fullPath, headers };
         if (hasBody) {
             requestMeta.contentLength = contentLength;
             // Keep contentType for backward compatibility with older devices
@@ -734,7 +736,17 @@ class BitBangConnection {
         const msg = JSON.parse(text);
 
         if (msg.type === 'ready') {
-            console.log('[Bootstrap] Device ready');
+            // SWSP v3 `ready` carries the listener's capability set + server
+            // version. v2 listeners send just {type:'ready'} — caps stays
+            // undefined and we treat it as unknown / not advertised.
+            this.serverCaps = Array.isArray(msg.caps) ? msg.caps : null;
+            this.serverVersion = msg.server_version || 2;
+            if (this.debug) {
+                console.log('[Bootstrap] Device ready (server v' + this.serverVersion +
+                    ', caps: ' + (this.serverCaps ? this.serverCaps.join(',') : 'n/a') + ')');
+            } else {
+                console.log('[Bootstrap] Device ready');
+            }
             if (this.connectResolve) {
                 this.connectResolve();
                 this.connectResolve = null;
@@ -919,8 +931,16 @@ class BitBangConnection {
         // Brief delay for any pending tracks to arrive
         await new Promise(resolve => setTimeout(resolve, 100));
 
-        // Send connect handshake with path (streamId 0)
-        const connectMsg = JSON.stringify({ type: 'connect', path: this.devicePath });
+        // Send connect handshake with path (streamId 0). SWSP v3 adds
+        // `caps` (the stream types this client knows how to drive) and
+        // `version` (the SWSP version we're speaking). Older v2 listeners
+        // ignore both fields and continue working.
+        const connectMsg = JSON.stringify({
+            type: 'connect',
+            path: this.devicePath,
+            caps: ['http', 'websocket'],
+            version: 3,
+        });
         this.dataChannel.send(this.createFrame(0, FLAG_SYN, connectMsg));
 
         // Wait for 'ready' response from device, AND for the optional 2 s
@@ -964,8 +984,13 @@ class BitBangConnection {
         };
         this.connectResolve = navigateAfterAuth;
 
-        // Send connect with the new path
-        const connectMsg = JSON.stringify({ type: 'connect', path });
+        // Send connect with the new path (SWSP v3 fields included).
+        const connectMsg = JSON.stringify({
+            type: 'connect',
+            path,
+            caps: ['http', 'websocket'],
+            version: 3,
+        });
         this.dataChannel.send(this.createFrame(0, FLAG_SYN, connectMsg));
     }
 
