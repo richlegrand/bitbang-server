@@ -19,6 +19,101 @@ const FLAG_SYN = 0x0001;
 const FLAG_FIN = 0x0004;
 const FLAG_DAT = 0x0000;
 
+// --- Bidirectional verify helpers ----------------------------------------
+//
+// The browser is the connecting party. Before opening WebRTC, it asks the
+// signaling server for the device's pubkey, verifies hash(pubkey) === UID
+// locally, then rides an encrypted {fingerprint, nonce} payload on the
+// answer. The device decrypts, confirms the fingerprint matches the SDP, and
+// proves possession of the private key by sending sha256(nonce) back as the
+// first stream-0 frame after the data channel opens. A rogue signaling
+// server cannot mount a relay attack: it can rewrite SDPs all it wants, but
+// without the device's private key it can't decrypt the payload or produce a
+// matching nonce hash, and the browser will reject the channel.
+
+function bytesToBase64(bytes) {
+    let s = '';
+    for (let i = 0; i < bytes.length; i++) s += String.fromCharCode(bytes[i]);
+    return btoa(s);
+}
+
+function base64ToBytes(b64) {
+    const bin = atob(b64);
+    const out = new Uint8Array(bin.length);
+    for (let i = 0; i < bin.length; i++) out[i] = bin.charCodeAt(i);
+    return out;
+}
+
+function bytesToHex(bytes) {
+    let s = '';
+    for (let i = 0; i < bytes.length; i++) {
+        s += bytes[i].toString(16).padStart(2, '0');
+    }
+    return s;
+}
+
+// uidFromPubkeyDer mirrors identity.UIDFromPublicKeyBytes in the server and
+// device: first 32 hex chars of sha256(public_key_DER). Used to verify the
+// pubkey the signaling server hands us actually belongs to the UID we're
+// trying to reach — without this check, a rogue server could swap pubkeys
+// and the browser would happily encrypt to the attacker's key.
+async function uidFromPubkeyDer(derBytes) {
+    const hash = await crypto.subtle.digest('SHA-256', derBytes);
+    return bytesToHex(new Uint8Array(hash)).slice(0, 32);
+}
+
+// extractDTLSFingerprint pulls "a=fingerprint:sha-256 AA:BB:..." out of an
+// SDP and normalizes to uppercase. The device runs the same parse on its end
+// (peer/verify.go) so the strings compare directly.
+function extractDTLSFingerprint(sdp) {
+    const lines = (sdp || '').split('\n');
+    for (const raw of lines) {
+        const line = raw.replace(/\r$/, '');
+        const m = /^a=fingerprint:sha-256\s+([0-9A-Fa-f:]+)\s*$/.exec(line);
+        if (m) return m[1].toUpperCase();
+    }
+    return '';
+}
+
+// importDevicePubkey turns a base64 SPKI DER public key into a CryptoKey
+// usable for RSA-OAEP/SHA-256 encryption. The DER bytes are also returned so
+// the caller can hash them for the UID check without round-tripping through
+// the import.
+async function importDevicePubkey(b64) {
+    const der = base64ToBytes(b64);
+    const key = await crypto.subtle.importKey(
+        'spki',
+        der,
+        { name: 'RSA-OAEP', hash: 'SHA-256' },
+        false,
+        ['encrypt']
+    );
+    return { key, der };
+}
+
+// encryptVerifyPayload RSA-OAEP encrypts the bidirectional-verify JSON
+// ({fingerprint, nonce}) to the device's public key. The matching decrypt
+// lives in identity.Decrypt on the device side.
+async function encryptVerifyPayload(pubkey, fingerprint, nonceBytes) {
+    const payload = JSON.stringify({
+        fingerprint,
+        nonce: bytesToBase64(nonceBytes),
+    });
+    const ciphertext = await crypto.subtle.encrypt(
+        { name: 'RSA-OAEP' },
+        pubkey,
+        new TextEncoder().encode(payload)
+    );
+    return bytesToBase64(new Uint8Array(ciphertext));
+}
+
+// sha256Base64 returns base64(sha256(bytes)) — matches the format the device
+// emits in the verify_nonce_hash control frame.
+async function sha256Base64(bytes) {
+    const hash = await crypto.subtle.digest('SHA-256', bytes);
+    return bytesToBase64(new Uint8Array(hash));
+}
+
 class BitBangConnection {
     constructor(uid, devicePath) {
         this.uid = uid;
@@ -290,6 +385,13 @@ class BitBangConnection {
                 reject(new Error('offer_timeout'));
             }, 15000);
 
+            // Bidirectional-verify state. devicePubkey + verifyNonce are
+            // populated in handleOffer; deviceVerified flips true when the
+            // device's first stream-0 frame proves it decrypted the nonce.
+            this.devicePubkey = null;
+            this.verifyNonce = null;
+            this.deviceVerified = false;
+
             this.ws.onopen = () => {
                 this.ws.send(JSON.stringify({ type: 'request', uid: this.uid }));
                 this.updateStatus(STATUS.WAITING_OFFER);
@@ -299,7 +401,12 @@ class BitBangConnection {
                 const msg = JSON.parse(event.data);
                 if (msg.type === 'offer') {
                     clearTimeout(offerTimeout);
-                    await this.handleOffer(msg);
+                    try {
+                        await this.handleOffer(msg);
+                    } catch (e) {
+                        reject(e);
+                        return;
+                    }
                     resolve();
                 } else if (msg.type === 'candidate') {
                     this.handleRemoteCandidate(msg.candidate);
@@ -326,6 +433,20 @@ class BitBangConnection {
     }
 
     async handleOffer(msg) {
+        // Bidirectional verify, part 1: the offer carries the device's
+        // pubkey alongside the SDP. Verify hash(pubkey) === uid locally
+        // before doing any WebRTC work — a rogue server can't substitute
+        // a key for a UID it doesn't own without breaking this check.
+        if (!msg.device_pubkey) {
+            throw new Error('offer missing device_pubkey — server too old or misbehaving');
+        }
+        const { key, der } = await importDevicePubkey(msg.device_pubkey);
+        const computedUid = await uidFromPubkeyDer(der);
+        if (computedUid !== this.uid) {
+            throw new Error(`pubkey/UID mismatch (server gave key for ${computedUid}, expected ${this.uid})`);
+        }
+        this.devicePubkey = key;
+
         this.updateStatus(STATUS.CONNECTING_WEBRTC);
         this.streamNameMap = msg.streams || {};
         this.deviceName = msg.device_name || null;
@@ -373,10 +494,28 @@ class BitBangConnection {
         }
         this.remoteCandidateQueue = [];
 
-        // Create and send answer
+        // Create the answer; setLocalDescription populates the SDP with our
+        // DTLS fingerprint, which we then commit to via the encrypted
+        // payload below. The device decrypts the payload and checks it
+        // against the SDP — a rogue relay rewriting the SDP would mismatch.
         const answer = await this.pc.createAnswer();
         await this.pc.setLocalDescription(answer);
-        this.ws.send(JSON.stringify({ type: 'answer', uid: this.uid, sdp: this.pc.localDescription.sdp }));
+
+        const localFingerprint = extractDTLSFingerprint(this.pc.localDescription.sdp);
+        if (!localFingerprint) {
+            throw new Error('local SDP has no sha-256 fingerprint');
+        }
+        const nonce = crypto.getRandomValues(new Uint8Array(16));
+        this.verifyNonce = nonce;
+        const encryptedRequest = await encryptVerifyPayload(
+            this.devicePubkey, localFingerprint, nonce);
+
+        this.ws.send(JSON.stringify({
+            type: 'answer',
+            uid: this.uid,
+            sdp: this.pc.localDescription.sdp,
+            encrypted_request: encryptedRequest,
+        }));
 
         // Flush buffered local candidates
         for (const msg of this.localCandidateQueue) {
@@ -464,7 +603,12 @@ class BitBangConnection {
             this.dataChannel.binaryType = 'arraybuffer';  // SWSP uses binary frames
             this.dataChannel.onopen = () => {
                 console.log('DataChannel opened');
-                this.onDataChannelReady();
+                // Bidirectional verify: do not send "connect" yet. The
+                // device's first stream-0 frame must be verify_nonce_hash
+                // and must match sha256(this.verifyNonce). Only then can we
+                // trust that the channel really terminates at the device
+                // (not a rogue relay), and onDataChannelReady will be called
+                // from handleControlMessage on successful verify.
             };
             this.dataChannel.onclose = () => console.log('DataChannel closed');
             this.dataChannel.onerror = (e) => console.error('DataChannel error:', e);
@@ -729,11 +873,44 @@ class BitBangConnection {
         }
     }
 
-    handleControlMessage(frame) {
+    async handleControlMessage(frame) {
         if (!(frame.flags & FLAG_SYN)) return;
 
         const text = new TextDecoder().decode(frame.payload);
         const msg = JSON.parse(text);
+
+        // verify_nonce_hash must be the very first control message we see
+        // on a freshly-opened data channel. Until it lands and matches
+        // sha256(this.verifyNonce), the channel is treated as untrusted and
+        // we won't send connect/auth or accept any other control message.
+        if (msg.type === 'verify_nonce_hash') {
+            if (this.deviceVerified) {
+                console.warn('[Bootstrap] duplicate verify_nonce_hash, ignoring');
+                return;
+            }
+            const expected = await sha256Base64(this.verifyNonce);
+            if (msg.hash !== expected) {
+                console.error('[Bootstrap] nonce hash mismatch — device did not prove possession of the private key. Closing.');
+                this.showErrorScreen('Connection rejected: device identity could not be verified.');
+                try { this.dataChannel.close(); } catch (e) {}
+                try { this.pc.close(); } catch (e) {}
+                return;
+            }
+            this.deviceVerified = true;
+            console.log('[Bootstrap] bidirectional verify OK');
+            this.onDataChannelReady();
+            return;
+        }
+
+        if (!this.deviceVerified) {
+            // Any non-verify control message before verify is a protocol
+            // violation. Treat as if the device failed to authenticate.
+            console.error('[Bootstrap] control message %o received before verify_nonce_hash — closing', msg.type);
+            this.showErrorScreen('Connection rejected: device identity could not be verified.');
+            try { this.dataChannel.close(); } catch (e) {}
+            try { this.pc.close(); } catch (e) {}
+            return;
+        }
 
         if (msg.type === 'ready') {
             // SWSP v3 `ready` carries the listener's capability set + server

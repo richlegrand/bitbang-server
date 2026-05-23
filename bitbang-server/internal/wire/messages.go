@@ -33,21 +33,7 @@ type Register struct {
 	ICEServers []ICEServer `json:"ice_servers,omitempty"` // device-supplied override
 }
 
-// Challenge is sent by the server after a successful register.
-// Nonce is base64-encoded 32 random bytes.
-type Challenge struct {
-	Type  string `json:"type"`  // "challenge"
-	Nonce string `json:"nonce"` // base64
-}
-
-// ChallengeResponse is sent by the device in response to Challenge.
-// Signature is base64-encoded; algorithm is implicit from the public key type.
-type ChallengeResponse struct {
-	Type      string `json:"type"`      // "challenge_response"
-	Signature string `json:"signature"` // base64
-}
-
-// Registered is sent by the server after a successful challenge_response.
+// Registered is sent by the server after a successful register.
 type Registered struct {
 	Type string `json:"type"` // "registered"
 }
@@ -60,7 +46,11 @@ type Error struct {
 
 // Offer is a WebRTC offer SDP relayed between device and client.
 // When device→server, the device's offer includes streams (mid→name).
-// When server→client, the server attaches ice_servers (and turn_unavailable).
+// When server→client, the server attaches ice_servers, turn_unavailable, and
+// device_pubkey. device_pubkey is the base64 DER SubjectPublicKeyInfo the
+// device presented at register time; the browser checks
+// hash(device_pubkey) == uid and uses the key to encrypt the
+// bidirectional-verify payload that rides on the answer.
 type Offer struct {
 	Type            string            `json:"type"` // "offer"
 	SDP             string            `json:"sdp"`
@@ -69,13 +59,19 @@ type Offer struct {
 	ICEServers      []ICEServer       `json:"ice_servers,omitempty"`
 	TURNUnavailable bool              `json:"turn_unavailable,omitempty"`
 	DeviceName      string            `json:"device_name,omitempty"`
+	DevicePubkey    string            `json:"device_pubkey,omitempty"`
 }
 
-// Answer is a WebRTC answer SDP relayed between client and device.
+// Answer is a WebRTC answer SDP relayed between client and device. The
+// browser is the answerer in this protocol, so the answer is also where the
+// browser delivers its bidirectional-verify payload — base64 ciphertext of
+// {fingerprint, nonce} encrypted to the device's public key. Opaque to the
+// server; relayed verbatim to the device.
 type Answer struct {
-	Type     string `json:"type"` // "answer"
-	SDP      string `json:"sdp"`
-	ClientID string `json:"client_id"`
+	Type             string `json:"type"` // "answer"
+	SDP              string `json:"sdp"`
+	ClientID         string `json:"client_id"`
+	EncryptedRequest string `json:"encrypted_request,omitempty"`
 }
 
 // Candidate is a WebRTC ICE candidate relayed between client and device.

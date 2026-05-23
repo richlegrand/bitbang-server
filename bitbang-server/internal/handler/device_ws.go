@@ -5,8 +5,6 @@
 package handler
 
 import (
-	"crypto/rand"
-	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"log/slog"
@@ -43,8 +41,11 @@ type Deps struct {
 
 // DeviceWS handles /ws/device/<uid>.
 //
-// Flow: upgrade → authenticate (register/challenge/challenge_response) →
-// preempt prior connection (if any) → register → enter relay loop.
+// Flow: upgrade → register (UID must equal hash(pubkey)) → preempt prior
+// connection (if any) → enter relay loop. Proof of private-key possession is
+// no longer demanded by the server; the browser-side bidirectional verify
+// (encrypted fingerprint+nonce, hash(nonce) reply over DTLS) makes any
+// imposter who claims a UID unable to complete a real session.
 func (d *Deps) DeviceWS(w http.ResponseWriter, r *http.Request, uid string) {
 	if !d.Limiter.Allow(r.RemoteAddr) {
 		http.Error(w, "rate limited", http.StatusTooManyRequests)
@@ -70,10 +71,13 @@ func (d *Deps) DeviceWS(w http.ResponseWriter, r *http.Request, uid string) {
 		d.Log.Warn("device auth failed", "uid", uid, "remote", r.RemoteAddr, "err", err)
 		return
 	}
+	conn.PublicKey = regMsg.PublicKey
 
-	// Preempt any existing connection for this UID. The new connection has
-	// proven key ownership, so it takes precedence (typically a device
-	// restart racing with its own stale ws).
+	// Preempt any existing connection for this UID. The newcomer satisfies the
+	// same UID-binding check as the incumbent, so it takes precedence
+	// (typically a device restart racing with its own stale ws). A real
+	// imposter is harmless: they can claim a UID here but cannot complete the
+	// browser-side bidirectional verify without the private key.
 	if old := d.Devices.Add(uid, conn); old != nil {
 		d.Log.Warn("device preempted", "uid", uid)
 		_ = old.SendJSON(wire.Error{Type: "error", Message: "preempted"})
@@ -109,9 +113,14 @@ func (d *Deps) DeviceWS(w http.ResponseWriter, r *http.Request, uid string) {
 	d.deviceRelay(conn)
 }
 
-// authenticateDevice runs the register → challenge → challenge_response
-// sequence. Returns the register message on success.
-// Error strings sent to the client match Python signaling.py exactly.
+// authenticateDevice reads and validates the device's register message.
+// Returns the register message on success.
+//
+// The server enforces UID == hash(pubkey) for routing integrity. It does NOT
+// challenge the device to prove possession of the private key — the
+// browser-side bidirectional verify catches imposters end-to-end (an attacker
+// who claims a UID with someone else's pubkey cannot decrypt the encrypted
+// fingerprint+nonce payload and so cannot complete a session).
 func (d *Deps) authenticateDevice(uid string, conn *registry.DeviceConn) (*wire.Register, error) {
 	if !identity.ValidateUID(uid) {
 		_ = conn.SendJSON(wire.Error{Type: "error", Message: "Invalid UID format"})
@@ -155,36 +164,6 @@ func (d *Deps) authenticateDevice(uid string, conn *registry.DeviceConn) (*wire.
 		return nil, errors.New(msg)
 	}
 
-	// Issue challenge.
-	var nonce [32]byte
-	if _, err := rand.Read(nonce[:]); err != nil {
-		return nil, err
-	}
-	_ = conn.SendJSON(wire.Challenge{
-		Type:  "challenge",
-		Nonce: base64.StdEncoding.EncodeToString(nonce[:]),
-	})
-
-	var resp wire.ChallengeResponse
-	if err := readJSON(conn.WS, &resp); err != nil {
-		return nil, err
-	}
-	if resp.Type != "challenge_response" {
-		_ = conn.SendJSON(wire.Error{Type: "error", Message: "Expected challenge_response"})
-		return nil, errors.New("expected challenge_response")
-	}
-
-	sig, err := base64.StdEncoding.DecodeString(resp.Signature)
-	if err != nil {
-		_ = conn.SendJSON(wire.Error{Type: "error", Message: "Invalid signature format"})
-		return nil, err
-	}
-
-	if err := identity.VerifySignature(pubKey, nonce[:], sig); err != nil {
-		_ = conn.SendJSON(wire.Error{Type: "error", Message: "Invalid signature"})
-		return nil, err
-	}
-
 	return &reg, nil
 }
 
@@ -219,6 +198,10 @@ func (d *Deps) deviceRelay(conn *registry.DeviceConn) {
 			servers, unavailable := d.iceForClient(conn, env.ClientID)
 			offer.ICEServers = servers
 			offer.TURNUnavailable = unavailable
+			// Hand the browser the device's pubkey alongside the SDP so it
+			// can verify hash(pubkey) == uid and encrypt the
+			// bidirectional-verify payload without a separate round trip.
+			offer.DevicePubkey = conn.PublicKey
 			_ = client.SendJSON(offer)
 			d.Log.Info("forwarded offer",
 				"from", conn.UID, "to", env.ClientID, "streams", offer.Streams)

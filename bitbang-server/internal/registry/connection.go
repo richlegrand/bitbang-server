@@ -26,6 +26,11 @@ type DeviceConn struct {
 	ICEServers []wire.ICEServer // device-supplied override; empty if none
 	ConnectAt  time.Time
 
+	// PublicKey is the base64 DER SubjectPublicKeyInfo the device presented at
+	// register time, retained so clients can fetch it via "request_pubkey".
+	// hash(decoded) == UID is enforced before this is stored.
+	PublicKey string
+
 	writeMu sync.Mutex
 	closed  bool
 	closeMu sync.Mutex
