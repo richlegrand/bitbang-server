@@ -54,7 +54,8 @@ type Deps struct {
 // (encrypted fingerprint+nonce, hash(nonce) reply over DTLS) makes any
 // imposter who claims a UID unable to complete a real session.
 func (d *Deps) DeviceWS(w http.ResponseWriter, r *http.Request, uid string) {
-	if !d.Limiter.Allow(r.RemoteAddr) {
+	ip := d.clientIP(r)
+	if !d.Limiter.Allow(ip) {
 		http.Error(w, "rate limited", http.StatusTooManyRequests)
 		return
 	}
@@ -75,7 +76,7 @@ func (d *Deps) DeviceWS(w http.ResponseWriter, r *http.Request, uid string) {
 	regMsg, err := d.authenticateDevice(uid, conn)
 	if err != nil {
 		// authenticateDevice already sent an error frame.
-		d.Log.Warn("device auth failed", "uid", uid, "remote", r.RemoteAddr, "err", err)
+		d.Log.Warn("device auth failed", "uid", uid, "remote", ip, "err", err)
 		return
 	}
 	conn.PublicKey = regMsg.PublicKey

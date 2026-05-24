@@ -21,7 +21,8 @@ import (
 // then close with error → otherwise enter relay loop forwarding
 // request/answer/candidate to the target device.
 func (d *Deps) ClientWS(w http.ResponseWriter, r *http.Request, targetUID string) {
-	if !d.Limiter.Allow(r.RemoteAddr) {
+	ip := d.clientIP(r)
+	if !d.Limiter.Allow(ip) {
 		http.Error(w, "rate limited", http.StatusTooManyRequests)
 		return
 	}
@@ -42,7 +43,7 @@ func (d *Deps) ClientWS(w http.ResponseWriter, r *http.Request, targetUID string
 		TargetUID: targetUID,
 		WS:        ws,
 		ConnectAt: connectAt,
-		BrowserIP: d.browserIP(r),
+		BrowserIP: ip,
 	}
 	d.Clients.Add(conn)
 	d.Log.Info("client connected", "client_id", clientID, "target", targetUID)
@@ -167,24 +168,25 @@ func shortRandomHex(n int) string {
 	return hex.EncodeToString(buf)
 }
 
-// browserIP returns the connecting browser's IP for stamping on relayed
-// "request" messages. When TrustProxyHeaders is set, the first hop of
-// X-Forwarded-For takes precedence over X-Real-IP, which takes precedence
-// over r.RemoteAddr. The port is stripped in all cases.
+// clientIP returns the connecting peer's IP. Used both for stamping
+// browser_ip on relayed "request" messages and for keying the per-IP
+// rate limiter — anything that needs to identify "who is calling."
 //
-// TrustProxyHeaders must only be enabled when an upstream proxy strips
-// these headers from inbound requests; otherwise any client can spoof
-// browser_ip. The fallback (RemoteAddr) is always safe.
-func (d *Deps) browserIP(r *http.Request) string {
+// When TrustProxyHeaders is set, X-Real-IP takes precedence over
+// r.RemoteAddr. The port is stripped in both cases.
+//
+// X-Forwarded-For is deliberately NOT consulted: our nginx sets
+// X-Real-IP (unspoofable, equal to nginx's TCP-level $remote_addr) but
+// does not set XFF, so any XFF that arrives is whatever the client
+// sent — i.e. spoofable. If a multi-hop LB is added later this can
+// be revisited, with the chain-walking logic that scheme actually
+// requires.
+//
+// TrustProxyHeaders must only be enabled when the upstream proxy is
+// known to set X-Real-IP itself. The fallback (RemoteAddr) is always
+// safe.
+func (d *Deps) clientIP(r *http.Request) string {
 	if d.TrustProxyHeaders {
-		if xff := r.Header.Get("X-Forwarded-For"); xff != "" {
-			// X-Forwarded-For is a comma-separated chain; the first
-			// element is the original client.
-			if comma := strings.Index(xff, ","); comma >= 0 {
-				return strings.TrimSpace(xff[:comma])
-			}
-			return strings.TrimSpace(xff)
-		}
 		if real := r.Header.Get("X-Real-IP"); real != "" {
 			return strings.TrimSpace(real)
 		}

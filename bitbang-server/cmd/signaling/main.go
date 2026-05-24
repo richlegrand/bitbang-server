@@ -77,7 +77,7 @@ func main() {
 
 	srv := &http.Server{
 		Addr:    cfg.Bind,
-		Handler: requestLogger(logger, mux),
+		Handler: requestLogger(logger, mux, cfg.TrustProxyHeaders),
 		// No ReadTimeout/WriteTimeout because WebSocket upgrades need
 		// long-lived connections. Idle timeout protects against slow
 		// HTTP clients on non-WS endpoints.
@@ -170,9 +170,20 @@ func newLogger(level slog.Level) *slog.Logger {
 
 // requestLogger logs HTTP requests at DEBUG level. WebSocket upgrades log
 // once and the handler takes over from there.
-func requestLogger(log *slog.Logger, next http.Handler) http.Handler {
+//
+// When trustProxyHeaders is set, X-Real-IP takes precedence over
+// r.RemoteAddr so the logged remote matches what the handlers see (and
+// what's stamped on browser_ip). X-Forwarded-For is deliberately not
+// consulted — see handler.clientIP for rationale.
+func requestLogger(log *slog.Logger, next http.Handler, trustProxyHeaders bool) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		log.Debug("http", "method", r.Method, "path", r.URL.Path, "remote", r.RemoteAddr)
+		remote := r.RemoteAddr
+		if trustProxyHeaders {
+			if real := r.Header.Get("X-Real-IP"); real != "" {
+				remote = strings.TrimSpace(real)
+			}
+		}
+		log.Debug("http", "method", r.Method, "path", r.URL.Path, "remote", remote)
 		next.ServeHTTP(w, r)
 	})
 }
