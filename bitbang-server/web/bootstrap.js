@@ -1364,13 +1364,51 @@ class BitBangConnection {
     }
 
     const uid = pathParts[0];
-    const devicePath = '/' + pathParts.slice(1).join('/');
+    const pathFromUrl = '/' + pathParts.slice(1).join('/');
+
     // The 64-bit access code lives in the URL fragment so the signaling
     // server never sees it. Browsers also never send fragments to servers,
     // so even if a user accidentally posts the URL to a server log, the
     // code part is stripped on first send. The browser bundles it inside
     // the RSA-OAEP-encrypted verify payload sent to the device.
-    const code = window.location.hash ? window.location.hash.slice(1) : '';
+    //
+    // We also accept a naively-concatenated path inside the fragment as
+    // a convenience: a user with the URL `https://srv/<uid>#<code>` who
+    // wants the subpath `/foo` can just append `/foo` to get
+    // `https://srv/<uid>#<code>/foo`, and we auto-rearrange to the
+    // canonical `https://srv/<uid>/foo#<code>`. The access-code alphabet
+    // is base64url (`[A-Za-z0-9_-]`) which never contains `/`, so the
+    // first `/` in the fragment unambiguously separates code from path.
+    //
+    // When both a URL path AND a fragment path are present (the user
+    // appended onto an already-canonical URL), we concat them: e.g.
+    // `https://srv/<uid>/foo#<code>/bar` -> devicePath `/foo/bar`.
+    const rawFragment = window.location.hash ? window.location.hash.slice(1) : '';
+    const slashAt = rawFragment.indexOf('/');
+    let code, pathFromFragment;
+    if (slashAt >= 0) {
+        code = rawFragment.substring(0, slashAt);
+        pathFromFragment = rawFragment.substring(slashAt);  // keeps the leading '/'
+    } else {
+        code = rawFragment;
+        pathFromFragment = '';
+    }
+
+    // Concatenate URL path + fragment path. Drop the lone '/' on the
+    // URL side so we don't end up with '//foo'.
+    const urlPathSeg = (pathFromUrl === '/') ? '' : pathFromUrl;
+    const devicePath = (urlPathSeg + pathFromFragment) || '/';
+
+    // Whenever the fragment contributed a path, rewrite the address bar
+    // so a reload / copy / share captures the canonical shape.
+    if (pathFromFragment) {
+        const canonical = '/' + uid + devicePath
+            + (window.location.search || '')
+            + '#' + code;
+        history.replaceState(null, '', canonical);
+        console.log('[Bootstrap] Rearranged URL to canonical form:', canonical);
+    }
+
     const connection = new BitBangConnection(uid, devicePath, code);
     window.__bitbangConnection = connection;
     await connection.connect();
