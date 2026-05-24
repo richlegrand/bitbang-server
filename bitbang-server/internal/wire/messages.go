@@ -9,11 +9,12 @@ package wire
 // Protocol versioning. Devices send their supported version in the register
 // message; the server rejects anything below MinProtocolVersion.
 //
-// v3 introduces split-identity URLs: the wire UID drops to 80 bits (20 hex
-// chars) and the URL fragment carries a 40-bit access code that the browser
-// includes inside the encrypted_request payload. The server also forwards
-// the connecting browser's IP on relayed "request" messages so the device
-// can attribute bad-code attempts.
+// v3 introduces split-identity URLs: the wire UID is 128 bits encoded as
+// 22 base64url chars (no padding), and the URL fragment carries a 64-bit
+// access code (11 base64url chars) that the browser includes inside the
+// encrypted_request payload. The server also forwards the connecting
+// browser's IP on relayed "request" messages so the device can attribute
+// bad-code attempts.
 const (
 	ProtocolVersion    = 3
 	MinProtocolVersion = 3

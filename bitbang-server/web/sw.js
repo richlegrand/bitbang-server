@@ -132,8 +132,12 @@ async function findSession(event) {
     // page reload while the old bootstrap window is still being torn down
     // can match the stale session via Strategy 3 (uid-in-referer) and end
     // up routing the reload through the device, which then 404s.
+    //
+    // The UID is 22 base64url chars (alphabet [A-Za-z0-9_-]). Followed by
+    // either end-of-path or "/", so we don't accidentally treat
+    // /__device__/... or anything else as a UID path.
     const reqUrl = new URL(event.request.url);
-    const isUidPath = /^\/[0-9a-f]{20,}/.test(reqUrl.pathname);
+    const isUidPath = /^\/[A-Za-z0-9_-]{22}(\/|$)/.test(reqUrl.pathname);
     if (isUidPath && event.request.mode === 'navigate') {
         return null;
     }

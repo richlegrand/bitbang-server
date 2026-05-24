@@ -17,12 +17,15 @@ func TestValidateUID(t *testing.T) {
 		uid string
 		ok  bool
 	}{
-		{"abcdef0123456789abcd", true},
-		{"ABCDEF0123456789ABCD", false},                 // uppercase not allowed
-		{"abcdef0123456789abc", false},                  // too short
-		{"abcdef0123456789abcde", false},                // too long
-		{"abcdef0123456789abcg", false},                 // non-hex
-		{"abcdef0123456789abcdef0123456789", false},     // legacy 128-bit UID, no longer accepted
+		{"R6S_AGYqzlPp48fK2nUmkA", true},                // valid base64url, 22 chars
+		{"AAAAAAAAAAAAAAAAAAAAAA", true},                // 22 chars, valid alphabet
+		{"abcdef0123456789abcd", false},                 // legacy 20-hex format
+		{"abcdef0123456789abcdef0123456789", false},     // legacy 32-hex (128-bit) format
+		{"R6S_AGYqzlPp48fK2nUmk", false},                // too short
+		{"R6S_AGYqzlPp48fK2nUmkAA", false},              // too long
+		{"R6S/AGYqzlPp48fK2nUmkA", false},               // standard base64 (/) not allowed
+		{"R6S+AGYqzlPp48fK2nUmkA", false},               // standard base64 (+) not allowed
+		{"R6S=AGYqzlPp48fK2nUmkA", false},               // padding not allowed
 		{"", false},
 	}
 	for _, c := range cases {
@@ -42,8 +45,8 @@ func TestUIDDerivation(t *testing.T) {
 		t.Fatal(err)
 	}
 	uid := UIDFromPublicKeyBytes(der)
-	if len(uid) != 20 {
-		t.Errorf("UID length = %d, want 20", len(uid))
+	if len(uid) != 22 {
+		t.Errorf("UID length = %d, want 22", len(uid))
 	}
 	if !ValidateUID(uid) {
 		t.Errorf("Derived UID %q failed ValidateUID", uid)
@@ -52,13 +55,10 @@ func TestUIDDerivation(t *testing.T) {
 	if uid2 := UIDFromPublicKeyBytes(der); uid2 != uid {
 		t.Errorf("UID not deterministic: %q vs %q", uid, uid2)
 	}
-	// Sanity: matches manual computation — first 80 bits of SHA-256(DER)
-	// as lowercase hex.
+	// Sanity: matches manual computation — base64url of the first 16 bytes
+	// of SHA-256(DER), no padding.
 	h := sha256.Sum256(der)
-	want := ""
-	for _, b := range h[:10] {
-		want += string("0123456789abcdef"[b>>4]) + string("0123456789abcdef"[b&0xf])
-	}
+	want := base64.RawURLEncoding.EncodeToString(h[:16])
 	if uid != want {
 		t.Errorf("UID mismatch: got %q want %q", uid, want)
 	}

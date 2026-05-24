@@ -52,17 +52,28 @@ function bytesToHex(bytes) {
     return s;
 }
 
+// bytesToBase64Url returns base64url without padding (alphabet [A-Za-z0-9_-]).
+// btoa() produces standard base64 with + / =; we swap to URL-safe chars and
+// strip padding. Matches Python's base64.urlsafe_b64encode(...).rstrip(b'=')
+// and Go's base64.RawURLEncoding.
+function bytesToBase64Url(bytes) {
+    return bytesToBase64(bytes)
+        .replace(/\+/g, '-')
+        .replace(/\//g, '_')
+        .replace(/=+$/, '');
+}
+
 // uidFromPubkeyDer mirrors identity.UIDFromPublicKeyBytes in the server and
-// device: first 20 hex chars (80 bits) of sha256(public_key_DER). The other
-// 40 bits of the 128-bit URL space are the access code, which travels in
-// the URL fragment (never sent to the server) and is verified inside the
+// device: first 128 bits of sha256(public_key_DER), base64url-encoded with no
+// padding (22 chars). The companion 64-bit access code travels in the URL
+// fragment (never sent to the server) and is verified inside the
 // encrypted_request payload. Used to verify the pubkey the signaling
 // server hands us actually belongs to the UID we're trying to reach —
 // without this check, a rogue server could swap pubkeys and the browser
 // would happily encrypt to the attacker's key.
 async function uidFromPubkeyDer(derBytes) {
     const hash = await crypto.subtle.digest('SHA-256', derBytes);
-    return bytesToHex(new Uint8Array(hash)).slice(0, 20);
+    return bytesToBase64Url(new Uint8Array(hash).slice(0, 16));
 }
 
 // extractDTLSFingerprint pulls "a=fingerprint:sha-256 AA:BB:..." out of an
@@ -96,10 +107,11 @@ async function importDevicePubkey(b64) {
 
 // encryptVerifyPayload RSA-OAEP encrypts the bidirectional-verify JSON
 // ({fingerprint, nonce, code?}) to the device's public key. The code field
-// is the 40-bit access code from the URL fragment — omitted when the user
-// browsed to the bare UID without a #code, in which case the device will
-// reject the connection unless it was started without a code.
-// The matching decrypt lives in identity.Decrypt on the device side.
+// is the 64-bit access code from the URL fragment (11 base64url chars) —
+// omitted when the user browsed to the bare UID without a #code, in
+// which case the device will reject the connection unless it was started
+// without a code. The matching decrypt lives in identity.Decrypt on the
+// device side.
 async function encryptVerifyPayload(pubkey, fingerprint, nonceBytes, code) {
     const obj = {
         fingerprint,
