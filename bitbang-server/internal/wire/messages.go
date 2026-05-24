@@ -8,9 +8,15 @@ package wire
 
 // Protocol versioning. Devices send their supported version in the register
 // message; the server rejects anything below MinProtocolVersion.
+//
+// v3 introduces split-identity URLs: the wire UID drops to 80 bits (20 hex
+// chars) and the URL fragment carries a 40-bit access code that the browser
+// includes inside the encrypted_request payload. The server also forwards
+// the connecting browser's IP on relayed "request" messages so the device
+// can attribute bad-code attempts.
 const (
-	ProtocolVersion    = 2
-	MinProtocolVersion = 2
+	ProtocolVersion    = 3
+	MinProtocolVersion = 3
 )
 
 // ICEServer is the browser-native ice_servers format (one entry per server).
@@ -85,11 +91,16 @@ type Candidate struct {
 }
 
 // Request is sent by a client to initiate a session with a device.
-// The server augments it with client_id and ice_servers before forwarding.
+// The server augments it with client_id, ice_servers, and browser_ip
+// before forwarding. browser_ip is the connecting browser's IP as seen by
+// the signaling server (X-Real-IP when behind a reverse proxy, else the
+// direct RemoteAddr). Devices use it to attribute bad-code attempts; the
+// browser never sets it itself.
 type Request struct {
 	Type       string      `json:"type"` // "request"
 	ClientID   string      `json:"client_id,omitempty"`
 	ICEServers []ICEServer `json:"ice_servers,omitempty"`
+	BrowserIP  string      `json:"browser_ip,omitempty"`
 }
 
 // Envelope is used to peek at the "type" field before fully deserializing.

@@ -53,13 +53,16 @@ function bytesToHex(bytes) {
 }
 
 // uidFromPubkeyDer mirrors identity.UIDFromPublicKeyBytes in the server and
-// device: first 32 hex chars of sha256(public_key_DER). Used to verify the
-// pubkey the signaling server hands us actually belongs to the UID we're
-// trying to reach — without this check, a rogue server could swap pubkeys
-// and the browser would happily encrypt to the attacker's key.
+// device: first 20 hex chars (80 bits) of sha256(public_key_DER). The other
+// 40 bits of the 128-bit URL space are the access code, which travels in
+// the URL fragment (never sent to the server) and is verified inside the
+// encrypted_request payload. Used to verify the pubkey the signaling
+// server hands us actually belongs to the UID we're trying to reach —
+// without this check, a rogue server could swap pubkeys and the browser
+// would happily encrypt to the attacker's key.
 async function uidFromPubkeyDer(derBytes) {
     const hash = await crypto.subtle.digest('SHA-256', derBytes);
-    return bytesToHex(new Uint8Array(hash)).slice(0, 32);
+    return bytesToHex(new Uint8Array(hash)).slice(0, 20);
 }
 
 // extractDTLSFingerprint pulls "a=fingerprint:sha-256 AA:BB:..." out of an
@@ -92,17 +95,23 @@ async function importDevicePubkey(b64) {
 }
 
 // encryptVerifyPayload RSA-OAEP encrypts the bidirectional-verify JSON
-// ({fingerprint, nonce}) to the device's public key. The matching decrypt
-// lives in identity.Decrypt on the device side.
-async function encryptVerifyPayload(pubkey, fingerprint, nonceBytes) {
-    const payload = JSON.stringify({
+// ({fingerprint, nonce, code?}) to the device's public key. The code field
+// is the 40-bit access code from the URL fragment — omitted when the user
+// browsed to the bare UID without a #code, in which case the device will
+// reject the connection unless it was started without a code.
+// The matching decrypt lives in identity.Decrypt on the device side.
+async function encryptVerifyPayload(pubkey, fingerprint, nonceBytes, code) {
+    const obj = {
         fingerprint,
         nonce: bytesToBase64(nonceBytes),
-    });
+    };
+    if (code) {
+        obj.code = code;
+    }
     const ciphertext = await crypto.subtle.encrypt(
         { name: 'RSA-OAEP' },
         pubkey,
-        new TextEncoder().encode(payload)
+        new TextEncoder().encode(JSON.stringify(obj))
     );
     return bytesToBase64(new Uint8Array(ciphertext));
 }
@@ -115,9 +124,10 @@ async function sha256Base64(bytes) {
 }
 
 class BitBangConnection {
-    constructor(uid, devicePath) {
+    constructor(uid, devicePath, code) {
         this.uid = uid;
         this.devicePath = devicePath || '/';
+        this.code = code || '';
         this.pc = null;
         this.dataChannel = null;
         this.ws = null;
@@ -508,7 +518,7 @@ class BitBangConnection {
         const nonce = crypto.getRandomValues(new Uint8Array(16));
         this.verifyNonce = nonce;
         const encryptedRequest = await encryptVerifyPayload(
-            this.devicePubkey, localFingerprint, nonce);
+            this.devicePubkey, localFingerprint, nonce, this.code);
 
         this.ws.send(JSON.stringify({
             type: 'answer',
@@ -1343,7 +1353,13 @@ class BitBangConnection {
 
     const uid = pathParts[0];
     const devicePath = '/' + pathParts.slice(1).join('/');
-    const connection = new BitBangConnection(uid, devicePath);
+    // The 40-bit access code lives in the URL fragment so the signaling
+    // server never sees it. Browsers also never send fragments to servers,
+    // so even if a user accidentally posts the URL to a server log, the
+    // code part is stripped on first send. The browser bundles it inside
+    // the RSA-OAEP-encrypted verify payload sent to the device.
+    const code = window.location.hash ? window.location.hash.slice(1) : '';
+    const connection = new BitBangConnection(uid, devicePath, code);
     window.__bitbangConnection = connection;
     await connection.connect();
 })();

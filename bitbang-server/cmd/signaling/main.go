@@ -9,6 +9,9 @@
 //	TURN_MAX_ACTIVE      Max concurrent clients granted TURN (0 = no cap)
 //	LOG_LEVEL            DEBUG | INFO | WARN | ERROR (default INFO)
 //	STATIC_DIR           Path to web/ asset directory (default ./web)
+//	TRUST_PROXY_HEADERS  When "true", honor X-Real-IP/X-Forwarded-For for
+//	                     browser-IP capture. Enable only behind a proxy
+//	                     that strips these headers from inbound requests.
 package main
 
 import (
@@ -51,14 +54,15 @@ func main() {
 	}
 
 	deps := &handler.Deps{
-		Devices:      devices,
-		Clients:      clients,
-		TURN:         turnProvider,
-		Limiter:      limiter,
-		Log:          logger,
-		Upgrader:     websocket.Upgrader{CheckOrigin: func(*http.Request) bool { return true }},
-		PingInterval: 60 * time.Second,
-		PongWait:     300 * time.Second,
+		Devices:           devices,
+		Clients:           clients,
+		TURN:              turnProvider,
+		Limiter:           limiter,
+		Log:               logger,
+		Upgrader:          websocket.Upgrader{CheckOrigin: func(*http.Request) bool { return true }},
+		PingInterval:      60 * time.Second,
+		PongWait:          300 * time.Second,
+		TrustProxyHeaders: cfg.TrustProxyHeaders,
 	}
 
 	mux := http.NewServeMux()
@@ -104,26 +108,28 @@ func main() {
 }
 
 type config struct {
-	Bind          string
-	CoturnHost    string
-	CoturnSecret  string
-	CoturnTTL     int
-	TURNMaxActive int
-	LogLevel      slog.Level
-	StaticDir     string
+	Bind              string
+	CoturnHost        string
+	CoturnSecret      string
+	CoturnTTL         int
+	TURNMaxActive     int
+	LogLevel          slog.Level
+	StaticDir         string
+	TrustProxyHeaders bool
 }
 
 func loadConfig() config {
 	port := envOr("BITBANG_SERVER_PORT", "8082")
 	staticDir := envOr("STATIC_DIR", "./web")
 	return config{
-		Bind:          "0.0.0.0:" + port,
-		CoturnHost:    os.Getenv("COTURN_HOST"),
-		CoturnSecret:  os.Getenv("COTURN_SECRET"),
-		CoturnTTL:     envOrInt("COTURN_TTL", 86400),
-		TURNMaxActive: envOrInt("TURN_MAX_ACTIVE", 0),
-		LogLevel:      parseLogLevel(envOr("LOG_LEVEL", "INFO")),
-		StaticDir:     staticDir,
+		Bind:              "0.0.0.0:" + port,
+		CoturnHost:        os.Getenv("COTURN_HOST"),
+		CoturnSecret:      os.Getenv("COTURN_SECRET"),
+		CoturnTTL:         envOrInt("COTURN_TTL", 86400),
+		TURNMaxActive:     envOrInt("TURN_MAX_ACTIVE", 0),
+		LogLevel:          parseLogLevel(envOr("LOG_LEVEL", "INFO")),
+		StaticDir:         staticDir,
+		TrustProxyHeaders: strings.EqualFold(os.Getenv("TRUST_PROXY_HEADERS"), "true"),
 	}
 }
 

@@ -78,6 +78,11 @@ type ClientConn struct {
 	WS        *websocket.Conn
 	ConnectAt time.Time
 
+	// BrowserIP is the connecting browser's IP, captured at WS-upgrade time
+	// and stamped on relayed "request" messages so devices can attribute
+	// bad-code attempts to a source IP. Empty if not yet determined.
+	BrowserIP string
+
 	writeMu sync.Mutex
 	closed  bool
 	closeMu sync.Mutex

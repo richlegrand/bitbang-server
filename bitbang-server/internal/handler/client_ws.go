@@ -4,7 +4,9 @@ import (
 	"crypto/rand"
 	"encoding/hex"
 	"encoding/json"
+	"net"
 	"net/http"
+	"strings"
 	"time"
 
 	"github.com/gorilla/websocket"
@@ -40,6 +42,7 @@ func (d *Deps) ClientWS(w http.ResponseWriter, r *http.Request, targetUID string
 		TargetUID: targetUID,
 		WS:        ws,
 		ConnectAt: connectAt,
+		BrowserIP: d.browserIP(r),
 	}
 	d.Clients.Add(conn)
 	d.Log.Info("client connected", "client_id", clientID, "target", targetUID)
@@ -99,6 +102,15 @@ func (d *Deps) clientRelay(conn *registry.ClientConn) {
 			if len(servers) > 0 {
 				msg["ice_servers"] = servers
 			}
+			// Stamp the connecting browser's IP so the device can attribute
+			// bad-code attempts. Browsers can't set browser_ip themselves
+			// (the field is server-supplied); any value the client sent is
+			// overwritten here.
+			if conn.BrowserIP != "" {
+				msg["browser_ip"] = conn.BrowserIP
+			} else {
+				delete(msg, "browser_ip")
+			}
 			if err := device.SendJSON(msg); err != nil {
 				d.Log.Warn("forward request failed", "client_id", conn.ClientID, "target", conn.TargetUID, "err", err)
 				_ = conn.SendJSON(wire.Error{Type: "error", Message: "Device not found"})
@@ -153,6 +165,35 @@ func shortRandomHex(n int) string {
 		return "00000000"
 	}
 	return hex.EncodeToString(buf)
+}
+
+// browserIP returns the connecting browser's IP for stamping on relayed
+// "request" messages. When TrustProxyHeaders is set, the first hop of
+// X-Forwarded-For takes precedence over X-Real-IP, which takes precedence
+// over r.RemoteAddr. The port is stripped in all cases.
+//
+// TrustProxyHeaders must only be enabled when an upstream proxy strips
+// these headers from inbound requests; otherwise any client can spoof
+// browser_ip. The fallback (RemoteAddr) is always safe.
+func (d *Deps) browserIP(r *http.Request) string {
+	if d.TrustProxyHeaders {
+		if xff := r.Header.Get("X-Forwarded-For"); xff != "" {
+			// X-Forwarded-For is a comma-separated chain; the first
+			// element is the original client.
+			if comma := strings.Index(xff, ","); comma >= 0 {
+				return strings.TrimSpace(xff[:comma])
+			}
+			return strings.TrimSpace(xff)
+		}
+		if real := r.Header.Get("X-Real-IP"); real != "" {
+			return strings.TrimSpace(real)
+		}
+	}
+	host, _, err := net.SplitHostPort(r.RemoteAddr)
+	if err != nil {
+		return r.RemoteAddr
+	}
+	return host
 }
 
 // closeWith sends a close frame to ws with the given code/reason. Best effort.

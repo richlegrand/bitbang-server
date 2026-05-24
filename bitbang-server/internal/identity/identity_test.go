@@ -17,11 +17,12 @@ func TestValidateUID(t *testing.T) {
 		uid string
 		ok  bool
 	}{
-		{"abcdef0123456789abcdef0123456789", true},
-		{"ABCDEF0123456789ABCDEF0123456789", false}, // uppercase not allowed
-		{"abcdef0123456789abcdef012345678", false},  // too short
-		{"abcdef0123456789abcdef0123456789a", false}, // too long
-		{"abcdef0123456789abcdef012345678g", false},  // non-hex
+		{"abcdef0123456789abcd", true},
+		{"ABCDEF0123456789ABCD", false},                 // uppercase not allowed
+		{"abcdef0123456789abc", false},                  // too short
+		{"abcdef0123456789abcde", false},                // too long
+		{"abcdef0123456789abcg", false},                 // non-hex
+		{"abcdef0123456789abcdef0123456789", false},     // legacy 128-bit UID, no longer accepted
 		{"", false},
 	}
 	for _, c := range cases {
@@ -41,8 +42,8 @@ func TestUIDDerivation(t *testing.T) {
 		t.Fatal(err)
 	}
 	uid := UIDFromPublicKeyBytes(der)
-	if len(uid) != 32 {
-		t.Errorf("UID length = %d, want 32", len(uid))
+	if len(uid) != 20 {
+		t.Errorf("UID length = %d, want 20", len(uid))
 	}
 	if !ValidateUID(uid) {
 		t.Errorf("Derived UID %q failed ValidateUID", uid)
@@ -51,10 +52,11 @@ func TestUIDDerivation(t *testing.T) {
 	if uid2 := UIDFromPublicKeyBytes(der); uid2 != uid {
 		t.Errorf("UID not deterministic: %q vs %q", uid, uid2)
 	}
-	// Sanity: matches manual computation
+	// Sanity: matches manual computation — first 80 bits of SHA-256(DER)
+	// as lowercase hex.
 	h := sha256.Sum256(der)
 	want := ""
-	for _, b := range h[:16] {
+	for _, b := range h[:10] {
 		want += string("0123456789abcdef"[b>>4]) + string("0123456789abcdef"[b&0xf])
 	}
 	if uid != want {

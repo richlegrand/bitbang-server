@@ -37,6 +37,13 @@ type Deps struct {
 	// websocket_ping_interval=60, keep_alive_timeout=300.
 	PingInterval time.Duration
 	PongWait     time.Duration
+
+	// TrustProxyHeaders controls whether X-Real-IP / X-Forwarded-For are
+	// honored when capturing the browser's IP for relayed "request"
+	// messages. Enable only when the server runs behind a reverse proxy
+	// that strips these headers from inbound requests; otherwise clients
+	// can spoof the value.
+	TrustProxyHeaders bool
 }
 
 // DeviceWS handles /ws/device/<uid>.

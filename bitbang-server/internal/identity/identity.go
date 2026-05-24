@@ -35,8 +35,10 @@ var AuthDomain = []byte("bitbang-auth-v1:")
 // MinRSAKeySize is the smallest RSA modulus we accept (NIST SP 800-57 floor).
 const MinRSAKeySize = 2048
 
-// uidPattern matches the wire UID format: 32 lowercase hex chars.
-var uidPattern = regexp.MustCompile(`^[a-f0-9]{32}$`)
+// uidPattern matches the wire UID format: 20 lowercase hex chars (80 bits).
+// The remaining 40 bits of the 128-bit URL space are the access code, which
+// rides in the URL fragment and is never sent to the server.
+var uidPattern = regexp.MustCompile(`^[a-f0-9]{20}$`)
 
 // ValidateUID reports whether uid is well-formed.
 func ValidateUID(uid string) bool {
@@ -44,10 +46,10 @@ func ValidateUID(uid string) bool {
 }
 
 // UIDFromPublicKeyBytes derives the wire UID from a DER-encoded public key:
-// first 32 hex chars of SHA256(publicKeyDER).
+// first 20 hex chars (80 bits) of SHA256(publicKeyDER).
 func UIDFromPublicKeyBytes(publicBytes []byte) string {
 	h := sha256.Sum256(publicBytes)
-	return hex.EncodeToString(h[:])[:32]
+	return hex.EncodeToString(h[:])[:20]
 }
 
 // ParsePublicKeyB64 decodes a base64 DER SubjectPublicKeyInfo and parses
