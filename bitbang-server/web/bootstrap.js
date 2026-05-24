@@ -1365,7 +1365,7 @@ class BitBangConnection {
 
     const uid = pathParts[0];
     const devicePath = '/' + pathParts.slice(1).join('/');
-    // The 40-bit access code lives in the URL fragment so the signaling
+    // The 64-bit access code lives in the URL fragment so the signaling
     // server never sees it. Browsers also never send fragments to servers,
     // so even if a user accidentally posts the URL to a server log, the
     // code part is stripped on first send. The browser bundles it inside
