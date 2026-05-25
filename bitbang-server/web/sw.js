@@ -187,8 +187,20 @@ async function findSession(event) {
         return Array.from(sessions.keys())[0];
     }
 
-    // Strategy 5: most recent session (sub-resources only, not navigations)
-    if (event.request.mode !== 'navigate' && sessions.size > 0) {
+    // Strategy 5 (final fallback): when no other strategy matched and
+    // there's any open session, route to the most recent. Covers:
+    //   - Sub-resource fetches (XHR, fetch, img, …) from contexts
+    //     whose URL doesn't include /__device__/<sid> — e.g. bare-
+    //     origin iframes the proxied app spawns.
+    //   - Form-POST navigations into hidden iframes (Synology DSM
+    //     uses this for /webman/login.cgi). These have mode ===
+    //     'navigate' even though no top-level page is loading.
+    //
+    // Top-level UID-path navigations (i.e. real bootstrap-page loads
+    // and reloads) are already excluded by the isUidPath+navigate
+    // early return at the top of this function, so it's safe to
+    // include 'navigate' mode here.
+    if (sessions.size > 0) {
         return Array.from(sessions.keys()).pop();
     }
 
