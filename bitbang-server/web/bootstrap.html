@@ -3,6 +3,13 @@
 <head>
     <meta charset="utf-8">
     <title>Loading...</title>
+    <!-- Explicit favicon link bypasses the browser's default
+         autodiscovery of /favicon.ico, which the SW intercepts and
+         tries to proxy through the device (where it 404s). The
+         /__bitbang__/* prefix is on isServerEndpoint's skip list, so
+         the request goes straight to bitbang-server's static.go,
+         which maps favicon.ico → favicon.png. -->
+    <link rel="icon" type="image/png" href="/__bitbang__/favicon.ico">
     <script>
         // ?debug loads eruda -- a floating console/network/storage panel for
         // mobile, where browser DevTools aren't available. Loaded async so it

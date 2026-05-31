@@ -935,14 +935,12 @@ class BitBangConnection {
         }
 
         if (msg.type === 'ready') {
-            // SWSP v3 `ready` carries the listener's capability set + server
-            // version. v2 listeners send just {type:'ready'} — caps stays
-            // undefined and we treat it as unknown / not advertised.
-            this.serverCaps = Array.isArray(msg.caps) ? msg.caps : null;
+            // `server_version` tells us which SWSP version the listener
+            // is speaking. v2 listeners send just {type:'ready'} —
+            // serverVersion defaults to 2.
             this.serverVersion = msg.server_version || 2;
             if (this.debug) {
-                console.log('[Bootstrap] Device ready (server v' + this.serverVersion +
-                    ', caps: ' + (this.serverCaps ? this.serverCaps.join(',') : 'n/a') + ')');
+                console.log('[Bootstrap] Device ready (server v' + this.serverVersion + ')');
             } else {
                 console.log('[Bootstrap] Device ready');
             }
@@ -1060,6 +1058,15 @@ class BitBangConnection {
     }
 
     handleWSFrame(frame, ws) {
+        // Generic /__bitbang/<type> streams use raw bytes for DAT and
+        // pass the FIN payload through untouched. Per-cap framing
+        // (tag bytes, JSON status payloads, etc.) lives in the
+        // iframe; bootstrap.js stays a transport.
+        if (ws.kind === 'bitbang') {
+            this.handleBitbangFrame(frame, ws);
+            return;
+        }
+
         if (frame.flags & FLAG_SYN) {
             // Device acknowledged the WebSocket open
             if (this.debug) console.log(`[Bootstrap] ws SYN ack from device, streamId=${frame.streamId}`);
@@ -1113,6 +1120,55 @@ class BitBangConnection {
         }
     }
 
+    // handleBitbangFrame is the generic transport for streams opened
+    // through the magic /__bitbang/<type> path. It does NO per-cap
+    // interpretation — the iframe-served code handles tag bytes,
+    // JSON FIN payloads, status decoding, etc. Bootstrap.js is just
+    // shuttling raw bytes between the SWSP data channel and the
+    // iframe's WebSocket shim.
+    handleBitbangFrame(frame, ws) {
+        if (frame.flags & FLAG_SYN) {
+            // A mid-stream SYN from the device is the listener's
+            // chosen way to deliver an early-error payload (or any
+            // other one-shot metadata). Deliver as a text WS message
+            // so the iframe can decide what to do with it. Most caps
+            // will UTF-8-decode + JSON.parse and look for `error`.
+            const text = frame.payload && frame.payload.byteLength > 0
+                ? new TextDecoder().decode(frame.payload) : '';
+            ws.iframe.postMessage({
+                type: 'ws-message', streamId: frame.streamId, data: text,
+            }, '*');
+            return;
+        }
+
+        if (frame.flags & FLAG_FIN) {
+            // FIN — close the iframe-side WebSocket. The FIN payload
+            // (if any) becomes the `reason` field on the close event.
+            // The iframe parses it however its cap requires (e.g.
+            // shell parses {exit_code, signal}; file ops parse
+            // {status, error}).
+            let reason = '';
+            if (frame.payload && frame.payload.byteLength > 0) {
+                reason = new TextDecoder().decode(frame.payload);
+            }
+            this.wsStreams.delete(frame.streamId);
+            ws.iframe.postMessage({
+                type: 'ws-closed', streamId: frame.streamId, code: 1000, reason,
+            }, '*');
+            return;
+        }
+
+        // DAT — raw bytes through. Send as a binary ws-message; the
+        // iframe is responsible for whatever tag-byte or framing
+        // scheme its cap uses.
+        if (!frame.payload || frame.payload.byteLength === 0) return;
+        const view = new Uint8Array(frame.payload);
+        const ab = view.buffer.slice(view.byteOffset, view.byteOffset + view.byteLength);
+        ws.iframe.postMessage({
+            type: 'ws-message', streamId: frame.streamId, data: ab,
+        }, '*');
+    }
+
     async onDataChannelReady() {
         // Register this tab's session with the SW
         const pathParts = this.devicePath.split('/').filter(Boolean);
@@ -1130,14 +1186,14 @@ class BitBangConnection {
         // Brief delay for any pending tracks to arrive
         await new Promise(resolve => setTimeout(resolve, 100));
 
-        // Send connect handshake with path (streamId 0). SWSP v3 adds
-        // `caps` (the stream types this client knows how to drive) and
-        // `version` (the SWSP version we're speaking). Older v2 listeners
-        // ignore both fields and continue working.
+        // Send connect handshake with path (streamId 0). `version` is
+        // the SWSP version we're speaking; older v2 listeners ignore
+        // it. No `caps` field — bootstrap.js is a pure transport and
+        // doesn't claim knowledge of specific stream types. The iframe
+        // decides what to open via /__bitbang/<type>.
         const connectMsg = JSON.stringify({
             type: 'connect',
             path: this.devicePath,
-            caps: ['http', 'websocket'],
             version: 3,
         });
         this.dataChannel.send(this.createFrame(0, FLAG_SYN, connectMsg));
@@ -1150,12 +1206,31 @@ class BitBangConnection {
         const connectPromise = new Promise(resolve => { this.connectResolve = resolve; });
         await Promise.all([connectPromise, this._turnHoldPromise || Promise.resolve()]);
 
-        // Listen for messages from the iframe (WebSocket shim + navigation)
+        // Listen for messages from the iframe (WebSocket shim + navigation
+        // + open-cap launcher requests).
         window.addEventListener('message', (event) => {
             const iframe = document.getElementById('device-frame');
             if (!iframe || event.source !== iframe.contentWindow) return;
             if (event.data?.type === 'bb-navigate') {
                 this.handleNavigateRequest(event.data.path);
+            } else if (event.data?.type === 'bb-open-cap') {
+                // The iframe asks us to land on /<uid><path>#<code>.
+                // The code lives in our fragment (never sent to the
+                // iframe), and the iframe sandbox forbids top-frame
+                // navigation, so both URL composition and navigation
+                // happen here in the top frame.
+                //
+                // newTab: true (default) → window.open (cap-bar
+                // hamburger items, intentional multi-tab launch).
+                // newTab: false → navigate this same tab (proxy form's
+                // Go button — the proxy tab becomes the target tab).
+                const path = event.data.path || '/';
+                const url = '/' + this.uid + path + '#' + this.code;
+                if (event.data.newTab === false) {
+                    window.location.href = url;
+                } else {
+                    window.open(url, '_blank', 'noopener');
+                }
             } else {
                 this.handleWSShimMessage(event);
             }
@@ -1183,11 +1258,11 @@ class BitBangConnection {
         };
         this.connectResolve = navigateAfterAuth;
 
-        // Send connect with the new path (SWSP v3 fields included).
+        // Send connect with the new path. Matches the initial-connect
+        // payload — no caps advertisement.
         const connectMsg = JSON.stringify({
             type: 'connect',
             path,
-            caps: ['http', 'websocket'],
             version: 3,
         });
         this.dataChannel.send(this.createFrame(0, FLAG_SYN, connectMsg));
@@ -1202,19 +1277,65 @@ class BitBangConnection {
         if (!msg || !msg.type?.startsWith('ws-')) return;
 
         if (msg.type === 'ws-open') {
-            // Allocate a stream ID and send SYN with websocket type
             const streamId = this.nextStreamId++;
-            this.wsStreams.set(streamId, { iframe: iframe.contentWindow });
             if (this.debug) console.log(`[Bootstrap] ws-open ${msg.pathname}, streamId=${streamId}, cookies.len=${(msg.cookies || '').length}`);
 
-            // Tell the shim which streamId was assigned
+            // Magic path: /__bitbang/<type>?<params> opens a SWSP
+            // stream of the named type. bootstrap.js is a generic
+            // transport here — it builds the SYN from path+query but
+            // shuttles raw bytes for DAT/FIN. Each iframe-served cap
+            // (shell, serial, forward, …) handles its own per-stream
+            // framing (tag bytes, JSON FIN payloads, etc.). Adding a
+            // new cap therefore doesn't require any bootstrap.js
+            // changes — just a new device-side handler and an iframe
+            // page that opens the right magic URL.
+            const bitbangPrefix = '/__bitbang/';
+            if (msg.pathname && msg.pathname.indexOf(bitbangPrefix) === 0) {
+                const u = new URL(msg.pathname, 'http://device');
+                // Pathname after /__bitbang/ is the stream type. Strip
+                // the leading slash that URL.pathname keeps and pull
+                // out the first segment.
+                const tail = u.pathname.substring(bitbangPrefix.length);
+                const type = tail.split('/')[0];
+                if (!type) {
+                    iframe.contentWindow.postMessage({
+                        type: 'ws-closed', streamId, code: 1008,
+                        reason: 'bitbang: empty type in magic path',
+                    }, '*');
+                    return;
+                }
+
+                // Build the SYN payload from the query string. Each
+                // value is JSON-parsed where possible (so "true" → bool,
+                // "80" → number, "[\"bash\"]" → array), otherwise kept
+                // as a literal string. The result is a typed JSON
+                // object the listener can unmarshal cleanly.
+                const syn = { type };
+                for (const [k, v] of u.searchParams) {
+                    try { syn[k] = JSON.parse(v); }
+                    catch (e) { syn[k] = v; }
+                }
+
+                this.wsStreams.set(streamId, { iframe: iframe.contentWindow, kind: 'bitbang' });
+                iframe.contentWindow.postMessage({
+                    type: 'ws-assign', pathname: msg.pathname, streamId,
+                }, '*');
+                this.dataChannel.send(this.createFrame(streamId, FLAG_SYN, JSON.stringify(syn)));
+                // Tell the iframe the WS is open now. Listener handlers
+                // typically don't send a SYN ack on the success path —
+                // the first DAT is the natural signal that things are
+                // working. Iframe code can start sending immediately.
+                iframe.contentWindow.postMessage({ type: 'ws-opened', streamId }, '*');
+                return;
+            }
+
+            // Regular WebSocket proxy path (unchanged).
+            this.wsStreams.set(streamId, { iframe: iframe.contentWindow, kind: 'websocket' });
             iframe.contentWindow.postMessage({
                 type: 'ws-assign',
                 pathname: msg.pathname,
                 streamId
             }, '*');
-
-            // Send SWSP SYN to device (include cookies for session auth)
             const synPayload = JSON.stringify({
                 type: 'websocket',
                 pathname: msg.pathname,
@@ -1227,7 +1348,23 @@ class BitBangConnection {
             const ws = this.wsStreams.get(msg.streamId);
             if (!ws) return;
 
-            // DAT frame with type byte prefix: 0=text, 1=binary
+            if (ws.kind === 'bitbang') {
+                // Generic shuttle: raw bytes go through unchanged. Text
+                // frames are UTF-8 encoded; the iframe is responsible
+                // for keeping the cap-specific framing it expects.
+                let payload;
+                if (msg.isText) {
+                    payload = new TextEncoder().encode(msg.data);
+                } else {
+                    payload = msg.data instanceof ArrayBuffer
+                        ? new Uint8Array(msg.data)
+                        : new Uint8Array(msg.data);
+                }
+                this.dataChannel.send(this.createFrame(msg.streamId, FLAG_DAT, payload));
+                return;
+            }
+
+            // Regular WebSocket DAT framing: [1B type: 0=text 1=binary][message]
             let payload;
             if (msg.isText) {
                 const textBytes = new TextEncoder().encode(msg.data);
@@ -1235,7 +1372,6 @@ class BitBangConnection {
                 payload[0] = 0; // text
                 payload.set(textBytes, 1);
             } else {
-                // Binary data (ArrayBuffer or similar)
                 const binBytes = msg.data instanceof ArrayBuffer
                     ? new Uint8Array(msg.data)
                     : new Uint8Array(msg.data);
@@ -1364,7 +1500,17 @@ class BitBangConnection {
     }
 
     const uid = pathParts[0];
-    const pathFromUrl = '/' + pathParts.slice(1).join('/');
+    let pathFromUrl = '/' + pathParts.slice(1).join('/');
+    // Preserve trailing slash from the original pathname. URL parsing
+    // above drops it (filter(Boolean) strips the empty segment after
+    // the last /), but the listener's mux mounts cap routes WITH the
+    // trailing slash ("/proxy/" not "/proxy"). Without this, the iframe
+    // load triggers a 301 from the listener whose Location header
+    // doesn't include the /__device__/<sessionId> prefix — the iframe
+    // ends up navigating to the wrong place.
+    if (window.location.pathname.endsWith('/') && pathFromUrl !== '/') {
+        pathFromUrl += '/';
+    }
 
     // The 64-bit access code lives in the URL fragment so the signaling
     // server never sees it. Browsers also never send fragments to servers,

@@ -33,16 +33,28 @@ type ICEServer struct {
 // Register is the first message a device sends after the WS opens.
 // PublicKey is base64-encoded DER (SubjectPublicKeyInfo). The algorithm is
 // derived from the DER structure itself, not carried in a separate field.
+//
+// WantCode (additive in v3.x) opts the device into the code-exchange
+// pairing flow. When set, the server allocates a 6-digit code, stores
+// the code→UID mapping, and includes the code in the Registered reply.
+// Connectors can then pair by sending PairInit with that code instead
+// of needing the full 22-char UID up front. Devices that don't speak
+// code exchange omit the field; the server defaults to legacy behavior.
 type Register struct {
 	Type       string      `json:"type"` // "register"
 	Protocol   int         `json:"protocol"`
 	PublicKey  string      `json:"public_key"`
 	ICEServers []ICEServer `json:"ice_servers,omitempty"` // device-supplied override
+	WantCode   bool        `json:"want_code,omitempty"`
 }
 
-// Registered is sent by the server after a successful register.
+// Registered is sent by the server after a successful register. Code is
+// populated only when the device sent WantCode=true (and pairing is
+// enabled server-side); legacy devices that don't set WantCode get a
+// bare {"type":"registered"} reply.
 type Registered struct {
-	Type string `json:"type"` // "registered"
+	Type string `json:"type"`           // "registered"
+	Code string `json:"code,omitempty"` // 6-digit pairing code
 }
 
 // Error is sent by the server when any validation/auth step fails.

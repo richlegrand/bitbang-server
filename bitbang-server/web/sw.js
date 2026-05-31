@@ -323,13 +323,30 @@ function getCookieHeader(jarKey, requestPath) {
 
 // -- Fetch handler -----------------------------------------------------------
 
+// Signaling-server endpoints — and our own static assets — must reach the
+// origin server, not the device tunnel. Without this list, a tail of
+// proxyAbsolutePath would route /status (and similar) through whatever
+// session happens to be open, returning whatever 404/406 the device app
+// thinks of the path. Worst case the user looks at /status in a browser
+// that's been used for bitbang, gets a 404 from their own SW, and thinks
+// the server is broken.
+//
+// Keep in sync with the signaling server's route table in
+// cmd/signaling/main.go.
+function isServerEndpoint(pathname) {
+    return pathname === '/status'
+        || pathname.startsWith('/ws/')
+        || pathname.startsWith('/__bitbang__/');
+}
+
 self.addEventListener('fetch', (event) => {
     const url = new URL(event.request.url);
     if (url.origin !== self.location.origin) return;
+    if (isServerEndpoint(url.pathname)) return;
 
     if (url.pathname.startsWith('/__device__/')) {
         event.respondWith(proxyToDevice(event));
-    } else if (!url.pathname.startsWith('/__bitbang__/')) {
+    } else {
         event.respondWith(proxyAbsolutePath(event, url));
     }
 });
