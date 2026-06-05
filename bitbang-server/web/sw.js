@@ -10,18 +10,7 @@
 console.log('[SW] booted');
 
 self.addEventListener('install', () => self.skipWaiting());
-
-// Bump the suffix to invalidate all cached assets on a breaking SW change.
-const ASSET_CACHE = 'bitbang-assets-v1';
-
-self.addEventListener('activate', (event) => event.waitUntil((async () => {
-    await self.clients.claim();
-    // Drop stale asset-cache buckets from older SW builds.
-    const keys = await caches.keys();
-    await Promise.all(keys
-        .filter(k => k.startsWith('bitbang-assets-') && k !== ASSET_CACHE)
-        .map(k => caches.delete(k)));
-})()));
+self.addEventListener('activate', (event) => event.waitUntil(self.clients.claim()));
 
 // -- Session tracking --------------------------------------------------------
 
@@ -350,22 +339,6 @@ function isServerEndpoint(pathname) {
         || pathname.startsWith('/__bitbang__/');
 }
 
-// -- Static-asset cache (cache-first) ---------------------------------------
-// OctoPrint's static assets are immutable per URL: packed_*.js/css are
-// query-busted (?<hash>) and vendor libs are path-versioned. So a full
-// path+query key is safe to serve cache-first -- a rebuild changes the URL and
-// misses the cache. Keyed by device uid (not the ephemeral session id) so the
-// cache survives reconnects. Only GETs under /static/ or /plugin/*/static/.
-function isCacheableAsset(method, devicePath) {
-    if (method !== 'GET') return false;
-    return devicePath.startsWith('/static/')
-        || /^\/plugin\/[^/]+\/static\//.test(devicePath);
-}
-
-function assetCacheKey(uid, pathAndSearch) {
-    return `${self.location.origin}/__assetcache__/${uid}${pathAndSearch}`;
-}
-
 self.addEventListener('fetch', (event) => {
     const url = new URL(event.request.url);
     if (url.origin !== self.location.origin) return;
@@ -462,20 +435,6 @@ async function proxyToDevice(event) {
     }
 
     if (session?.debug) console.log(`[SW] ${event.request.method} ${url.pathname} -> session: ${sessionId}, bootstrap: ${!!bootstrap}`);
-
-    // Cache-first for immutable static assets. A hit serves locally without
-    // touching the device (or even needing a live bootstrap).
-    const cacheable = session && isCacheableAsset(event.request.method, devicePath);
-    let assetCache = null, assetKey = null;
-    if (cacheable) {
-        assetCache = await caches.open(ASSET_CACHE);
-        assetKey = assetCacheKey(session.uid, devicePath + url.search);
-        const hit = await assetCache.match(assetKey);
-        if (hit) {
-            if (session?.debug) console.log(`[SW] asset cache HIT ${devicePath}`);
-            return hit;
-        }
-    }
 
     if (!bootstrap) {
         console.warn('[SW] No bootstrap client found');
@@ -635,13 +594,7 @@ async function proxyToDevice(event) {
 
                 // 204/304 responses must not have a body per spec
                 const nullBodyStatus = (status === 204 || status === 304);
-                const response = new Response(nullBodyStatus ? null : stream, { status, headers });
-                // Store immutable static assets for cache-first next time. Only
-                // clean 200s without Set-Cookie (cookies => not a static asset).
-                if (cacheable && assetCache && assetKey && status === 200 && !setCookie) {
-                    assetCache.put(assetKey, response.clone()).catch(() => {});
-                }
-                resolve(response);
+                resolve(new Response(nullBodyStatus ? null : stream, { status, headers }));
             } else if (type === 'chunk') {
                 try { streamController?.enqueue(data); } catch (e) {}
             } else if (type === 'done') {
