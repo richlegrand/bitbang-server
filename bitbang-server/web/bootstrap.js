@@ -11,25 +11,49 @@ const STATUS = {
     CONNECTING: "Connecting to server...",
     WAITING_OFFER: "Waiting for device...",
     CONNECTING_WEBRTC: "Establishing peer connection...",
+    NEGOTIATING: "Negotiating connection...",
     CONNECTED: "Connected"
 };
+
+// Per-phase delay before the TURN-withhold fallback fires. The browser
+// first tries to connect with host + srflx candidates only (server
+// withholds TURN). After MESSAGE_TIMEOUT_MS, if still not connected, we
+// show the user a "Negotiating connection..." banner and start the
+// second timer. After another MESSAGE_TIMEOUT_MS (so 2 × the timeout
+// since the answer was sent), if still not connected, the browser asks
+// the server for TURN credentials and adds them via setConfiguration +
+// restartIce.
+//
+// Override via ?msg_timeout=N (seconds, float-OK). Defaults to 3 seconds
+// → 6 seconds total before a fallback. Direct paths almost always
+// resolve within phase 1; this just biases ICE toward direct.
+const MESSAGE_TIMEOUT_MS = (() => {
+    const p = new URLSearchParams(window.location.search);
+    const n = parseFloat(p.get('msg_timeout'));
+    return isFinite(n) && n > 0 ? n * 1000 : 3000;
+})();
 
 // SWSP (Simple WebRTC Streaming Protocol) constants
 const FLAG_SYN = 0x0001;
 const FLAG_FIN = 0x0004;
 const FLAG_DAT = 0x0000;
+const FLAG_MORE = 0x0002;  // non-final fragment of a chunked WS message
+const SWSP_CHUNK_SIZE = 16384;  // max payload bytes per data-channel frame
 
 // --- Bidirectional verify helpers ----------------------------------------
 //
 // The browser is the connecting party. Before opening WebRTC, it asks the
 // signaling server for the device's pubkey, verifies hash(pubkey) === UID
-// locally, then rides an encrypted {fingerprint, nonce} payload on the
-// answer. The device decrypts, confirms the fingerprint matches the SDP, and
-// proves possession of the private key by sending sha256(nonce) back as the
-// first stream-0 frame after the data channel opens. A rogue signaling
-// server cannot mount a relay attack: it can rewrite SDPs all it wants, but
-// without the device's private key it can't decrypt the payload or produce a
-// matching nonce hash, and the browser will reject the channel.
+// locally, then rides an encrypted {fingerprint, nonce, code} payload on
+// the answer (code is the access code from the URL fragment; omitted only
+// when the URL has no #code, in which case the device rejects the
+// connection). The device decrypts, confirms the fingerprint matches the
+// SDP and the code matches its own, and proves possession of the private
+// key by sending sha256(nonce) back as the first stream-0 frame after the
+// data channel opens. A rogue signaling server cannot mount a relay
+// attack: it can rewrite SDPs all it wants, but without the device's
+// private key it can't decrypt the payload or produce a matching nonce
+// hash, and the browser will reject the channel.
 
 function bytesToBase64(bytes) {
     let s = '';
@@ -415,7 +439,17 @@ class BitBangConnection {
             this.deviceVerified = false;
 
             this.ws.onopen = () => {
-                this.ws.send(JSON.stringify({ type: 'request', uid: this.uid }));
+                // ?relay tells the server to skip TURN withholding and
+                // include relay credentials in the initial offer (legacy
+                // behavior). ?norelay also disables the fallback (handled
+                // in createPeerConnection by dropping iceServers entirely).
+                const params = new URLSearchParams(window.location.search);
+                const forceRelay = params.has('relay') && !params.has('norelay');
+                this.ws.send(JSON.stringify({
+                    type: 'request',
+                    uid: this.uid,
+                    force_relay: forceRelay,
+                }));
                 this.updateStatus(STATUS.WAITING_OFFER);
             };
 
@@ -432,6 +466,8 @@ class BitBangConnection {
                     resolve();
                 } else if (msg.type === 'candidate') {
                     this.handleRemoteCandidate(msg.candidate);
+                } else if (msg.type === 'ice_servers') {
+                    await this._handleICEServersPush(msg);
                 } else if (msg.type === 'error') {
                     clearTimeout(offerTimeout);
                     if (msg.message === 'device_preempted') {
@@ -497,6 +533,7 @@ class BitBangConnection {
                 }
             }
         }
+        this.iceServers = Array.isArray(msg.ice_servers) ? msg.ice_servers : [];
         this.pc = this.createPeerConnection(msg.ice_servers);
 
         if (this.debug) {
@@ -544,6 +581,23 @@ class BitBangConnection {
             this.ws.send(JSON.stringify(msg));
         }
         this.localCandidateQueue = [];
+
+        // Start the TURN-withhold fallback timers. After MESSAGE_TIMEOUT_MS,
+        // if the connection still isn't up, show the user a friendly
+        // "Negotiating connection..." banner. After another MESSAGE_TIMEOUT_MS,
+        // silently ask the server for TURN credentials.
+        //
+        // ?norelay: skip the fallback entirely — connection either works
+        // direct or fails. ?relay: server already attached TURN to the offer
+        // and the connection should converge quickly; still arm the
+        // reassurance timer in case it doesn't.
+        const params = new URLSearchParams(window.location.search);
+        const noRelay = params.has('norelay');
+        this._reassureTimer = setTimeout(() => this._reassureUser(), MESSAGE_TIMEOUT_MS);
+        if (!noRelay) {
+            // Phase 2 timer is armed inside _reassureUser so it always
+            // follows phase 1.5. Nothing to do here.
+        }
     }
 
     createPeerConnection(iceServers) {
@@ -572,6 +626,9 @@ class BitBangConnection {
         pc.onconnectionstatechange = () => {
             if (this.debug) console.log(`[Bootstrap] connectionState -> ${pc.connectionState}`);
             if (pc.connectionState === 'connected') {
+                // Cancel any pending TURN-withhold fallback timers; the
+                // connection is up and we no longer need to escalate.
+                this._clearFallbackTimers();
                 this.updateStatus(STATUS.CONNECTED);
                 this.pollConnectionType(pc);
                 if (!this._wasConnected) {
@@ -579,6 +636,7 @@ class BitBangConnection {
                     this._onFirstConnected(pc);
                 }
             } else if (pc.connectionState === 'failed') {
+                this._clearFallbackTimers();
                 if (this._wasConnected) {
                     this._handlePostHandshakeFailure();
                 } else {
@@ -710,6 +768,79 @@ class BitBangConnection {
         this.turnBannerEl.hidden = false;
     }
 
+    _hideRelayBanner() {
+        if (!this.turnBannerEl) return;
+        this.turnBannerEl.hidden = true;
+        this.turnBannerEl.textContent = '';
+    }
+
+    _clearFallbackTimers() {
+        if (this._reassureTimer) {
+            clearTimeout(this._reassureTimer);
+            this._reassureTimer = null;
+        }
+        if (this._turnFallbackTimer) {
+            clearTimeout(this._turnFallbackTimer);
+            this._turnFallbackTimer = null;
+        }
+    }
+
+    // Phase 1.5 of TURN-withhold fallback. Direct ICE hasn't connected yet.
+    // Show the user a "Negotiating connection..." banner so they know the
+    // page hasn't stalled, and arm phase 2 (request TURN credentials).
+    _reassureUser() {
+        this._reassureTimer = null;
+        if (this.pc && this.pc.connectionState === 'connected') return;
+        this.updateStatus(STATUS.NEGOTIATING);
+        this._setRelayBanner(STATUS.NEGOTIATING);
+
+        // ?norelay disables phase 2 entirely; only show the banner.
+        const params = new URLSearchParams(window.location.search);
+        if (params.has('norelay')) return;
+
+        this._turnFallbackTimer = setTimeout(() => this._requestTURNFallback(), MESSAGE_TIMEOUT_MS);
+    }
+
+    // Phase 2. Direct ICE still hasn't connected after the second timeout
+    // window. Ask the signaling server for TURN credentials; it will reply
+    // with an "ice_servers" message that triggers _handleICEServersPush.
+    // No banner change — keep "Negotiating connection..." until either
+    // direct or TURN actually connects. _onFirstConnected handles the
+    // standard "Using temporary relay (TURN)..." banner if TURN wins.
+    _requestTURNFallback() {
+        this._turnFallbackTimer = null;
+        if (this.pc && this.pc.connectionState === 'connected') return;
+        if (this.debug) console.log('[Bootstrap] direct ICE timeout, requesting TURN');
+        try {
+            this.ws.send(JSON.stringify({ type: 'request_ice' }));
+        } catch (e) {
+            console.warn('[Bootstrap] request_ice failed:', e);
+        }
+    }
+
+    // Server pushed TURN credentials in response to a request_ice we sent
+    // (or in response to a ?relay query path). Inject them into the
+    // existing RTCPeerConnection and restart ICE so the relay candidates
+    // get gathered and tried alongside the still-running direct attempts.
+    async _handleICEServersPush(msg) {
+        if (this.debug) console.log('[Bootstrap] received ice_servers push, unavailable=' + !!msg.turn_unavailable);
+        if (msg.turn_unavailable) {
+            this._setRelayBanner('Relay server (TURN) is at capacity — connection may fail.');
+            return;
+        }
+        if (!this.pc) return;
+        const servers = Array.isArray(msg.ice_servers) ? msg.ice_servers : [];
+        if (servers.length === 0) return;
+        const config = this.pc.getConfiguration();
+        config.iceServers = (config.iceServers || []).concat(servers);
+        try {
+            this.pc.setConfiguration(config);
+            this.pc.restartIce();
+        } catch (e) {
+            console.warn('[Bootstrap] failed to apply TURN credentials:', e);
+        }
+    }
+
     // Fired once per session, the first time pc.connectionState reaches
     // 'connected'. DTLS is up by then; candidate-pair byte counters are
     // populated. We use this to:
@@ -732,6 +863,10 @@ class BitBangConnection {
             // Banner was already set in handleOffer; just arm the hold so
             // the visible message survives iframe handoff for ~2 s.
             this._turnHoldPromise = new Promise(r => setTimeout(r, 2000));
+        } else {
+            // Direct peer-to-peer won. Clear any "Negotiating connection..."
+            // banner the fallback timers may have set.
+            this._hideRelayBanner();
         }
         // Arm the TTL-based end triggers if we're on a relay path and we
         // know when the credential expires. Direct paths skip both.
@@ -985,9 +1120,59 @@ class BitBangConnection {
                 const delay = msg.success ? 2000 : 3000;
                 setTimeout(handleResult, delay);
             }
+        } else if (msg.type === 'video_offer') {
+            // Secondary "video" PeerConnection: the device relays an external
+            // media helper's offer over the (verified) data channel. We answer
+            // over the data channel too — not via bitba.ng signaling.
+            this.handleVideoOffer(msg.sdp);
+        } else if (msg.type === 'video_candidate') {
+            if (this.videoPc && msg.candidate) {
+                this.videoPc.addIceCandidate(msg.candidate).catch(() => {});
+            }
         } else if (msg.type === 'error') {
             console.error('[Bootstrap] Device error:', msg.message);
             this.showErrorScreen(msg.message || 'Connection refused');
+        }
+    }
+
+    // handleVideoOffer answers a video offer that arrived over the data
+    // channel, creating a second PeerConnection whose track lands in
+    // resolvedStreams (same registry the iframe binds via data-bitbang-stream).
+    // Answer + ICE travel back over stream 0 (FLAG_SYN control frames).
+    async handleVideoOffer(sdp) {
+        try {
+            if (this.videoPc) { try { this.videoPc.close(); } catch (e) {} }
+            const config = { sdpSemantics: 'unified-plan' };
+            if (this.iceServers && this.iceServers.length) config.iceServers = this.iceServers;
+            const pc = new RTCPeerConnection(config);
+            this.videoPc = pc;
+
+            pc.ontrack = (event) => {
+                const stream = event.streams[0];
+                this.resolvedStreams['camera'] = stream;
+                if (this.debug) console.log('[Bootstrap] video track received');
+                const iframe = document.getElementById('device-frame');
+                if (iframe) this.wireStreams(iframe);
+            };
+            pc.onicecandidate = (event) => {
+                if (event.candidate) {
+                    this.dataChannel.send(this.createFrame(0, FLAG_SYN, JSON.stringify({
+                        type: 'video_candidate', candidate: event.candidate.toJSON(),
+                    })));
+                }
+            };
+            pc.onconnectionstatechange = () => {
+                if (this.debug) console.log('[Bootstrap] video PC -> ' + pc.connectionState);
+            };
+
+            await pc.setRemoteDescription({ type: 'offer', sdp });
+            await pc.setLocalDescription(await pc.createAnswer());
+            this.dataChannel.send(this.createFrame(0, FLAG_SYN, JSON.stringify({
+                type: 'video_answer', sdp: pc.localDescription.sdp,
+            })));
+            if (this.debug) console.log('[Bootstrap] sent video answer');
+        } catch (e) {
+            console.error('[Bootstrap] video offer handling failed:', e);
         }
     }
 
@@ -1100,10 +1285,30 @@ class BitBangConnection {
         }
 
         if (frame.payload.byteLength > 0 && !(frame.flags & FLAG_SYN)) {
-            // DAT frame: type byte (0=text, 1=binary) + message
-            const view = new Uint8Array(frame.payload);
-            const isText = view[0] === 0;
-            const messageBytes = view.slice(1);
+            // DAT frame(s): a large WS message is split into <=SWSP_CHUNK_SIZE
+            // chunks, with FLAG_MORE on every non-final chunk. Buffer until the
+            // final chunk, then deliver the reassembled message -- preserving the
+            // WS message boundary. The type byte (0=text, 1=binary) rides in the
+            // first chunk.
+            const part = new Uint8Array(frame.payload);
+            if (frame.flags & FLAG_MORE) {
+                (ws._rx || (ws._rx = [])).push(part);
+                return;
+            }
+            let full;
+            if (ws._rx) {
+                ws._rx.push(part);
+                const total = ws._rx.reduce((n, a) => n + a.byteLength, 0);
+                full = new Uint8Array(total);
+                let o = 0;
+                for (const a of ws._rx) { full.set(a, o); o += a.byteLength; }
+                ws._rx = null;
+            } else {
+                full = part;
+            }
+
+            const isText = full[0] === 0;
+            const messageBytes = full.slice(1);
 
             let data;
             if (isText) {
@@ -1379,7 +1584,15 @@ class BitBangConnection {
                 payload[0] = 1; // binary
                 payload.set(binBytes, 1);
             }
-            this.dataChannel.send(this.createFrame(msg.streamId, FLAG_DAT, payload));
+            // Chunk at SWSP_CHUNK_SIZE (the data-channel message limit). Non-final
+            // chunks carry FLAG_MORE so the device reassembles them into one WS
+            // message (the type byte rides in the first chunk).
+            for (let off = 0; off < payload.length; off += SWSP_CHUNK_SIZE) {
+                const end = off + SWSP_CHUNK_SIZE;
+                const flags = end >= payload.length ? FLAG_DAT : (FLAG_DAT | FLAG_MORE);
+                this.dataChannel.send(this.createFrame(
+                    msg.streamId, flags, payload.subarray(off, Math.min(end, payload.length))));
+            }
 
         } else if (msg.type === 'ws-close') {
             const ws = this.wsStreams.get(msg.streamId);
