@@ -456,6 +456,19 @@ class BitBangConnection {
             this.ws.onmessage = async (event) => {
                 const msg = JSON.parse(event.data);
                 if (msg.type === 'offer') {
+                    // A second offer on an established PC is the device's
+                    // ICE-restart re-offer (TURN-withhold fallback): renegotiate
+                    // in place so we re-answer and gather relay candidates from
+                    // the TURN creds we already added via setConfiguration. The
+                    // connect promise resolved on the first offer — leave it be.
+                    if (this.pc && this.remoteDescriptionSet) {
+                        try {
+                            await this.handleRenegotiationOffer(msg);
+                        } catch (e) {
+                            console.warn('[Bootstrap] ICE-restart renegotiation failed:', e);
+                        }
+                        return;
+                    }
                     clearTimeout(offerTimeout);
                     try {
                         await this.handleOffer(msg);
@@ -488,6 +501,26 @@ class BitBangConnection {
                 reject(new Error('WebSocket connection failed'));
             };
         });
+    }
+
+    // Handle the device's ICE-restart re-offer (TURN-withhold fallback).
+    // Reuse the existing PC — it already has the TURN servers added by
+    // _handleICEServersPush, so creating the answer re-gathers ICE and this
+    // time produces relay candidates, which trickle to the device via the
+    // existing onicecandidate handler. No re-verify: an ICE restart leaves
+    // DTLS (and the verified fingerprint) unchanged, so we skip the encrypted
+    // payload and flag the answer so the device applies it without verifying.
+    async handleRenegotiationOffer(msg) {
+        if (this.debug) console.log('[Bootstrap] ICE-restart re-offer — renegotiating to add relay');
+        await this.pc.setRemoteDescription({ type: 'offer', sdp: msg.sdp });
+        const answer = await this.pc.createAnswer();
+        await this.pc.setLocalDescription(answer);
+        this.ws.send(JSON.stringify({
+            type: 'answer',
+            uid: this.uid,
+            sdp: this.pc.localDescription.sdp,
+            ice_restart: true,
+        }));
     }
 
     async handleOffer(msg) {
@@ -835,7 +868,11 @@ class BitBangConnection {
         config.iceServers = (config.iceServers || []).concat(servers);
         try {
             this.pc.setConfiguration(config);
-            this.pc.restartIce();
+            // The device drives the actual ICE restart: the server forwards an
+            // ice_restart trigger, the device re-offers, and handleRenegotiationOffer
+            // re-answers — gathering relay candidates from the creds just added.
+            // A browser-side restartIce() here is inert: we're the answerer, so
+            // it would only take effect on a createOffer() we never call.
         } catch (e) {
             console.warn('[Bootstrap] failed to apply TURN credentials:', e);
         }
