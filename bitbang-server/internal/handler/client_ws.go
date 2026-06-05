@@ -97,11 +97,24 @@ func (d *Deps) clientRelay(conn *registry.ClientConn) {
 
 		switch msgType {
 		case "request":
-			// Capacity-decide once at request time (CredentialsFor caches
-			// internally so the offer-forward path sees the same answer).
-			servers, unavailable := d.iceForClient(device, conn.ClientID)
+			// Capture the browser's ?relay flag so the offer relay later
+			// knows whether to attach TURN credentials to the offer it
+			// forwards back to the client. Once set on the conn, it's
+			// stable for the session.
+			if forceRelay, ok := msg["force_relay"].(bool); ok && forceRelay {
+				conn.ForceRelay = true
+			}
+			// Stamp ICE servers for the device side. Withhold is always
+			// true here: the architecture is browser-only TURN allocation,
+			// so the device never needs server-managed TURN credentials.
+			// BYO TURN (device-supplied at register) still flows through —
+			// iceForClient's first check honors device.ICEServers regardless
+			// of withhold.
+			servers, _ := d.iceForClient(device, conn.ClientID, true)
 			if len(servers) > 0 {
 				msg["ice_servers"] = servers
+			} else {
+				delete(msg, "ice_servers")
 			}
 			// Stamp the connecting browser's IP so the device can attribute
 			// bad-code attempts. Browsers can't set browser_ip themselves
@@ -120,7 +133,7 @@ func (d *Deps) clientRelay(conn *registry.ClientConn) {
 			d.Log.Info("forwarded request",
 				"client_id", conn.ClientID,
 				"target", conn.TargetUID,
-				"turn", turnStatus(device, conn.ClientID, unavailable, d.TURN.Configured()))
+				"force_relay", conn.ForceRelay)
 
 		case "answer":
 			if err := device.SendJSON(msg); err != nil {
@@ -136,25 +149,32 @@ func (d *Deps) clientRelay(conn *registry.ClientConn) {
 			}
 			d.Log.Debug("forwarded candidate", "client_id", conn.ClientID, "target", conn.TargetUID)
 
+		case "request_ice":
+			// Browser's direct-only ICE attempt didn't connect within the
+			// fallback window; push TURN credentials so the browser can
+			// add them via setConfiguration + restartIce. This is where
+			// the TURN capacity gate fires — the offer relay never called
+			// CredentialsFor.
+			servers, unavailable := d.TURN.CredentialsFor(conn.ClientID)
+			push := wire.ICEServersPush{
+				Type:            "ice_servers",
+				ICEServers:      servers,
+				TURNUnavailable: unavailable,
+			}
+			if err := conn.SendJSON(push); err != nil {
+				d.Log.Warn("ice_servers push failed", "client_id", conn.ClientID, "err", err)
+				return
+			}
+			d.Log.Info("served TURN credentials",
+				"client_id", conn.ClientID,
+				"target", conn.TargetUID,
+				"unavailable", unavailable,
+				"count", len(servers))
+
 		default:
 			d.Log.Warn("client sent unknown message type", "client_id", conn.ClientID, "type", msgType)
 		}
 	}
-}
-
-// turnStatus picks a short string for the request-forwarded log line that
-// matches the Python implementation's log vocabulary.
-func turnStatus(device *registry.DeviceConn, clientID string, unavailable bool, turnConfigured bool) string {
-	if unavailable {
-		return "STUN only (at capacity)"
-	}
-	if len(device.ICEServers) > 0 {
-		return "with device-supplied ICE"
-	}
-	if !turnConfigured {
-		return "direct only (no TURN credentials)"
-	}
-	return "with TURN"
 }
 
 // shortRandomHex returns 2*n hex chars from crypto/rand. Used to suffix

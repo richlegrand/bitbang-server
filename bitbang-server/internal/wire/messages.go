@@ -109,11 +109,85 @@ type Candidate struct {
 // the signaling server (X-Real-IP when behind a reverse proxy, else the
 // direct RemoteAddr). Devices use it to attribute bad-code attempts; the
 // browser never sets it itself.
+//
+// ForceRelay is set by the browser when the URL carries the ?relay
+// query-string flag. It tells the server to skip TURN withholding and
+// include relay credentials in the initial offer (the legacy behavior
+// before TURN withholding shipped). Used for debugging and end-to-end
+// TURN verification.
 type Request struct {
 	Type       string      `json:"type"` // "request"
 	ClientID   string      `json:"client_id,omitempty"`
 	ICEServers []ICEServer `json:"ice_servers,omitempty"`
 	BrowserIP  string      `json:"browser_ip,omitempty"`
+	ForceRelay bool        `json:"force_relay,omitempty"`
+}
+
+// RequestICE is sent by a browser when its direct ICE attempt has stalled
+// (no `connected` state within the fallback timeout). The server responds
+// with an ICEServersPush containing TURN credentials, which the browser
+// then injects via pc.setConfiguration + restartIce. The signaling server
+// withholds TURN from the initial offer to bias ICE toward direct paths;
+// browsers that don't connect directly within the timeout opt back in via
+// this message.
+type RequestICE struct {
+	Type string `json:"type"` // "request_ice"
+}
+
+// ICEServersPush carries TURN credentials to a browser after it has
+// requested them via RequestICE (or, for ?relay-forced flows, attached
+// to the initial offer instead). TURNUnavailable reflects the TURN
+// provider's capacity gate — when true, ICEServers is empty and the
+// browser should surface a "relay at capacity" banner.
+type ICEServersPush struct {
+	Type            string      `json:"type"` // "ice_servers"
+	ICEServers      []ICEServer `json:"ice_servers,omitempty"`
+	TURNUnavailable bool        `json:"turn_unavailable,omitempty"`
+}
+
+// PairInit is sent by a connector to a pairing endpoint with a 6-digit
+// code. The server looks the code up (with a built-in 3-second delay,
+// constant-time regardless of outcome) and either routes onward to the
+// owning device as PairRequest, or returns Error{Message:"unknown_code"}.
+type PairInit struct {
+	Type string `json:"type"` // "pair_init"
+	Code string `json:"code"`
+}
+
+// PairRouted is sent by the server to the connector once a PairInit
+// has been resolved to a device. After this, the connector and device
+// exchange the usual offer/answer/candidate messages (relayed by the
+// server) over the same WebSocket, identified by client_id.
+type PairRouted struct {
+	Type string `json:"type"` // "pair_routed"
+}
+
+// PairRequest is sent by the server to the device WebSocket when a
+// PairInit lookup hits the device's code. The device treats it like a
+// regular Request — same handshake — but the post-DTLS flow runs the
+// SAS prompt before unlocking application traffic.
+type PairRequest struct {
+	Type     string `json:"type"` // "pair_request"
+	ClientID string `json:"client_id"`
+}
+
+// PairApproved is sent by the device (after the operator confirms the
+// out-of-band SAS) to release the pairing. The server forwards the
+// payload to the originating connector so it can save the UID +
+// access_code pair for future direct connects.
+type PairApproved struct {
+	Type       string `json:"type"` // "pair_approved"
+	ClientID   string `json:"client_id"`
+	UID        string `json:"uid"`
+	AccessCode string `json:"access_code"`
+}
+
+// PairRejected is sent by the device to abort a pairing in progress.
+// Reason is one of "user_declined", "sas_mismatch", "timeout".
+type PairRejected struct {
+	Type     string `json:"type"` // "pair_rejected"
+	ClientID string `json:"client_id"`
+	Reason   string `json:"reason"`
 }
 
 // Envelope is used to peek at the "type" field before fully deserializing.

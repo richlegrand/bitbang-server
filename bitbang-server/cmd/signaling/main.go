@@ -29,6 +29,7 @@ import (
 	"github.com/gorilla/websocket"
 
 	"bitbang-server-go/internal/handler"
+	"bitbang-server-go/internal/pairing"
 	"bitbang-server-go/internal/ratelimit"
 	"bitbang-server-go/internal/registry"
 	"bitbang-server-go/internal/turn"
@@ -43,6 +44,7 @@ func main() {
 	clients := registry.NewClientRegistry()
 	turnProvider := turn.NewCoturn(cfg.CoturnHost, cfg.CoturnSecret, cfg.CoturnTTL, cfg.TURNMaxActive)
 	limiter := ratelimit.NoOp{}
+	pairingTable := pairing.NewTable()
 
 	if turnProvider.Configured() {
 		logger.Info("TURN: using coturn",
@@ -58,6 +60,7 @@ func main() {
 		Clients:           clients,
 		TURN:              turnProvider,
 		Limiter:           limiter,
+		Pairing:           pairingTable,
 		Log:               logger,
 		Upgrader:          websocket.Upgrader{CheckOrigin: func(*http.Request) bool { return true }},
 		PingInterval:      60 * time.Second,
@@ -73,6 +76,7 @@ func main() {
 	mux.HandleFunc("GET /ws/client/{uid}", func(w http.ResponseWriter, r *http.Request) {
 		deps.ClientWS(w, r, r.PathValue("uid"))
 	})
+	mux.HandleFunc("GET /ws/pair", deps.PairWS)
 	mux.Handle("/", handler.Static(cfg.StaticDir))
 
 	srv := &http.Server{

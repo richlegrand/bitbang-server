@@ -83,6 +83,13 @@ type ClientConn struct {
 	// bad-code attempts to a source IP. Empty if not yet determined.
 	BrowserIP string
 
+	// ForceRelay reflects the ?relay query flag from the browser, captured
+	// when the client sent its "request" message. When true, the server
+	// includes TURN credentials in the offer at relay time (no withholding);
+	// when false, TURN is withheld until the browser explicitly asks via
+	// RequestICE.
+	ForceRelay bool
+
 	writeMu sync.Mutex
 	closed  bool
 	closeMu sync.Mutex

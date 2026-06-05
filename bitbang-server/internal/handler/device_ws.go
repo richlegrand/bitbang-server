@@ -15,6 +15,7 @@ import (
 	"github.com/gorilla/websocket"
 
 	"bitbang-server-go/internal/identity"
+	"bitbang-server-go/internal/pairing"
 	"bitbang-server-go/internal/ratelimit"
 	"bitbang-server-go/internal/registry"
 	"bitbang-server-go/internal/turn"
@@ -28,6 +29,11 @@ type Deps struct {
 	Clients *registry.ClientRegistry
 	TURN    turn.TURNProvider
 	Limiter ratelimit.RateLimiter
+	// Pairing is the code-exchange table. nil disables pairing entirely
+	// (devices that ask for a code with want_code=true get a bare
+	// registered reply without a code; pair_init endpoints return
+	// 404 / unknown_code).
+	Pairing *pairing.Table
 	Log     *slog.Logger
 
 	// Upgrader is the gorilla websocket upgrader, configured once.
@@ -109,7 +115,17 @@ func (d *Deps) DeviceWS(w http.ResponseWriter, r *http.Request, uid string) {
 		d.Log.Info("device registered", "uid", uid)
 	}
 
-	_ = conn.SendJSON(wire.Registered{Type: "registered"})
+	// Issue a pairing code if the device asked for one. The Registered
+	// reply carries the code so the operator can read it out loud.
+	// Pairing.Release fires on disconnect so the code is freed
+	// promptly (rather than waiting for TTL).
+	reply := wire.Registered{Type: "registered"}
+	if regMsg.WantCode && d.Pairing != nil {
+		reply.Code = d.Pairing.Issue(uid)
+		d.Log.Info("issued pairing code", "uid", uid, "code", reply.Code)
+		defer d.Pairing.Release(uid)
+	}
+	_ = conn.SendJSON(reply)
 
 	defer func() {
 		d.Devices.Remove(uid, conn)
@@ -203,7 +219,12 @@ func (d *Deps) deviceRelay(conn *registry.DeviceConn) {
 				d.Log.Warn("device sent invalid offer", "uid", conn.UID, "err", err)
 				continue
 			}
-			servers, unavailable := d.iceForClient(conn, env.ClientID)
+			// Withhold TURN from the initial offer unless the browser asked
+			// for ?relay. The browser tries direct-only first; if its
+			// fallback timer fires, it asks for TURN via "request_ice"
+			// (handled in client_ws.go). This biases ICE toward direct
+			// peer-to-peer instead of losing the race to relay.
+			servers, unavailable := d.iceForClient(conn, env.ClientID, !client.ForceRelay)
 			offer.ICEServers = servers
 			offer.TURNUnavailable = unavailable
 			// Hand the browser the device's pubkey alongside the SDP so it
@@ -223,6 +244,14 @@ func (d *Deps) deviceRelay(conn *registry.DeviceConn) {
 			_ = client.SendJSON(json.RawMessage(data))
 			d.Log.Debug("forwarded candidate", "from", conn.UID, "to", env.ClientID)
 
+		case "pair_approved", "pair_rejected":
+			// Pairing outcomes: forward verbatim to the originating
+			// connector. The device validated the SAS out-of-band and
+			// is informing the connector to either save UID/access_code
+			// (approved) or abort (rejected).
+			_ = client.SendJSON(json.RawMessage(data))
+			d.Log.Info("forwarded "+env.Type, "from", conn.UID, "to", env.ClientID)
+
 		default:
 			d.Log.Warn("device sent unknown message type", "uid", conn.UID, "type", env.Type)
 		}
@@ -230,11 +259,24 @@ func (d *Deps) deviceRelay(conn *registry.DeviceConn) {
 }
 
 // iceForClient returns (servers, turnUnavailable) for the given target device
-// + client pair. Device-supplied ICE override beats coturn; otherwise the
-// TURN provider decides.
-func (d *Deps) iceForClient(device *registry.DeviceConn, clientID string) ([]wire.ICEServer, bool) {
+// + client pair.
+//
+// Priority:
+//  1. Device-supplied ICE override (BYO TURN) always wins — the operator
+//     configured it deliberately, and withholding would defeat the purpose.
+//  2. If withhold is true (default, browser hasn't asked for TURN yet),
+//     return nil. The browser tries direct ICE only; ICE re-runs with TURN
+//     after the browser sends "request_ice" via client_ws.
+//  3. Otherwise, call the TURN provider for server-managed credentials.
+//
+// withhold lets the offer relay skip TURN by default while still allowing
+// the ?relay debug flag to short-circuit to immediate TURN issuance.
+func (d *Deps) iceForClient(device *registry.DeviceConn, clientID string, withhold bool) ([]wire.ICEServer, bool) {
 	if len(device.ICEServers) > 0 {
 		return device.ICEServers, false
+	}
+	if withhold {
+		return nil, false
 	}
 	return d.TURN.CredentialsFor(clientID)
 }
