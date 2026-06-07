@@ -550,6 +550,22 @@ async function proxyToDevice(event) {
                     delete headers['set-cookie'];
                 }
 
+                // Re-anchor redirects onto the device proxy. The device returns
+                // absolute-path Location headers (e.g. /login/ from OctoPrint's
+                // forced login); the Go proxy already stripped the host. Left
+                // as-is, the browser resolves /login/ against the origin
+                // (bitba.ng/login/) and the redirect escapes the device. Prefix
+                // it with /__device__/<sessionId> so the follow-up navigation
+                // proxies back to the device.
+                if (status >= 300 && status < 400 && headers) {
+                    const locKey = headers['Location'] !== undefined ? 'Location'
+                        : headers['location'] !== undefined ? 'location' : null;
+                    const loc = locKey && headers[locKey];
+                    if (typeof loc === 'string' && loc.startsWith('/') && !loc.startsWith('/__device__/')) {
+                        headers[locKey] = `/__device__/${sessionId}${loc}`;
+                    }
+                }
+
                 // Detect HTML navigation responses for shim injection
                 const ct = headers?.['Content-Type'] || headers?.['content-type'] || '';
                 const isNav = event.request?.mode === 'navigate'
