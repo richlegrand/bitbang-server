@@ -190,7 +190,6 @@ class BitBangConnection {
         this._turnWarnTimer = null;
         this._turnEndTimer = null;
         this._turnExpiryMs = null;
-        this._turnDurationMin = null;  // captured at first-connect, reused in end message
         this._turnUnavailable = false;
         this._turnEnded = false;
     }
@@ -843,6 +842,11 @@ class BitBangConnection {
         if (!this.pc) return;
         const servers = Array.isArray(msg.ice_servers) ? msg.ice_servers : [];
         if (servers.length === 0) return;
+        // Make the relay creds available to the video PC too: it's negotiated
+        // after the data channel and reads this.iceServers when answering the
+        // device's video offer. Without this it gathers host-only, so a
+        // relay-required path ends up with working data but no video.
+        this.iceServers = (this.iceServers || []).concat(servers);
         const config = this.pc.getConfiguration();
         config.iceServers = (config.iceServers || []).concat(servers);
         try {
@@ -867,13 +871,7 @@ class BitBangConnection {
     async _onFirstConnected(pc) {
         this._usingRelay = await this._isUsingRelay(pc);
         if (this._usingRelay) {
-            if (this._turnExpiryMs) {
-                const minutes = Math.max(1, Math.round((this._turnExpiryMs - Date.now()) / 60_000));
-                this._turnDurationMin = minutes;
-                this._print(`Using temporary relay (TURN) for up to ${minutes} minute${minutes === 1 ? '' : 's'} — direct peer-to-peer was not possible.`);
-            } else {
-                this._print('Using temporary relay (TURN) — direct peer-to-peer was not possible.');
-            }
+            this._print('Using temporary relay (TURN) — direct peer-to-peer was not possible.');
             this._turnHoldPromise = new Promise(r => setTimeout(r, 2000));
         } else if (this._turnUnavailable) {
             // Banner was already set in handleOffer; just arm the hold so
@@ -915,10 +913,6 @@ class BitBangConnection {
     }
 
     _endedMessage() {
-        if (this._turnDurationMin) {
-            const plural = this._turnDurationMin === 1 ? '' : 's';
-            return `Relay session ended after ${this._turnDurationMin} minute${plural}. Reload to continue.`;
-        }
         return 'Relay session ended. Reload to continue.';
     }
 
