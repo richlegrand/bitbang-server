@@ -77,8 +77,10 @@ func Static(staticDir string) http.HandlerFunc {
 			return
 		}
 
-		// Default: serve bootstrap.html (SPA routing).
-		serveFile(w, r, staticDir, "bootstrap.html", "", false)
+		// Default: serve bootstrap.html (SPA routing). no-cache like the JS —
+		// the page carries inline CSS, so a stale cached copy means stale
+		// styling against fresh bootstrap.js.
+		serveFile(w, r, staticDir, "bootstrap.html", "", true)
 	}
 }
 

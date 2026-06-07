@@ -41,34 +41,10 @@
 
         #connection-ui {
             padding: 12px 16px;
-        }
-
-        #connection-ui.debug {
             font-family: "SF Mono", "Menlo", "Monaco", "Consolas", monospace;
             font-size: 13px;
             color: #333;
-        }
-
-        #connection-ui.debug .step {
             line-height: 1.6;
-        }
-
-        #status {
-            font-size: 14px;
-        }
-
-        /* Match #status in non-debug and the .step lines in debug.
-           Font-family inherits from the parent #connection-ui (sans-serif
-           default, monospace when .debug is active) — same path #status
-           takes. line-height: 1.6 mirrors .step in debug mode. */
-        #turn-banner {
-            font-size: 14px;
-            line-height: 1.6;
-            color: #333;
-        }
-
-        #turn-banner[hidden] {
-            display: none;
         }
 
         .error {
@@ -80,7 +56,6 @@
 <body>
     <div id="connection-ui">
         <div id="status">Loading...</div>
-        <div id="turn-banner" hidden></div>
     </div>
     <script src="/__bitbang__/bootstrap.js"></script>
 </body>

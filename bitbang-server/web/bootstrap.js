@@ -182,7 +182,6 @@ class BitBangConnection {
 
         this.statusEl = document.getElementById('status');
         this.connectionUI = document.getElementById('connection-ui');
-        this.turnBannerEl = document.getElementById('turn-banner');
         this.debug = new URLSearchParams(window.location.search).has('debug');
         this.noCookieJar = new URLSearchParams(window.location.search).has('nocookiejar');
         this._turnHoldPromise = null;
@@ -194,11 +193,6 @@ class BitBangConnection {
         this._turnDurationMin = null;  // captured at first-connect, reused in end message
         this._turnUnavailable = false;
         this._turnEnded = false;
-
-        if (this.debug && this.connectionUI) {
-            this.connectionUI.classList.add('debug');
-            this.statusEl.textContent = '';
-        }
     }
 
     // SWSP frame helpers
@@ -231,31 +225,29 @@ class BitBangConnection {
         return { streamId, flags, payload };
     }
 
-    updateStatus(status) {
-        if (this.debug) {
-            if (this.statusEl) {
-                const step = document.createElement('div');
-                step.className = 'step';
-                step.textContent = status;
-                this.statusEl.appendChild(step);
-            }
-        }
-        document.title = status;
+    // Append one line to the connection log — a plain append-only terminal:
+    // one element, one font. Never replaces or clears a message.
+    _print(msg) {
+        document.title = msg;
+        if (!this.statusEl) return;
+        const line = document.createElement('div');
+        line.textContent = msg;
+        this.statusEl.appendChild(line);
+    }
+
+    // Same, but only with ?debug — the extra play-by-play detail.
+    _printDebug(msg) {
+        if (this.debug) this._print(msg);
     }
 
     async connect() {
         try {
             await this.registerServiceWorker();
-            this.updateStatus(STATUS.CONNECTING);
+            this._printDebug(STATUS.CONNECTING);
             await this.connectWebSocket();
         } catch (error) {
             console.error('Connection failed:', error);
-            const msg = this.userErrorMessage(error.message);
-            if (this.debug) {
-                this.updateStatus('Error: ' + msg);
-            } else if (this.statusEl) {
-                this.statusEl.textContent = msg;
-            }
+            this._print(this.userErrorMessage(error.message));
             if (this.statusEl) this.statusEl.classList.add('error');
         }
     }
@@ -450,7 +442,7 @@ class BitBangConnection {
                     uid: this.uid,
                     force_relay: forceRelay,
                 }));
-                this.updateStatus(STATUS.WAITING_OFFER);
+                this._printDebug(STATUS.WAITING_OFFER);
             };
 
             this.ws.onmessage = async (event) => {
@@ -538,7 +530,7 @@ class BitBangConnection {
         }
         this.devicePubkey = key;
 
-        this.updateStatus(STATUS.CONNECTING_WEBRTC);
+        this._printDebug(STATUS.CONNECTING_WEBRTC);
         this.streamNameMap = msg.streams || {};
         this.deviceName = msg.device_name || null;
         this._turnUnavailable = !!msg.turn_unavailable;
@@ -548,7 +540,7 @@ class BitBangConnection {
         // so _onFirstConnected won't ever fire and the user would otherwise
         // get no feedback at all.
         if (this._turnUnavailable) {
-            this._setRelayBanner('Relay server (TURN) is at capacity. Connection may fail — please try again later.');
+            this._print('Relay server (TURN) is at capacity. Connection may fail — please try again later.');
         }
         // Coturn REST-API username format: "<expiry-epoch>[:<user_name>]".
         // The expiry is set via COTURN_TTL in signaling/.env; the optional
@@ -662,7 +654,7 @@ class BitBangConnection {
                 // Cancel any pending TURN-withhold fallback timers; the
                 // connection is up and we no longer need to escalate.
                 this._clearFallbackTimers();
-                this.updateStatus(STATUS.CONNECTED);
+                this._printDebug(STATUS.CONNECTED);
                 this.pollConnectionType(pc);
                 if (!this._wasConnected) {
                     this._wasConnected = true;
@@ -795,18 +787,6 @@ class BitBangConnection {
         return false;
     }
 
-    _setRelayBanner(text) {
-        if (!this.turnBannerEl) return;
-        this.turnBannerEl.textContent = text;
-        this.turnBannerEl.hidden = false;
-    }
-
-    _hideRelayBanner() {
-        if (!this.turnBannerEl) return;
-        this.turnBannerEl.hidden = true;
-        this.turnBannerEl.textContent = '';
-    }
-
     _clearFallbackTimers() {
         if (this._reassureTimer) {
             clearTimeout(this._reassureTimer);
@@ -824,8 +804,7 @@ class BitBangConnection {
     _reassureUser() {
         this._reassureTimer = null;
         if (this.pc && this.pc.connectionState === 'connected') return;
-        this.updateStatus(STATUS.NEGOTIATING);
-        this._setRelayBanner(STATUS.NEGOTIATING);
+        this._print(STATUS.NEGOTIATING);
 
         // ?norelay disables phase 2 entirely; only show the banner.
         const params = new URLSearchParams(window.location.search);
@@ -858,7 +837,7 @@ class BitBangConnection {
     async _handleICEServersPush(msg) {
         if (this.debug) console.log('[Bootstrap] received ice_servers push, unavailable=' + !!msg.turn_unavailable);
         if (msg.turn_unavailable) {
-            this._setRelayBanner('Relay server (TURN) is at capacity — connection may fail.');
+            this._print('Relay server (TURN) is at capacity — connection may fail.');
             return;
         }
         if (!this.pc) return;
@@ -891,19 +870,15 @@ class BitBangConnection {
             if (this._turnExpiryMs) {
                 const minutes = Math.max(1, Math.round((this._turnExpiryMs - Date.now()) / 60_000));
                 this._turnDurationMin = minutes;
-                this._setRelayBanner(`Using temporary relay (TURN) for up to ${minutes} minute${minutes === 1 ? '' : 's'} — direct peer-to-peer was not possible.`);
+                this._print(`Using temporary relay (TURN) for up to ${minutes} minute${minutes === 1 ? '' : 's'} — direct peer-to-peer was not possible.`);
             } else {
-                this._setRelayBanner('Using temporary relay (TURN) — direct peer-to-peer was not possible.');
+                this._print('Using temporary relay (TURN) — direct peer-to-peer was not possible.');
             }
             this._turnHoldPromise = new Promise(r => setTimeout(r, 2000));
         } else if (this._turnUnavailable) {
             // Banner was already set in handleOffer; just arm the hold so
             // the visible message survives iframe handoff for ~2 s.
             this._turnHoldPromise = new Promise(r => setTimeout(r, 2000));
-        } else {
-            // Direct peer-to-peer won. Clear any "Negotiating connection..."
-            // banner the fallback timers may have set.
-            this._hideRelayBanner();
         }
         // Arm the TTL-based end triggers if we're on a relay path and we
         // know when the credential expires. Direct paths skip both.
@@ -1231,12 +1206,8 @@ class BitBangConnection {
 
     showErrorScreen(message) {
         if (this.connectionUI) {
-            if (this.debug) {
-                this.updateStatus('Error: ' + message);
-            } else {
-                this.statusEl.textContent = message;
-                this.statusEl.classList.add('error');
-            }
+            this._print(message);
+            if (this.statusEl) this.statusEl.classList.add('error');
             this.connectionUI.style.display = '';
         }
     }
