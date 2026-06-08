@@ -1608,7 +1608,7 @@ class BitBangConnection {
         const iframe = document.createElement('iframe');
         iframe.id = 'device-frame';
         iframe.sandbox = 'allow-scripts allow-forms allow-same-origin allow-popups allow-modals allow-downloads';
-        iframe.allow = 'fullscreen';
+        iframe.allow = 'autoplay; fullscreen';
         iframe.scrolling = 'yes';
         iframe.style.cssText = `
             position: fixed; top: 0; left: 0;
