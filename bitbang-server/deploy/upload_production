@@ -40,7 +40,7 @@ ssh "${SERVER_SSH}" -i "${SERVER_SSH_KEY}" "
 
     systemctl --user restart ${SERVICE}
     sleep 0.5
-    systemctl --no-pager --lines=10 status ${SERVICE} || true
+    systemctl --user --no-pager --lines=10 status ${SERVICE} || true
 "
 
 PORT=$(grep '^BITBANG_SERVER_PORT=' deploy/production.env | cut -d= -f2)

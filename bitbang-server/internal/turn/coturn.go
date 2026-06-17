@@ -32,6 +32,14 @@ type TURNProvider interface {
 	// provider caches per client_id internally.
 	CredentialsFor(clientID string) (servers []wire.ICEServer, turnUnavailable bool)
 
+	// StunServers returns STUN-only ICE servers (no credentials), used for
+	// the direct-only first connection phase. The browser gathers host +
+	// srflx from these and can connect peer-to-peer through both NATs
+	// without ever allocating a relay. STUN Binding creates no allocation
+	// and is not capacity-gated, so this is free to hand out. Returns nil
+	// if no TURN host is configured.
+	StunServers() []wire.ICEServer
+
 	// Release frees any cached state for clientID. Called on client
 	// disconnect so capacity counters and cred caches don't leak.
 	Release(clientID string)
@@ -94,13 +102,13 @@ func (c *Coturn) CredentialsFor(clientID string) ([]wire.ICEServer, bool) {
 	}
 	// Already gated to STUN-only.
 	if c.gated[clientID] {
-		return []wire.ICEServer{{URLs: []string{fmt.Sprintf("stun:%s:3478", c.host)}}}, true
+		return c.StunServers(), true
 	}
 
 	// New client: capacity decision.
 	if c.maxActive > 0 && len(c.granted) >= c.maxActive {
 		c.gated[clientID] = true
-		return []wire.ICEServer{{URLs: []string{fmt.Sprintf("stun:%s:3478", c.host)}}}, true
+		return c.StunServers(), true
 	}
 
 	// Grant TURN: generate REST-API credentials.
@@ -128,6 +136,16 @@ func (c *Coturn) MaxActive() int {
 
 func (c *Coturn) Host() string { return c.host }
 
+// StunServers returns the STUN-only ICE entry for this coturn host, or nil
+// if no host is configured. Safe to call under the capacity mutex — it reads
+// only the immutable host.
+func (c *Coturn) StunServers() []wire.ICEServer {
+	if c.host == "" {
+		return nil
+	}
+	return []wire.ICEServer{{URLs: []string{fmt.Sprintf("stun:%s:3478", c.host)}}}
+}
+
 // generateCredentials produces a single REST-API credential pair valid for
 // TTL seconds. Username is the expiry epoch; password is base64(HMAC-SHA1(secret, username)).
 // The credential is structurally identical to what the Python server produces.
@@ -138,17 +156,14 @@ func (c *Coturn) generateCredentials() []wire.ICEServer {
 	mac.Write([]byte(username))
 	password := base64.StdEncoding.EncodeToString(mac.Sum(nil))
 
-	return []wire.ICEServer{
-		{URLs: []string{fmt.Sprintf("stun:%s:3478", c.host)}},
-		{
-			URLs: []string{
-				fmt.Sprintf("turn:%s:3478", c.host),
-				fmt.Sprintf("turns:%s:5349", c.host),
-			},
-			Username:   username,
-			Credential: password,
+	return append(c.StunServers(), wire.ICEServer{
+		URLs: []string{
+			fmt.Sprintf("turn:%s:3478", c.host),
+			fmt.Sprintf("turns:%s:5349", c.host),
 		},
-	}
+		Username:   username,
+		Credential: password,
+	})
 }
 
 // Compile-time check

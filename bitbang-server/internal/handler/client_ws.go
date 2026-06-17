@@ -97,6 +97,12 @@ func (d *Deps) clientRelay(conn *registry.ClientConn) {
 
 		switch msgType {
 		case "request":
+			// Telemetry denominator. Counts every "request" arriving here,
+			// regardless of how it ends up — the success counts (direct /
+			// relay / tcp-relay) and the failure count are client-reported
+			// via connection_path, and this is what they normalize against.
+			d.Metrics.IncRequests()
+
 			// Capture the browser's ?relay flag so the offer relay later
 			// knows whether to attach TURN credentials to the offer it
 			// forwards back to the client. Once set on the conn, it's
@@ -182,6 +188,28 @@ func (d *Deps) clientRelay(conn *registry.ClientConn) {
 				}); err != nil {
 					d.Log.Warn("ice_restart trigger failed", "client_id", conn.ClientID, "err", err)
 				}
+			}
+
+		case "connection_path":
+			// Fire-and-forget telemetry: the client reports the path of an
+			// established (or failed) ICE connection. We bump the matching
+			// counter and move on — no reply, no per-client state. One
+			// message per ICE establishment, including post-restart
+			// re-establishments, so reconnects naturally aggregate.
+			path, _ := msg["path"].(string)
+			d.Metrics.IncPath(path)
+			if path == "failed" {
+				// Reason is optional and only meaningful on failures.
+				// Logged at info — useful for spotting NAT/firewall
+				// trouble at the population level.
+				reason, _ := msg["reason"].(string)
+				d.Log.Info("client reported failed connection",
+					"client_id", conn.ClientID,
+					"target", conn.TargetUID,
+					"reason", reason)
+			} else {
+				d.Log.Debug("client reported connection path",
+					"client_id", conn.ClientID, "path", path)
 			}
 
 		default:

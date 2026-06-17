@@ -669,8 +669,31 @@ class BitBangConnection {
             }
         };
 
+        // _prevICEState tracks the last-seen iceConnectionState on this PC so
+        // we can detect transitions INTO 'connected' (including post-
+        // restartIce re-establishments — those go connected → checking →
+        // connected within the same PC) and fire one connection_path
+        // telemetry message per established or failed event.
+        this._prevICEState = null;
+
         pc.oniceconnectionstatechange = () => {
             if (this.debug) console.log(`[Bootstrap] iceConnectionState -> ${pc.iceConnectionState}`);
+            const now = pc.iceConnectionState;
+            const prev = this._prevICEState;
+            this._prevICEState = now;
+
+            // Telemetry: each transition INTO connected gets one
+            // connection_path report with the actual selected path. Each
+            // transition INTO failed gets one "failed" report. Fire-and-
+            // forget — never block the connection state machine on it.
+            if (now === 'connected' && prev !== 'connected') {
+                this._detectConnectionPath(pc)
+                    .then((path) => this._sendConnectionPath(path))
+                    .catch(() => {});
+            } else if (now === 'failed' && prev !== 'failed') {
+                this._sendConnectionPath('failed', 'ice_failed');
+            }
+
             if (this._wasConnected && this._usingRelay
                 && (pc.iceConnectionState === 'failed' || pc.iceConnectionState === 'disconnected')) {
                 this._handlePostHandshakeFailure();
@@ -786,6 +809,63 @@ class BitBangConnection {
         return false;
     }
 
+    // Classify the established path for telemetry. Returns "direct",
+    // "relay", or "tcp-relay". Looks at every transport's selected pair
+    // and picks the "worst" (relay > tcp-relay > direct) so a mixed
+    // session — e.g. data direct but video relay — reports relay rather
+    // than under-counting it as direct.
+    //
+    // tcp-relay distinction: when a candidate is type "relay", the
+    // relayProtocol field (if exposed) tells us whether the allocation
+    // was made over UDP or TCP. We fall back to the candidate's
+    // transport protocol if relayProtocol isn't present.
+    async _detectConnectionPath(pc) {
+        let path = 'direct';
+        try {
+            const stats = await pc.getStats();
+            for (const [, report] of stats) {
+                if (report.type !== 'transport' || !report.selectedCandidatePairId) continue;
+                const pair = stats.get(report.selectedCandidatePairId);
+                if (!pair) continue;
+                const local = stats.get(pair.localCandidateId);
+                const remote = stats.get(pair.remoteCandidateId);
+                const relayCand =
+                    local?.candidateType === 'relay' ? local
+                  : remote?.candidateType === 'relay' ? remote
+                  : null;
+                if (!relayCand) continue;
+                const proto = (relayCand.relayProtocol || relayCand.protocol || 'udp').toLowerCase();
+                // "relay" wins outright over "direct"; "tcp-relay" is a
+                // worse outcome than "relay" only in cost/latency terms,
+                // not strictly worse, so we treat them as distinct but
+                // either takes precedence over direct.
+                path = proto === 'tcp' ? 'tcp-relay' : 'relay';
+                // Don't break — keep scanning in case a later transport
+                // has a worse classification (tcp-relay > relay).
+                if (path === 'tcp-relay') break;
+            }
+        } catch (e) {
+            // Telemetry must never break user flow. Best-effort classify
+            // as direct and move on.
+        }
+        return path;
+    }
+
+    // Fire-and-forget telemetry. Sends one connection_path message to
+    // the signaling server. Tolerant of a closed/closing WS — telemetry
+    // failure must never affect the user's session.
+    _sendConnectionPath(path, reason) {
+        if (this.ws?.readyState !== WebSocket.OPEN) return;
+        const msg = { type: 'connection_path', path };
+        if (reason) msg.reason = reason;
+        try {
+            this.ws.send(JSON.stringify(msg));
+            if (this.debug) console.log(`[Bootstrap] reported connection_path: ${path}${reason ? ' (' + reason + ')' : ''}`);
+        } catch (e) {
+            // swallow — see above
+        }
+    }
+
     _clearFallbackTimers() {
         if (this._reassureTimer) {
             clearTimeout(this._reassureTimer);
@@ -842,6 +922,18 @@ class BitBangConnection {
         if (!this.pc) return;
         const servers = Array.isArray(msg.ice_servers) ? msg.ice_servers : [];
         if (servers.length === 0) return;
+        // Parse the TURN credential's epoch expiry from the username so the
+        // end-of-session warn/reload timers can arm. Same coturn REST-API
+        // format as handleOffer. Without this, _armTurnEndTimers' guard
+        // (_usingRelay && _turnExpiryMs) silently falls through and the
+        // session runs past its intended TTL.
+        for (const s of servers) {
+            const m = s && s.username && /^(\d+)(:|$)/.exec(s.username);
+            if (m) {
+                this._turnExpiryMs = parseInt(m[1], 10) * 1000;
+                break;
+            }
+        }
         // Make the relay creds available to the video PC too: it's negotiated
         // after the data channel and reads this.iceServers when answering the
         // device's video offer. Without this it gathers host-only, so a
@@ -858,6 +950,15 @@ class BitBangConnection {
             // it would only take effect on a createOffer() we never call.
         } catch (e) {
             console.warn('[Bootstrap] failed to apply TURN credentials:', e);
+        }
+        // If _onFirstConnected already fired before this push arrived
+        // (e.g., the page briefly reached 'connected' on a direct candidate
+        // pair before falling back to relay), its arming branch was skipped
+        // because _turnExpiryMs was still null. Arm the end timers now that
+        // we have an expiry. Idempotent — _clearTurnEndTimers first.
+        if (this._wasConnected && this._usingRelay && this._turnExpiryMs) {
+            this._clearTurnEndTimers();
+            this._armTurnEndTimers();
         }
     }
 

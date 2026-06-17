@@ -162,7 +162,9 @@ func (d *Deps) PairWS(w http.ResponseWriter, r *http.Request) {
 	// Tell the device to expect this connector — same shape as a
 	// regular "request" but typed pair_request so the device can run
 	// the SAS confirmation flow instead of going straight to ready.
-	pr := wire.PairRequest{Type: "pair_request", ClientID: clientID}
+	// Forward the connector's IP so the listener operator can see who
+	// is trying to pair (useful for audit / security).
+	pr := wire.PairRequest{Type: "pair_request", ClientID: clientID, RemoteIP: ip}
 	if err := device.SendJSON(pr); err != nil {
 		_ = sendJSON(ws, wire.Error{Type: "error", Message: "Device not found"})
 		return

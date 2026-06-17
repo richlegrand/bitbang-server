@@ -15,6 +15,7 @@ import (
 	"github.com/gorilla/websocket"
 
 	"bitbang-server-go/internal/identity"
+	"bitbang-server-go/internal/metrics"
 	"bitbang-server-go/internal/pairing"
 	"bitbang-server-go/internal/ratelimit"
 	"bitbang-server-go/internal/registry"
@@ -34,6 +35,10 @@ type Deps struct {
 	// registered reply without a code; pair_init endpoints return
 	// 404 / unknown_code).
 	Pairing *pairing.Table
+	// Metrics collects connection-path counters reported by clients and
+	// the request count seen by client_ws. Snapshot by /status. Always
+	// non-nil; main.go constructs it at startup.
+	Metrics *metrics.Metrics
 	Log     *slog.Logger
 
 	// Upgrader is the gorilla websocket upgrader, configured once.
@@ -265,8 +270,9 @@ func (d *Deps) deviceRelay(conn *registry.DeviceConn) {
 //  1. Device-supplied ICE override (BYO TURN) always wins — the operator
 //     configured it deliberately, and withholding would defeat the purpose.
 //  2. If withhold is true (default, browser hasn't asked for TURN yet),
-//     return nil. The browser tries direct ICE only; ICE re-runs with TURN
-//     after the browser sends "request_ice" via client_ws.
+//     return STUN-only. The browser tries direct ICE (host + srflx) without
+//     allocating a relay; ICE re-runs with TURN added after the browser
+//     sends "request_ice" via client_ws.
 //  3. Otherwise, call the TURN provider for server-managed credentials.
 //
 // withhold lets the offer relay skip TURN by default while still allowing
@@ -276,7 +282,12 @@ func (d *Deps) iceForClient(device *registry.DeviceConn, clientID string, withho
 		return device.ICEServers, false
 	}
 	if withhold {
-		return nil, false
+		// Phase 1: hand out STUN only. The browser gathers host + srflx and
+		// tries direct peer-to-peer first; STUN creates no relay allocation,
+		// so srflx-capable peers connect without ever counting against TURN.
+		// TURN is withheld until the browser's fallback timer fires a
+		// "request_ice" (handled in client_ws.go).
+		return d.TURN.StunServers(), false
 	}
 	return d.TURN.CredentialsFor(clientID)
 }

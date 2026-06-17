@@ -166,9 +166,16 @@ type PairRouted struct {
 // PairInit lookup hits the device's code. The device treats it like a
 // regular Request — same handshake — but the post-DTLS flow runs the
 // SAS prompt before unlocking application traffic.
+//
+// RemoteIP is the IP the connector reached us from (X-Real-IP behind
+// the reverse proxy, or the direct RemoteAddr otherwise). Useful for
+// the device operator's audit log: who's trying to pair right now. Not
+// presumptive about the connector being a browser — pair_init may come
+// from a CLI, an embedded client, anything.
 type PairRequest struct {
 	Type     string `json:"type"` // "pair_request"
 	ClientID string `json:"client_id"`
+	RemoteIP string `json:"remote_ip,omitempty"`
 }
 
 // PairApproved is sent by the device (after the operator confirms the
@@ -188,6 +195,59 @@ type PairRejected struct {
 	Type     string `json:"type"` // "pair_rejected"
 	ClientID string `json:"client_id"`
 	Reason   string `json:"reason"`
+}
+
+// ConnectionPath is a fire-and-forget telemetry message sent by the
+// connecting peer after each ICE establishment, reporting how the
+// connection actually ended up. The server bumps a counter; no reply is
+// expected.
+//
+// One message is sent per transition into the ICE "connected" state,
+// including re-establishments via restartIce within a single peer
+// connection — so a client that reconnects ten times in a row produces
+// ten reports, regardless of whether those happened over one PC or many.
+//
+// # Telemetry contract: connector-only
+//
+// **Only the connector sends this message; the listener never does.**
+//
+// The "connector" is the side that initiates the session by sending a
+// "request" to /ws/client/<uid> — i.e., a browser opening bitba.ng/<uid>
+// or a CLI running `bitbang connect <URL>`. The "listener" is the device
+// side that accepts the incoming request (a `bitbang serve …` process,
+// a bitbang-python WSGI/ASGI wrapper, etc.).
+//
+// This rule exists because each session has exactly one connector and
+// one listener; if both reported, every counter would double. The server
+// has no way to deduplicate reports per session — `connection_path` is
+// stateless on this side — so the property must be enforced at the
+// emitter.
+//
+// When adding new code:
+//
+//   - New connector implementation (browser, CLI, future Python connect
+//     helper, embedded SDK) → wire up the same one-report-per-ICE-
+//     establishment telemetry. The denominator on the server is the
+//     count of "request" messages, so missing reports show up as
+//     unaccounted requests in /status.
+//   - New listener implementation → do not emit this message. Listener-
+//     side connection state is invisible to the metric on purpose.
+//
+// Path values:
+//
+//   - "direct"    — selected pair is host or srflx on both ends
+//   - "relay"     — selected pair uses a UDP TURN relay
+//   - "tcp-relay" — selected pair uses a TCP TURN relay (worst case)
+//   - "failed"    — ICE never reached connected, DTLS handshake errored,
+//                   or bidirectional verify rejected the peer
+//
+// Reason is an optional diagnostic string accompanying "failed" — e.g.,
+// "ice_timeout", "dtls_failed", "verify_failed". The server doesn't act
+// on it today; it's reserved for later breakouts in /status.
+type ConnectionPath struct {
+	Type   string `json:"type"` // "connection_path"
+	Path   string `json:"path"`
+	Reason string `json:"reason,omitempty"`
 }
 
 // Envelope is used to peek at the "type" field before fully deserializing.

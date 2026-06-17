@@ -19,6 +19,7 @@ import (
 	"github.com/gorilla/websocket"
 
 	"bitbang-server-go/internal/identity"
+	"bitbang-server-go/internal/metrics"
 	"bitbang-server-go/internal/pairing"
 	"bitbang-server-go/internal/ratelimit"
 	"bitbang-server-go/internal/registry"
@@ -42,6 +43,7 @@ func testServer(t *testing.T) (*httptest.Server, *Deps, func()) {
 		TURN:         turn.NewCoturn("", "", 0, 0), // no TURN configured
 		Limiter:      ratelimit.NoOp{},
 		Pairing:      pairTab,
+		Metrics:      metrics.New(),
 		Log:          slog.New(slog.NewTextHandler(io.Discard, nil)),
 		Upgrader:     websocket.Upgrader{CheckOrigin: func(*http.Request) bool { return true }},
 		PingInterval: 60 * time.Second,
