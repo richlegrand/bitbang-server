@@ -149,9 +149,15 @@ type ICEServersPush struct {
 // code. The server looks the code up (with a built-in 3-second delay,
 // constant-time regardless of outcome) and either routes onward to the
 // owning device as PairRequest, or returns Error{Message:"unknown_code"}.
+//
+// ForceRelay mirrors the URL flow's `force_relay`: when set, the offer the
+// device produces is stamped with TURN credentials up front instead of the
+// default STUN-only ICE, so a pairing on a known-hard network skips the
+// direct attempt. Wired to the connector's `--relay` flag.
 type PairInit struct {
-	Type string `json:"type"` // "pair_init"
-	Code string `json:"code"`
+	Type       string `json:"type"` // "pair_init"
+	Code       string `json:"code"`
+	ForceRelay bool   `json:"force_relay,omitempty"`
 }
 
 // PairRouted is sent by the server to the connector once a PairInit
@@ -172,10 +178,17 @@ type PairRouted struct {
 // the device operator's audit log: who's trying to pair right now. Not
 // presumptive about the connector being a browser — pair_init may come
 // from a CLI, an embedded client, anything.
+//
+// ICEServers carries the same phase-1 STUN entries the direct flow stamps
+// on a Request, so the listener gathers srflx candidates and is reachable
+// through NAT — not just on the same LAN. It is STUN-only (the device side
+// never gets server-managed TURN; relay allocation is connector-side), so
+// it is free and never capacity-gated.
 type PairRequest struct {
-	Type     string `json:"type"` // "pair_request"
-	ClientID string `json:"client_id"`
-	RemoteIP string `json:"remote_ip,omitempty"`
+	Type       string      `json:"type"` // "pair_request"
+	ClientID   string      `json:"client_id"`
+	RemoteIP   string      `json:"remote_ip,omitempty"`
+	ICEServers []ICEServer `json:"ice_servers,omitempty"`
 }
 
 // PairApproved is sent by the device (after the operator confirms the

@@ -142,11 +142,12 @@ func (d *Deps) PairWS(w http.ResponseWriter, r *http.Request) {
 	clientID := uid + "_" + shortRandomHex(4)
 	connectAt := time.Now()
 	conn := &registry.ClientConn{
-		ClientID:  clientID,
-		TargetUID: uid,
-		WS:        ws,
-		ConnectAt: connectAt,
-		BrowserIP: ip,
+		ClientID:   clientID,
+		TargetUID:  uid,
+		WS:         ws,
+		ConnectAt:  connectAt,
+		BrowserIP:  ip,
+		ForceRelay: init.ForceRelay,
 	}
 	d.Clients.Add(conn)
 	d.Log.Info("client paired",
@@ -164,7 +165,14 @@ func (d *Deps) PairWS(w http.ResponseWriter, r *http.Request) {
 	// the SAS confirmation flow instead of going straight to ready.
 	// Forward the connector's IP so the listener operator can see who
 	// is trying to pair (useful for audit / security).
-	pr := wire.PairRequest{Type: "pair_request", ClientID: clientID, RemoteIP: ip}
+	//
+	// Stamp phase-1 STUN exactly as clientRelay does for a Request:
+	// withhold=true means STUN-only (or the device's BYO override),
+	// never server-managed TURN — the device side never allocates a
+	// relay. Without this the listener gathers host candidates only and
+	// is unreachable from anything off its LAN.
+	stun, _ := d.iceForClient(device, clientID, true)
+	pr := wire.PairRequest{Type: "pair_request", ClientID: clientID, RemoteIP: ip, ICEServers: stun}
 	if err := device.SendJSON(pr); err != nil {
 		_ = sendJSON(ws, wire.Error{Type: "error", Message: "Device not found"})
 		return

@@ -32,6 +32,13 @@ import (
 // tests can poke at table state), and a teardown closure.
 func testServer(t *testing.T) (*httptest.Server, *Deps, func()) {
 	t.Helper()
+	return serveWithTURN(t, turn.NewCoturn("", "", 0, 0)) // no TURN configured
+}
+
+// serveWithTURN is testServer with a caller-supplied TURN provider, so a
+// test can verify STUN/TURN stamping with a configured coturn host.
+func serveWithTURN(t *testing.T, tp turn.TURNProvider) (*httptest.Server, *Deps, func()) {
+	t.Helper()
 
 	devices := registry.NewMemoryRegistry()
 	clients := registry.NewClientRegistry()
@@ -40,7 +47,7 @@ func testServer(t *testing.T) (*httptest.Server, *Deps, func()) {
 	deps := &Deps{
 		Devices:      devices,
 		Clients:      clients,
-		TURN:         turn.NewCoturn("", "", 0, 0), // no TURN configured
+		TURN:         tp,
 		Limiter:      ratelimit.NoOp{},
 		Pairing:      pairTab,
 		Metrics:      metrics.New(),
@@ -181,6 +188,56 @@ func TestCodeExchange_Roundtrip(t *testing.T) {
 	}
 	if got := deps.Pairing.ActiveCount(); got != 0 {
 		t.Errorf("after device disconnect, ActiveCount = %d, want 0", got)
+	}
+}
+
+// TestCodeExchange_PairRequestCarriesSTUN guards the NAT-traversal fix: the
+// server must stamp phase-1 STUN onto pair_request so the listener gathers
+// srflx candidates. Without it the listener has host candidates only and is
+// unreachable from anything off its LAN. The entry must be STUN-only — the
+// device side never receives server-managed TURN credentials.
+func TestCodeExchange_PairRequestCarriesSTUN(t *testing.T) {
+	srv, _, td := serveWithTURN(t, turn.NewCoturn("turn.example.com", "secret", 3600, 0))
+	defer td()
+
+	uid, pubB64 := newTestIdentity(t)
+	device := dialWS(t, srv, "/ws/device/"+uid)
+	defer device.Close()
+	writeJSON(t, device, wire.Register{
+		Type: "register", Protocol: wire.ProtocolVersion, PublicKey: pubB64, WantCode: true,
+	})
+	reg := readMsg(t, device, "registered")
+	code, _ := reg["code"].(string)
+
+	conn := dialWS(t, srv, "/ws/pair")
+	defer conn.Close()
+	writeJSON(t, conn, wire.PairInit{Type: "pair_init", Code: code})
+	_ = readMsg(t, conn, "pair_routed")
+
+	pr := readMsg(t, device, "pair_request")
+	servers, ok := pr["ice_servers"].([]any)
+	if !ok || len(servers) == 0 {
+		t.Fatalf("pair_request missing ice_servers (got %v)", pr["ice_servers"])
+	}
+	stunFound := false
+	for _, s := range servers {
+		m, _ := s.(map[string]any)
+		if _, hasCred := m["credential"]; hasCred {
+			t.Errorf("pair_request ICE carries credentials; device side must be STUN-only")
+		}
+		urls, _ := m["urls"].([]any)
+		for _, u := range urls {
+			str, _ := u.(string)
+			if strings.HasPrefix(str, "stun:") {
+				stunFound = true
+			}
+			if strings.HasPrefix(str, "turn:") || strings.HasPrefix(str, "turns:") {
+				t.Errorf("pair_request ICE includes relay %q; device side must be STUN-only", str)
+			}
+		}
+	}
+	if !stunFound {
+		t.Errorf("pair_request ice_servers has no stun: entry (got %v)", servers)
 	}
 }
 

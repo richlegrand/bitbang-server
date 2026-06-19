@@ -12,6 +12,9 @@
 //	TRUST_PROXY_HEADERS  When "true", honor X-Real-IP/X-Forwarded-For for
 //	                     browser-IP capture. Enable only behind a proxy
 //	                     that strips these headers from inbound requests.
+//	METRICS_PATH         When set, periodically append /status counters
+//	                     as JSONL to this file. Empty disables.
+//	METRICS_INTERVAL     Snapshot cadence in seconds (default 300 = 5 min).
 package main
 
 import (
@@ -47,6 +50,65 @@ func main() {
 	limiter := ratelimit.NoOp{}
 	pairingTable := pairing.NewTable()
 	connMetrics := metrics.New()
+
+	// Periodic snapshot recorder + counter resume. Disabled when
+	// METRICS_PATH is unset; see internal/metrics/recorder.go for the
+	// SQLite schema and durability story. Lifetime tied to recorderCtx
+	// so the goroutine exits on shutdown via the same SIGINT/SIGTERM
+	// that drains the HTTP server.
+	recorderCtx, stopRecorder := context.WithCancel(context.Background())
+	defer stopRecorder()
+	recorder, err := metrics.NewRecorder(
+		connMetrics,
+		devices,
+		clients,
+		cfg.MetricsPath,
+		time.Duration(cfg.MetricsInterval)*time.Second,
+		logger,
+	)
+	if err != nil {
+		// Hard failure on bad METRICS_PATH (unwritable directory, etc.).
+		// Better to refuse to start than to silently lose all metrics.
+		logger.Error("metrics recorder failed to open", "err", err, "path", cfg.MetricsPath)
+		os.Exit(1)
+	}
+	// recorder is nil when METRICS_PATH is empty (recorder disabled).
+	if recorder != nil {
+		defer recorder.Close()
+
+		// Resume: load the most-recent persisted snapshot and seed the
+		// in-memory atomics with its counter values. On a fresh deploy
+		// (no DB file or no rows), LoadLastSnapshot returns the zero
+		// Snapshot, which is exactly what New() already gave us — a
+		// no-op. On subsequent restarts, counters resume from where
+		// they left off, modulo at most one snapshot interval's worth
+		// of un-flushed events.
+		if snap, err := recorder.LoadLastSnapshot(); err != nil {
+			// A read failure here usually means a corrupt or
+			// version-mismatched DB file. Log loudly but continue —
+			// the server can still serve traffic; counts just restart
+			// from zero this round.
+			logger.Warn("metrics resume: load failed, starting counters at zero", "err", err)
+		} else {
+			connMetrics.Load(snap)
+			logger.Info("metrics resume: loaded snapshot",
+				"requests", snap.Requests,
+				"direct", snap.Direct,
+				"relay", snap.Relay,
+				"tcp_relay", snap.TCPRelay,
+				"failed", snap.Failed)
+		}
+
+		// Write one snapshot immediately so the first post-restart row
+		// reflects the seeded state — without this, the next periodic
+		// tick is the first row after restart and the gap looks like
+		// data loss in time-series queries.
+		if err := recorder.WriteSnapshot(); err != nil {
+			logger.Warn("metrics: initial snapshot write failed", "err", err)
+		}
+
+		go recorder.Run(recorderCtx)
+	}
 
 	if turnProvider.Configured() {
 		logger.Info("TURN: using coturn",
@@ -99,6 +161,11 @@ func main() {
 	go func() {
 		sig := <-stopChan
 		logger.Info("shutting down", "signal", sig.String())
+		// Stop the metrics recorder before draining HTTP — it owns its
+		// own goroutine and the file handle. Order doesn't strictly
+		// matter but stopping it first keeps "last snapshot at clean
+		// shutdown" consistent across restarts.
+		stopRecorder()
 		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 		defer cancel()
 		_ = srv.Shutdown(ctx)
@@ -123,6 +190,11 @@ type config struct {
 	LogLevel          slog.Level
 	StaticDir         string
 	TrustProxyHeaders bool
+
+	// MetricsPath, when non-empty, enables the periodic JSONL snapshot of
+	// /status counters at MetricsInterval seconds. Empty disables.
+	MetricsPath     string
+	MetricsInterval int
 }
 
 func loadConfig() config {
@@ -137,6 +209,8 @@ func loadConfig() config {
 		LogLevel:          parseLogLevel(envOr("LOG_LEVEL", "INFO")),
 		StaticDir:         staticDir,
 		TrustProxyHeaders: strings.EqualFold(os.Getenv("TRUST_PROXY_HEADERS"), "true"),
+		MetricsPath:       os.Getenv("METRICS_PATH"),
+		MetricsInterval:   envOrInt("METRICS_INTERVAL", 300),
 	}
 }
 

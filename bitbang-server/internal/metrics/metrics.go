@@ -99,3 +99,20 @@ func (m *Metrics) Snapshot() Snapshot {
 		Failed:   m.failed.Load(),
 	}
 }
+
+// Load seeds the atomic counters from a Snapshot. Used at startup to
+// resume from the most-recent persisted snapshot in the metrics
+// store — without this, counters would reset to zero on every process
+// restart and only the trailing window since the last snapshot would be
+// preserved. With it, the counters reflect lifetime totals modulo at
+// most one snapshot interval's worth of unflushed events.
+//
+// Safe to call concurrently with reads, but typically only called once
+// at startup before any IncRequests/IncPath traffic begins.
+func (m *Metrics) Load(s Snapshot) {
+	m.requests.Store(s.Requests)
+	m.direct.Store(s.Direct)
+	m.relay.Store(s.Relay)
+	m.tcpRelay.Store(s.TCPRelay)
+	m.failed.Store(s.Failed)
+}

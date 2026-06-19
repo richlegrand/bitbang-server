@@ -3,8 +3,9 @@
 # the production host.
 #
 # Reads deploy/production.deploy for SSH config (local, never ships).
-# Ships:   ./signaling-go (compiled), deploy/production.env (-> .env on
-#          remote), deploy/signaling.service, web/.
+# Ships:   ./signaling-go (compiled), ./bitbang-metrics-dump (companion
+#          CLI for reading metrics.db on the server), deploy/production.env
+#          (-> .env on remote), deploy/signaling.service, web/.
 # Restarts signaling.service on the remote.
 set -euo pipefail
 
@@ -18,11 +19,17 @@ source deploy/production.deploy
 echo "Building signaling-go for linux/amd64..."
 CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -o signaling-go ./cmd/signaling
 
+# Companion CLI for reading metrics.db on the server. Same CGO_ENABLED=0,
+# so it inherits the pure-Go SQLite driver — no libsqlite3.so needed.
+echo "Building bitbang-metrics-dump for linux/amd64..."
+CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -o bitbang-metrics-dump ./cmd/bitbang-metrics-dump
+
 TARFILE=signaling-production.tgz
 SERVICE=signaling.service
 
 tar cvfz "${TARFILE}" \
     signaling-go \
+    bitbang-metrics-dump \
     deploy/production.env \
     deploy/"${SERVICE}" \
     web

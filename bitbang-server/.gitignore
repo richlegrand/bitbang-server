@@ -1,0 +1,17 @@
+# Deployment files with real values (the .example siblings are tracked
+# as templates; copy them and fill in secrets locally — never commit the
+# concrete files):
+deploy/production.env
+deploy/production.deploy
+deploy/test.env
+deploy/test.deploy
+
+# Build artifacts (produced by upload_production / local builds):
+signaling-go
+bitbang-metrics-dump
+*.tgz
+
+# Local SQLite metrics, if running the server locally for testing:
+*.db
+*.db-wal
+*.db-shm

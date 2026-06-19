@@ -41,6 +41,29 @@ func TestIncPath_UnknownValue(t *testing.T) {
 	}
 }
 
+func TestLoad_SeedsCounters(t *testing.T) {
+	m := New()
+	m.Load(Snapshot{
+		Requests: 1000,
+		Direct:   600,
+		Relay:    300,
+		TCPRelay: 50,
+		Failed:   50,
+	})
+	got := m.Snapshot()
+	if got.Requests != 1000 || got.Direct != 600 || got.Relay != 300 ||
+		got.TCPRelay != 50 || got.Failed != 50 {
+		t.Errorf("Load did not seed all fields: %+v", got)
+	}
+	// Subsequent increments should continue from the seeded values.
+	m.IncRequests()
+	m.IncPath("direct")
+	got = m.Snapshot()
+	if got.Requests != 1001 || got.Direct != 601 {
+		t.Errorf("post-Load increment broke: %+v", got)
+	}
+}
+
 func TestIncRequests(t *testing.T) {
 	m := New()
 	for i := 0; i < 5; i++ {
