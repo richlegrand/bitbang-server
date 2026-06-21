@@ -123,29 +123,108 @@ self.addEventListener('message', async (event) => {
  *   4. Single-session fallback (excludes top-level UID paths)
  *   5. Most recent session (sub-resources only)
  */
+// Session-resolution strategies, applied in order by findSession. Each
+// returns a sessionId on a hit or null on a miss.
+//
+// `evidence` controls how the strategy interacts with pair-entry paths
+// (bare `/` and `/<6-digit>`):
+//
+//   - 'concrete' — the request carries an explicit `/__device__/<sid>`
+//     handle (in its referer or its requesting client's URL). Safe for
+//     pair-entry paths: an in-session iframe redirected to `/` still
+//     has a `/__device__/<sid>` referer, so we proxy correctly.
+//
+//   - 'fuzzy' — the strategy infers a session from weaker signals
+//     (referer-uid match, single-session fallback, most-recent session).
+//     SKIPPED for pair-entry paths: a fresh tab to bitba.ng/ would
+//     otherwise leak to whatever session another tab has open.
+const SESSION_STRATEGIES = [
+    {
+        name: 'referer-device',  // referer has /__device__/<sid>
+        evidence: 'concrete',
+        async match({ referer }) {
+            const m = referer.match(/\/__device__\/([^/]+)/);
+            return m && sessions.has(m[1]) ? m[1] : null;
+        },
+    },
+    {
+        name: 'client-device',  // requesting client's URL has /__device__/<sid>
+        evidence: 'concrete',
+        async match({ event }) {
+            if (!event.clientId) return null;
+            const client = await self.clients.get(event.clientId);
+            if (!client) return null;
+            const m = client.url.match(/\/__device__\/([^/]+)/);
+            return m && sessions.has(m[1]) ? m[1] : null;
+        },
+    },
+    {
+        name: 'referer-uid',  // referer has /<uid>
+        evidence: 'fuzzy',
+        async match({ referer }) {
+            if (!referer) return null;
+            try {
+                const refPath = new URL(referer).pathname;
+                for (const [sid, sess] of sessions) {
+                    if (sess.uid && refPath.startsWith('/' + sess.uid)) return sid;
+                }
+            } catch (e) {}
+            return null;
+        },
+    },
+    {
+        name: 'single-session',  // exactly one open session
+        evidence: 'fuzzy',
+        async match({ isUidPath }) {
+            // Excludes top-level UID paths (e.g. /bb29bead...) which
+            // need the signaling server to load bootstrap.html, even
+            // when the only open session happens to share the UID.
+            if (sessions.size === 1 && !isUidPath) {
+                return Array.from(sessions.keys())[0];
+            }
+            return null;
+        },
+    },
+    {
+        name: 'most-recent',  // any session → most recent
+        evidence: 'fuzzy',
+        // Final fallback: covers sub-resource fetches (XHR, fetch, img,
+        // …) from contexts whose URL doesn't include /__device__/<sid>
+        // — bare-origin iframes the proxied app spawns — and form-POST
+        // navigations into hidden iframes (Synology DSM uses this for
+        // /webman/login.cgi). Top-level UID-path navigations are already
+        // excluded by the isUidPath+navigate early return in findSession,
+        // so it's safe to include 'navigate' mode here.
+        async match() {
+            return sessions.size > 0 ? Array.from(sessions.keys()).pop() : null;
+        },
+    },
+];
+
 async function findSession(event) {
     await sessionsReady;
 
     // Top-level navigations to /<uid>/... are bootstrap-page loads — they
-    // must always fall through to the signaling server (which serves
-    // bootstrap.html), never get proxied to the device. Without this, a
-    // page reload while the old bootstrap window is still being torn down
-    // can match the stale session via Strategy 3 (uid-in-referer) and end
-    // up routing the reload through the device, which then 404s.
+    // must always reach the signaling server (which serves bootstrap.html),
+    // never get proxied to the device. Without this, a page reload while
+    // the old bootstrap window is still being torn down can match the
+    // stale session via the referer-uid strategy and end up routing the
+    // reload through the device, which then 404s.
     //
-    // The UID is 22 base64url chars (alphabet [A-Za-z0-9_-]). Followed by
+    // The UID is 22 base64url chars (alphabet [A-Za-z0-9_-]), followed by
     // either end-of-path or "/", so we don't accidentally treat
     // /__device__/... or anything else as a UID path.
     const reqUrl = new URL(event.request.url);
     const isUidPath = /^\/[A-Za-z0-9_-]{22}(\/|$)/.test(reqUrl.pathname);
-    if (isUidPath && event.request.mode === 'navigate') {
-        return null;
-    }
+    if (isUidPath && event.request.mode === 'navigate') return null;
 
-    // Drop sessions whose owning client is gone. Without this, an auto-fetch
-    // (e.g. /favicon.ico right after a refresh) can match a stale uid-keyed
-    // entry from a previous page and get routed into the rescue path. The
-    // pagehide cleanup is best-effort; this sweep is authoritative.
+    const isPairEntryPath = reqUrl.pathname === '/' || /^\/\d{6}$/.test(reqUrl.pathname);
+
+    // Drop sessions whose owning client is gone. Without this, an
+    // auto-fetch (e.g. /favicon.ico right after a refresh) can match a
+    // stale uid-keyed entry from a previous page and get routed into
+    // the rescue path. The pagehide cleanup is best-effort; this sweep
+    // is authoritative.
     let swept = false;
     for (const [sid, sess] of sessions) {
         if (!(await self.clients.get(sess.clientId))) {
@@ -155,55 +234,16 @@ async function findSession(event) {
     }
     if (swept) saveSessions();
 
-    const referer = event.request.referrer || '';
-
-    // Strategy 1: referer has /__device__/<sid>
-    const devMatch = referer.match(/\/__device__\/([^/]+)/);
-    if (devMatch && sessions.has(devMatch[1])) return devMatch[1];
-
-    // Strategy 2: requesting client's URL has /__device__/<sid>
-    if (event.clientId) {
-        const client = await self.clients.get(event.clientId);
-        if (client) {
-            const clientMatch = client.url.match(/\/__device__\/([^/]+)/);
-            if (clientMatch && sessions.has(clientMatch[1])) return clientMatch[1];
-        }
+    const ctx = {
+        event,
+        isUidPath,
+        referer: event.request.referrer || '',
+    };
+    for (const strat of SESSION_STRATEGIES) {
+        if (isPairEntryPath && strat.evidence !== 'concrete') break;
+        const sid = await strat.match(ctx);
+        if (sid) return sid;
     }
-
-    // Strategy 3: referer has /<uid>
-    if (referer) {
-        try {
-            const refPath = new URL(referer).pathname;
-            for (const [sid, sess] of sessions) {
-                if (sess.uid && refPath.startsWith('/' + sess.uid)) return sid;
-            }
-        } catch (e) {}
-    }
-
-    // Strategy 4: single-session fallback. Safe when there's only one
-    // session. Excludes top-level UID paths (e.g. /bb29bead...) which
-    // need the signaling server to load bootstrap.html.
-    if (sessions.size === 1 && !isUidPath) {
-        return Array.from(sessions.keys())[0];
-    }
-
-    // Strategy 5 (final fallback): when no other strategy matched and
-    // there's any open session, route to the most recent. Covers:
-    //   - Sub-resource fetches (XHR, fetch, img, …) from contexts
-    //     whose URL doesn't include /__device__/<sid> — e.g. bare-
-    //     origin iframes the proxied app spawns.
-    //   - Form-POST navigations into hidden iframes (Synology DSM
-    //     uses this for /webman/login.cgi). These have mode ===
-    //     'navigate' even though no top-level page is loading.
-    //
-    // Top-level UID-path navigations (i.e. real bootstrap-page loads
-    // and reloads) are already excluded by the isUidPath+navigate
-    // early return at the top of this function, so it's safe to
-    // include 'navigate' mode here.
-    if (sessions.size > 0) {
-        return Array.from(sessions.keys()).pop();
-    }
-
     return null;
 }
 
@@ -334,11 +374,9 @@ function getCookieHeader(jarKey, requestPath) {
 // Keep in sync with the signaling server's route table in
 // cmd/signaling/main.go.
 function isServerEndpoint(pathname) {
-    return pathname === '/'
-        || pathname === '/status'
+    return pathname === '/status'
         || pathname.startsWith('/ws/')
-        || pathname.startsWith('/__bitbang__/')
-        || /^\/\d{6}$/.test(pathname);
+        || pathname.startsWith('/__bitbang__/');
 }
 
 self.addEventListener('fetch', (event) => {

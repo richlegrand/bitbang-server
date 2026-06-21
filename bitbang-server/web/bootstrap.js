@@ -159,6 +159,25 @@ async function sha256Base64(bytes) {
     return bytesToBase64(new Uint8Array(hash));
 }
 
+// Buffer ICE candidates that arrive (or are produced) before the remote
+// description is set, then drain them in arrival order. Used by both the
+// direct (BitBangConnection) and pair (PairingFlow) handshakes — the
+// readiness gate lives at the call site because each flow tracks
+// remote-description state and ws-open state differently.
+class CandidateQueue {
+    constructor() { this.local = []; this.remote = []; }
+    pushLocal(msg)  { this.local.push(msg); }
+    pushRemote(c)   { this.remote.push(c); }
+    drainLocal(send) {
+        for (const m of this.local) send(m);
+        this.local.length = 0;
+    }
+    drainRemote(add) {
+        for (const c of this.remote) add(c);
+        this.remote.length = 0;
+    }
+}
+
 class BitBangConnection {
     constructor(uid, devicePath, code) {
         this.uid = uid;
@@ -175,8 +194,7 @@ class BitBangConnection {
         this.wsStreams = new Map();    // streamId -> { iframe } for WebSocket bridging
         this.sessionId = Array.from(crypto.getRandomValues(new Uint8Array(4)), b => b.toString(16).padStart(2, '0')).join(''); // 8 hex chars
         console.log('[Bootstrap] ctor', this.sessionId);
-        this.localCandidateQueue = [];
-        this.remoteCandidateQueue = [];
+        this.candidateQueue = new CandidateQueue();
         this.remoteDescriptionSet = false;
         this.progressChannel = new BroadcastChannel('bitbang-progress');
 
@@ -237,6 +255,23 @@ class BitBangConnection {
     // Same, but only with ?debug — the extra play-by-play detail.
     _printDebug(msg) {
         if (this.debug) this._print(msg);
+    }
+
+    // Parse the coturn REST-API expiry from a TURN credential's username
+    // ("<epoch>[:<user_name>]") and stash it in this._turnExpiryMs. The
+    // server stamps the same epoch on every entry it returns, so the
+    // first match wins. Called from both the initial offer and the
+    // post-stall ice_servers push — forgetting one would let
+    // _armTurnEndTimers silently fall through and run past the TTL.
+    _extractTurnExpiry(servers) {
+        if (!Array.isArray(servers)) return;
+        for (const s of servers) {
+            const m = s && s.username && /^(\d+)(:|$)/.exec(s.username);
+            if (m) {
+                this._turnExpiryMs = parseInt(m[1], 10) * 1000;
+                return;
+            }
+        }
     }
 
     async connect() {
@@ -541,22 +576,8 @@ class BitBangConnection {
         if (this._turnUnavailable) {
             this._print('Relay server (TURN) is at capacity. Connection may fail — please try again later.');
         }
-        // Coturn REST-API username format: "<expiry-epoch>[:<user_name>]".
-        // The expiry is set via COTURN_TTL in signaling/.env; the optional
-        // user_name suffix is the BitBang uid (used for per-uid quota in
-        // coturn). Match the leading integer up to either a colon or
-        // end-of-string. If multiple TURN entries are present, they share
-        // the same username.
         this._turnExpiryMs = null;
-        if (Array.isArray(msg.ice_servers)) {
-            for (const s of msg.ice_servers) {
-                const m = s && s.username && /^(\d+)(:|$)/.exec(s.username);
-                if (m) {
-                    this._turnExpiryMs = parseInt(m[1], 10) * 1000;
-                    break;
-                }
-            }
-        }
+        this._extractTurnExpiry(msg.ice_servers);
         this.iceServers = Array.isArray(msg.ice_servers) ? msg.ice_servers : [];
         this.pc = this.createPeerConnection(msg.ice_servers);
 
@@ -572,10 +593,7 @@ class BitBangConnection {
         this.remoteDescriptionSet = true;
 
         // Flush buffered remote candidates
-        for (const candidate of this.remoteCandidateQueue) {
-            await this.pc.addIceCandidate(candidate).catch(() => {});
-        }
-        this.remoteCandidateQueue = [];
+        this.candidateQueue.drainRemote(c => this.pc.addIceCandidate(c).catch(() => {}));
 
         // Create the answer; setLocalDescription populates the SDP with our
         // DTLS fingerprint, which we then commit to via the encrypted
@@ -601,10 +619,7 @@ class BitBangConnection {
         }));
 
         // Flush buffered local candidates
-        for (const msg of this.localCandidateQueue) {
-            this.ws.send(JSON.stringify(msg));
-        }
-        this.localCandidateQueue = [];
+        this.candidateQueue.drainLocal(m => this.ws.send(JSON.stringify(m)));
 
         // Start the TURN-withhold fallback timers. After MESSAGE_TIMEOUT_MS,
         // if the connection still isn't up, show the user a friendly
@@ -712,7 +727,7 @@ class BitBangConnection {
                 if (this.ws?.readyState === WebSocket.OPEN && this.remoteDescriptionSet) {
                     this.ws.send(JSON.stringify(msg));
                 } else {
-                    this.localCandidateQueue.push(msg);
+                    this.candidateQueue.pushLocal(msg);
                 }
             } else if (this.debug) {
                 console.log('[Bootstrap] local candidate gathering complete');
@@ -754,7 +769,7 @@ class BitBangConnection {
         if (this.remoteDescriptionSet && this.pc) {
             this.pc.addIceCandidate(candidate).catch(() => {});
         } else {
-            this.remoteCandidateQueue.push(candidate);
+            this.candidateQueue.pushRemote(candidate);
         }
     }
 
@@ -922,18 +937,7 @@ class BitBangConnection {
         if (!this.pc) return;
         const servers = Array.isArray(msg.ice_servers) ? msg.ice_servers : [];
         if (servers.length === 0) return;
-        // Parse the TURN credential's epoch expiry from the username so the
-        // end-of-session warn/reload timers can arm. Same coturn REST-API
-        // format as handleOffer. Without this, _armTurnEndTimers' guard
-        // (_usingRelay && _turnExpiryMs) silently falls through and the
-        // session runs past its intended TTL.
-        for (const s of servers) {
-            const m = s && s.username && /^(\d+)(:|$)/.exec(s.username);
-            if (m) {
-                this._turnExpiryMs = parseInt(m[1], 10) * 1000;
-                break;
-            }
-        }
+        this._extractTurnExpiry(servers);
         // Make the relay creds available to the video PC too: it's negotiated
         // after the data channel and reads this.iceServers when answering the
         // device's video offer. Without this it gathers host-only, so a
@@ -1932,123 +1936,141 @@ const pairUI = {
     },
 };
 
-// runPairingFlow drives the browser connector half of code exchange.
-async function runPairingFlow(code) {
-    const params = new URLSearchParams(location.search);
-    const forceRelay = params.has('relay') && !params.has('norelay');
-    const proto = location.protocol === 'https:' ? 'wss:' : 'ws:';
-    const ws = new WebSocket(`${proto}//${location.host}/ws/pair`);
-
-    let pc = null, dc = null, remoteSet = false, aborted = false;
-    const remoteCandQueue = [], localCandQueue = [];
-
-    // Promise-based reader over data-channel pairing messages.
-    const dcInbox = [];
-    let dcWaiter = null;
-    function dcDeliver(obj) {
-        if (dcWaiter) { const w = dcWaiter; dcWaiter = null; w(obj); }
-        else dcInbox.push(obj);
+// PairingFlow drives the browser connector half of code exchange. State
+// (pc, dc, remoteSet, aborted, the DC inbox + pending waiter) lives on
+// the instance instead of the closures of a single async function — it
+// makes the WS message handler and the offer/handshake methods easier to
+// follow, and lets us share CandidateQueue with the direct flow.
+class PairingFlow {
+    constructor(code) {
+        this.code = code;
+        const params = new URLSearchParams(location.search);
+        this.forceRelay = params.has('relay') && !params.has('norelay');
+        this.ws = null;
+        this.pc = null;
+        this.dc = null;
+        this.remoteSet = false;
+        this.aborted = false;
+        this.candidateQueue = new CandidateQueue();
+        // Promise-based reader over data-channel pairing messages: at most
+        // one outstanding waiter; inbox holds messages that arrived before
+        // anyone was waiting.
+        this._dcInbox = [];
+        this._dcWaiter = null;
     }
-    function dcRecv(timeoutMs) {
+
+    run() {
+        const proto = location.protocol === 'https:' ? 'wss:' : 'ws:';
+        this.ws = new WebSocket(`${proto}//${location.host}/ws/pair`);
+        this.ws.onopen = () => this.ws.send(JSON.stringify({
+            type: 'pair_init', code: this.code, force_relay: this.forceRelay,
+        }));
+        this.ws.onerror = () => this.fail('Connection error. Please try again.');
+        this.ws.onmessage = (ev) => this._onWsMessage(ev);
+    }
+
+    fail(text) {
+        if (this.aborted) return;
+        this.aborted = true;
+        pairUI.error(text);
+        try { this.ws?.close(); } catch (e) {}
+        try { this.pc?.close(); } catch (e) {}
+        if (this._dcWaiter) { const w = this._dcWaiter; this._dcWaiter = null; w(null); }
+    }
+
+    _dcDeliver(obj) {
+        if (this._dcWaiter) { const w = this._dcWaiter; this._dcWaiter = null; w(obj); }
+        else this._dcInbox.push(obj);
+    }
+
+    _dcRecv(timeoutMs) {
         return new Promise((resolve) => {
-            if (dcInbox.length) { resolve(dcInbox.shift()); return; }
-            const t = setTimeout(() => { dcWaiter = null; resolve(null); }, timeoutMs);
-            dcWaiter = (obj) => { clearTimeout(t); resolve(obj); };
+            if (this._dcInbox.length) { resolve(this._dcInbox.shift()); return; }
+            const t = setTimeout(() => { this._dcWaiter = null; resolve(null); }, timeoutMs);
+            this._dcWaiter = (obj) => { clearTimeout(t); resolve(obj); };
         });
     }
-    function fail(text) {
-        if (aborted) return;
-        aborted = true;
-        pairUI.error(text);
-        try { ws.close(); } catch (e) {}
-        try { if (pc) pc.close(); } catch (e) {}
-        if (dcWaiter) { const w = dcWaiter; dcWaiter = null; w(null); }
-    }
 
-    ws.onopen = () => ws.send(JSON.stringify({ type: 'pair_init', code, force_relay: forceRelay }));
-    ws.onerror = () => fail('Connection error. Please try again.');
-    ws.onmessage = async (ev) => {
+    async _onWsMessage(ev) {
         let msg; try { msg = JSON.parse(ev.data); } catch (e) { return; }
         switch (msg.type) {
             case 'pair_routed': break;
-            case 'error': fail(pairErrorText(msg.message)); break;
-            case 'offer': await handleOffer(msg); break;
+            case 'error': this.fail(pairErrorText(msg.message)); break;
+            case 'offer': await this._handleOffer(msg); break;
             case 'candidate':
-                if (remoteSet && pc) pc.addIceCandidate(msg.candidate).catch(() => {});
-                else remoteCandQueue.push(msg.candidate);
+                if (this.remoteSet && this.pc) this.pc.addIceCandidate(msg.candidate).catch(() => {});
+                else this.candidateQueue.pushRemote(msg.candidate);
                 break;
             case 'pair_approved': break; // bare ack — credentials arrive over the DC
-            case 'pair_rejected': fail(pairRejectText(msg.reason)); break;
+            case 'pair_rejected': this.fail(pairRejectText(msg.reason)); break;
         }
-    };
+    }
 
-    async function handleOffer(msg) {
+    async _handleOffer(msg) {
       try {
         const config = {};
         if (Array.isArray(msg.ice_servers) && msg.ice_servers.length) config.iceServers = msg.ice_servers;
-        if (forceRelay) config.iceTransportPolicy = 'relay';
-        pc = new RTCPeerConnection(config);
+        if (this.forceRelay) config.iceTransportPolicy = 'relay';
+        this.pc = new RTCPeerConnection(config);
 
-        pc.onicecandidate = (e) => {
+        this.pc.onicecandidate = (e) => {
             if (!e.candidate) return;
             const m = { type: 'candidate', candidate: e.candidate };
-            if (ws.readyState === WebSocket.OPEN && remoteSet) ws.send(JSON.stringify(m));
-            else localCandQueue.push(m);
+            if (this.ws.readyState === WebSocket.OPEN && this.remoteSet) this.ws.send(JSON.stringify(m));
+            else this.candidateQueue.pushLocal(m);
         };
-        pc.onconnectionstatechange = () => {
-            if (pc.connectionState === 'failed') {
-                fail('Could not connect to the device. Try again, or ask the owner to check their network.');
+        this.pc.onconnectionstatechange = () => {
+            if (this.pc.connectionState === 'failed') {
+                this.fail('Could not connect to the device. Try again, or ask the owner to check their network.');
             }
         };
-        pc.ondatachannel = (e) => {
-            dc = e.channel;
-            dc.binaryType = 'arraybuffer';
-            dc.onmessage = (me) => { const o = pairDecodeMessage(me.data); if (o) dcDeliver(o); };
-            dc.onopen = () => { runHandshake(); };
+        this.pc.ondatachannel = (e) => {
+            this.dc = e.channel;
+            this.dc.binaryType = 'arraybuffer';
+            this.dc.onmessage = (me) => { const o = pairDecodeMessage(me.data); if (o) this._dcDeliver(o); };
+            this.dc.onopen = () => { this._runHandshake(); };
         };
 
-        await pc.setRemoteDescription({ type: 'offer', sdp: msg.sdp });
-        remoteSet = true;
-        const answer = await pc.createAnswer();
-        await pc.setLocalDescription(answer);
-        ws.send(JSON.stringify({ type: 'answer', sdp: pc.localDescription.sdp }));
-        for (const m of localCandQueue) ws.send(JSON.stringify(m));
-        localCandQueue.length = 0;
-        for (const c of remoteCandQueue) pc.addIceCandidate(c).catch(() => {});
-        remoteCandQueue.length = 0;
+        await this.pc.setRemoteDescription({ type: 'offer', sdp: msg.sdp });
+        this.remoteSet = true;
+        const answer = await this.pc.createAnswer();
+        await this.pc.setLocalDescription(answer);
+        this.ws.send(JSON.stringify({ type: 'answer', sdp: this.pc.localDescription.sdp }));
+        this.candidateQueue.drainLocal(m => this.ws.send(JSON.stringify(m)));
+        this.candidateQueue.drainRemote(c => this.pc.addIceCandidate(c).catch(() => {}));
       } catch (e) {
-        fail('Could not set up the connection: ' + (e && e.message ? e.message : e));
+        this.fail('Could not set up the connection: ' + (e && e.message ? e.message : e));
       }
     }
 
-    async function runHandshake() {
+    async _runHandshake() {
         try {
             // 1. Commit our nonce (hidden) before the device reveals its challenge.
             const rc = pairNonce();
-            dc.send(JSON.stringify({ type: 'pair_commit', commit: await pairCommitment(rc) }));
+            this.dc.send(JSON.stringify({ type: 'pair_commit', commit: await pairCommitment(rc) }));
 
             // 2. Receive the device's challenge nonce.
-            const challenge = await dcRecv(30000);
-            if (aborted) return;
-            if (!challenge || challenge.type !== 'pair_challenge') { fail('Pairing timed out.'); return; }
+            const challenge = await this._dcRecv(30000);
+            if (this.aborted) return;
+            if (!challenge || challenge.type !== 'pair_challenge') { this.fail('Pairing timed out.'); return; }
             const rd = base64ToBytes(challenge.nonce_d || '');
-            if (rd.length !== PAIR_NONCE_LEN) { fail('Pairing failed (bad challenge).'); return; }
+            if (rd.length !== PAIR_NONCE_LEN) { this.fail('Pairing failed (bad challenge).'); return; }
 
             // 3. Reveal.
-            dc.send(JSON.stringify({ type: 'pair_reveal', nonce_c: bytesToBase64(rc) }));
+            this.dc.send(JSON.stringify({ type: 'pair_reveal', nonce_c: bytesToBase64(rc) }));
 
             // 4. Compute and show the SAS to read aloud.
-            const localFp = extractDTLSFingerprint(pc.localDescription.sdp);
-            const remoteFp = extractDTLSFingerprint(pc.remoteDescription.sdp);
+            const localFp = extractDTLSFingerprint(this.pc.localDescription.sdp);
+            const remoteFp = extractDTLSFingerprint(this.pc.remoteDescription.sdp);
             const sas = await pairComputeSAS(rc, rd, localFp, remoteFp);
             pairUI.showSAS(sas);
 
             // 5. Wait for credentials over the data channel (approval) — or a
             //    pair_rejected over signaling (handled by ws.onmessage → fail).
-            const creds = await dcRecv(120000);
-            if (aborted) return;
+            const creds = await this._dcRecv(120000);
+            if (this.aborted) return;
             if (!creds || creds.type !== 'pair_credentials' || !creds.uid || !creds.access_code) {
-                fail("The device owner didn't confirm in time.");
+                this.fail("The device owner didn't confirm in time.");
                 return;
             }
 
@@ -2057,7 +2079,7 @@ async function runPairingFlow(code) {
             sessionStorage.setItem('bitbang_just_paired', '1');
             location.replace('/' + creds.uid + '#' + creds.access_code);
         } catch (e) {
-            fail('Pairing failed: ' + (e && e.message ? e.message : e));
+            this.fail('Pairing failed: ' + (e && e.message ? e.message : e));
         }
     }
 }
@@ -2140,7 +2162,7 @@ function showBookmarkModal() {
     // empty path shows the pairing-code input; anything else is a device URL
     // handled by the direct flow below.
     if (pathParts.length === 1 && PAIR_CODE_RE.test(pathParts[0])) {
-        await runPairingFlow(pathParts[0]);
+        new PairingFlow(pathParts[0]).run();
         return;
     }
     if (pathParts.length === 0) {

@@ -196,6 +196,16 @@ func (d *Deps) clientRelay(conn *registry.ClientConn) {
 			// counter and move on — no reply, no per-client state. One
 			// message per ICE establishment, including post-restart
 			// re-establishments, so reconnects naturally aggregate.
+			//
+			// Telemetry contract — connector-only: only the side that sent
+			// "request" (browser opening bitba.ng/<uid>, CLI running
+			// `bitbang connect`) emits this; the listener never does. The
+			// server can't dedupe per session, so if both sides reported
+			// every counter would double. Each connector implementation is
+			// expected to wire one report per ICE establishment, including
+			// restartIce-driven re-establishments. Path values: "direct"
+			// (host/srflx both ends), "relay" (UDP TURN), "tcp-relay"
+			// (TCP TURN, worst case), "failed" (ICE/DTLS/verify abort).
 			path, _ := msg["path"].(string)
 			d.Metrics.IncPath(path)
 			if path == "failed" {
