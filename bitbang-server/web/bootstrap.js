@@ -1896,6 +1896,7 @@ const pairUI = {
             @keyframes pairspin{to{transform:rotate(360deg)}}
             .pair-input{font-size:28px;letter-spacing:.25em;text-align:center;width:200px;padding:10px;border:2px solid #ccc;border-radius:8px;font-variant-numeric:tabular-nums;}
             .pair-btn{display:inline-block;margin-top:14px;padding:10px 18px;font-size:14px;border:none;border-radius:8px;background:#111;color:#fff;cursor:pointer;}
+            .pair-btn:disabled{background:#bbb;cursor:not-allowed;}
             .pair-link{color:#06c;cursor:pointer;text-decoration:underline;background:none;border:none;font-size:14px;}
             .pair-modal-bg{position:fixed;inset:0;background:rgba(0,0,0,.45);display:flex;align-items:center;justify-content:center;z-index:99999;}
             .pair-modal{background:#fff;max-width:420px;width:90%;padding:24px;border-radius:14px;box-shadow:0 10px 40px rgba(0,0,0,.25);font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif;}
@@ -2094,9 +2095,10 @@ function showPairingInput() {
     if (slot) {
         // Operator-supplied front page provides framing; we just fill the
         // mount point. The surrounding snippet (headline, install hint,
-        // links) stays untouched. Inject pair-UI styles so .pair-input /
-        // .pair-btn render consistently.
+        // links) stays untouched. Apply .pair-box so the form picks up
+        // the same centering/sizing it gets in the no-snippet path.
         pairUI._injectStyle();
+        slot.className = 'pair-box';
         slot.innerHTML = '';
         root = slot;
     } else {
@@ -2108,18 +2110,21 @@ function showPairingInput() {
         `<h2>Enter pairing code</h2>` +
         `<p>Type the 6-digit code the device owner gave you.</p>` +
         `<input class="pair-input" id="pair-code-in" inputmode="numeric" pattern="\\d*" maxlength="6" autofocus>` +
-        `<div><button class="pair-btn" id="pair-go">Connect</button></div>`;
+        `<div><button class="pair-btn" id="pair-go" disabled>Connect</button></div>`;
     const input = document.getElementById('pair-code-in');
+    const button = document.getElementById('pair-go');
+    const sync = () => {
+        input.value = input.value.replace(/\D/g, '').slice(0, 6);
+        button.disabled = !PAIR_CODE_RE.test(input.value);
+    };
     const go = () => {
         const v = (input.value || '').replace(/\D/g, '').slice(0, 6);
         if (PAIR_CODE_RE.test(v)) location.href = '/' + v;
         else input.focus();
     };
-    input.addEventListener('input', () => {
-        input.value = input.value.replace(/\D/g, '').slice(0, 6);
-    });
+    input.addEventListener('input', sync);
     input.addEventListener('keydown', (e) => { if (e.key === 'Enter') go(); });
-    document.getElementById('pair-go').addEventListener('click', go);
+    button.addEventListener('click', go);
 }
 
 // showBookmarkModal is shown once, on the post-pairing load, nudging the user

@@ -1,28 +1,23 @@
 <!--
-Front-page snippet for bitba.ng. Spliced into bootstrap.html at the
-`<!-- FRONT_PAGE -->` marker when serving `/`. See the FRONT_PAGE_PATH
-docs in cmd/signaling/main.go for the contract; in particular, the
-`<div id="bb-pair-input"></div>` below is where bootstrap.js renders
-the pair-code form.
-
-This snippet is bitba.ng-specific — self-hosted deployments ship their
-own (or leave FRONT_PAGE_PATH unset for a bare pair input).
+Front-page snippet for bitba.ng. The server splices this file into
+bootstrap.html (at the FRONT_PAGE marker) when serving `/`. The
+div#bb-pair-input below is where bootstrap.js renders the pair-code
+form. See FRONT_PAGE_PATH docs in cmd/signaling/main.go for the full
+contract. bitba.ng-specific — self-hosted deployments ship their own.
 -->
 <style>
   .bb-page {
     max-width: 520px;
-    margin: 48px auto;
+    margin: 20px auto;
     padding: 0 20px;
     font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
     color: #333;
   }
-  .bb-page h1 {
-    font-size: 22px;
-    font-weight: 600;
-    margin: 0 0 12px;
-    color: #111;
-  }
   .bb-page p { font-size: 14px; line-height: 1.5; color: #555; margin: 8px 0; }
+  /* Override the 48px default that .pair-box (applied by bootstrap.js)
+     would otherwise contribute — we want a tighter entry-page top. */
+  .bb-page #bb-pair-input.pair-box { margin-top: 29px; }
+  .bb-page .bb-install-section { margin-top: 16px; }
   .bb-page .bb-install {
     background: #f4f4f4;
     border: 1px solid #e0e0e0;
@@ -35,25 +30,23 @@ own (or leave FRONT_PAGE_PATH unset for a bare pair input).
     user-select: all;
     overflow-x: auto;
   }
-  .bb-page .bb-links { font-size: 13px; color: #888; margin-top: 24px; }
+  .bb-page .bb-links { font-size: 13px; color: #888; margin-top: 16px; }
   .bb-page .bb-links a { color: #06c; text-decoration: none; }
   .bb-page .bb-links a:hover { text-decoration: underline; }
-  .bb-page hr { border: none; border-top: 1px solid #eee; margin: 28px 0; }
+  .bb-page .bb-install-section a { color: #06c; text-decoration: none; }
+  .bb-page .bb-install-section a:hover { text-decoration: underline; }
 </style>
 <div class="bb-page">
-  <h1>BitBang</h1>
-  <p>Secure remote access to any machine — shell, files, and web apps — from a browser or another terminal.</p>
-
   <div id="bb-pair-input"></div>
 
-  <hr>
-
-  <p>New to BitBang? Install the CLI on Linux:</p>
-  <div class="bb-install">curl -sSfL bitba.ng/install | sh</div>
+  <div class="bb-install-section">
+    <p>Install the CLI automatically by running the command below or <a href="https://github.com/richlegrand/bitbang-cli/releases" target="_blank" rel="noopener">download</a>.</p>
+    <div class="bb-install">curl -sSfL bitba.ng/install | sh</div>
+  </div>
 
   <p class="bb-links">
-    <a href="https://github.com/richlegrand/bitbang">Learn more about BitBang</a>
+    <a href="https://github.com/richlegrand/bitbang" target="_blank" rel="noopener">Learn more about BitBang</a>
     &nbsp;·&nbsp;
-    <a href="https://github.com/richlegrand/bitbang-cli">CLI repo</a>
+    <a href="https://github.com/richlegrand/bitbang-cli" target="_blank" rel="noopener">BitBang CLI repo</a>
   </p>
 </div>
