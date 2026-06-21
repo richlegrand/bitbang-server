@@ -2,9 +2,20 @@ package handler
 
 import (
 	"net/http"
+	"os"
 	"path/filepath"
 	"strings"
 )
+
+// frontPagePlaceholder is the literal marker bootstrap.html contains where
+// an operator's snippet (set via FRONT_PAGE_PATH) is spliced when serving
+// the entry page at `/`. The snippet should include a
+// `<div id="bb-pair-input"></div>` somewhere; bootstrap.js's
+// showPairingInput renders the pair-code form into it (or at the end of
+// the snippet if the div is missing). When the env var is empty or the
+// file can't be read, the placeholder is replaced with an empty string —
+// the page degrades to the bare pair input.
+const frontPagePlaceholder = "<!-- FRONT_PAGE -->"
 
 // allowedBitbangAssets is the whitelist of files served at /__bitbang__/<file>.
 // Anything else returns 404. Matches signaling.py exactly.
@@ -17,15 +28,22 @@ var allowedBitbangAssets = map[string]bool{
 }
 
 // Static returns an http.Handler that serves the signaling server's static
-// assets from staticDir. Routes mirror Python signaling.py:
+// assets from staticDir. Routes:
 //
 //	GET /favicon.ico            -> favicon.png
 //	GET /__bitbang__/<file>     -> whitelisted assets with no-cache headers
-//	GET /<uid>                  -> bootstrap.html  (or <uid>.js if uid ends in .js)
+//	GET /                       -> bootstrap.html with FRONT_PAGE splice
+//	GET /<uid>                  -> bootstrap.html (or <uid>.js if uid ends in .js)
 //	GET /<uid>/<subpath>        -> bootstrap.html
 //
-// /status and /ws/... are routed elsewhere (this handler is the catch-all).
-func Static(staticDir string) http.HandlerFunc {
+// /status, /install, and /ws/... are routed elsewhere (this is the catch-all).
+//
+// frontPagePath, when non-empty, is the path to an HTML snippet read on
+// every request to `/` and spliced into bootstrap.html at
+// frontPagePlaceholder. Empty disables the splice; the placeholder is
+// always replaced (with empty string if no snippet) so the marker never
+// leaks to the browser.
+func Static(staticDir, frontPagePath string) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodGet && r.Method != http.MethodHead {
 			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
@@ -75,11 +93,45 @@ func Static(staticDir string) http.HandlerFunc {
 			return
 		}
 
+		// Entry page `/` gets the FRONT_PAGE splice — the only path that
+		// renders the pair-input form is also the only one where an
+		// operator's branding/install hint matters. Other bootstrap.html
+		// serves (UID paths, 6-digit codes) skip the splice entirely.
+		if path == "/" {
+			serveBootstrapWithFrontPage(w, r, staticDir, frontPagePath)
+			return
+		}
+
 		// Default: serve bootstrap.html (SPA routing). no-cache like the JS —
 		// the page carries inline CSS, so a stale cached copy means stale
 		// styling against fresh bootstrap.js.
 		serveFile(w, r, staticDir, "bootstrap.html", "", true)
 	}
+}
+
+// serveBootstrapWithFrontPage reads bootstrap.html and the front-page
+// snippet on every request — files are tiny, IO is cheap, and operators
+// can edit the snippet without a service restart. Both reads can fail
+// independently: a missing snippet replaces the placeholder with empty
+// string (and the page degrades to bare pair input); a missing or
+// unreadable bootstrap.html is a 500.
+func serveBootstrapWithFrontPage(w http.ResponseWriter, r *http.Request, staticDir, frontPagePath string) {
+	html, err := os.ReadFile(filepath.Join(staticDir, "bootstrap.html"))
+	if err != nil {
+		http.Error(w, "internal error", http.StatusInternalServerError)
+		return
+	}
+	var snippet []byte
+	if frontPagePath != "" {
+		// Best-effort: a misconfigured FRONT_PAGE_PATH shouldn't take the
+		// entry page down. Log nothing here — the operator sees the
+		// missing snippet in their browser the next time they visit.
+		snippet, _ = os.ReadFile(frontPagePath)
+	}
+	out := strings.Replace(string(html), frontPagePlaceholder, string(snippet), 1)
+	w.Header().Set("Cache-Control", "no-cache, no-store, must-revalidate")
+	w.Header().Set("Content-Type", "text/html; charset=utf-8")
+	_, _ = w.Write([]byte(out))
 }
 
 // serveFile serves <staticDir>/<name>. The name is validated for traversal

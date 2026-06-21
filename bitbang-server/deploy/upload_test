@@ -23,6 +23,7 @@ SERVICE=signaling-test.service
 tar cvfz "${TARFILE}" \
     signaling-go \
     deploy/test.env \
+    deploy/test.front.html \
     deploy/"${SERVICE}" \
     web
 
@@ -34,6 +35,7 @@ ssh "${SERVER_SSH}" -i "${SERVER_SSH_KEY}" "
     tar xvfz ${TARFILE}
 
     cp deploy/test.env .env
+    cp deploy/test.front.html front.html
     cp deploy/${SERVICE} ${SERVICE}
 
     systemctl --user restart ${SERVICE}

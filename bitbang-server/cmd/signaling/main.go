@@ -15,6 +15,21 @@
 //	METRICS_PATH         When set, periodically append /status counters
 //	                     as JSONL to this file. Empty disables.
 //	METRICS_INTERVAL     Snapshot cadence in seconds (default 300 = 5 min).
+//	INSTALL_URL          When set, GET /install responds with a 302 to
+//	                     this URL. Empty (default) responds 404. Lets
+//	                     each operator point their `curl host/install`
+//	                     at the script that installs the binary they
+//	                     ship — no upstream URL baked into the binary.
+//	FRONT_PAGE_PATH      Path to an HTML snippet spliced into the entry
+//	                     page at `<!-- FRONT_PAGE -->`. Lets each
+//	                     operator add branding, install hints, or links
+//	                     above/around the pair-code form without
+//	                     forking. The snippet should contain a
+//	                     `<div id="bb-pair-input"></div>` somewhere;
+//	                     the pair input renders there (or at the end if
+//	                     the div is missing). Empty (default) = bare
+//	                     pair-entry page. File is re-read on every
+//	                     request — no restart needed after edits.
 package main
 
 import (
@@ -142,7 +157,22 @@ func main() {
 		deps.ClientWS(w, r, r.PathValue("uid"))
 	})
 	mux.HandleFunc("GET /ws/pair", deps.PairWS)
-	mux.Handle("/", handler.Static(cfg.StaticDir))
+
+	// `curl -sSfL host/install | sh` — short, memorable install URL that
+	// 302s to a deployment-chosen install script (typically a raw URL on
+	// GitHub serving install.sh). Off by default: empty INSTALL_URL means
+	// the route returns 404, so a self-hosted deployment that doesn't
+	// ship a CLI doesn't accidentally expose one. The URL is config, not
+	// code, because each operator may ship their own fork's binary.
+	mux.HandleFunc("GET /install", func(w http.ResponseWriter, r *http.Request) {
+		if cfg.InstallURL == "" {
+			http.NotFound(w, r)
+			return
+		}
+		http.Redirect(w, r, cfg.InstallURL, http.StatusFound)
+	})
+
+	mux.Handle("/", handler.Static(cfg.StaticDir, cfg.FrontPagePath))
 
 	srv := &http.Server{
 		Addr:    cfg.Bind,
@@ -195,6 +225,19 @@ type config struct {
 	// /status counters at MetricsInterval seconds. Empty disables.
 	MetricsPath     string
 	MetricsInterval int
+
+	// InstallURL, when non-empty, is the redirect target for GET /install.
+	// Empty means the route returns 404 — deployments that don't ship a
+	// CLI just don't expose an install path. The canonical bitba.ng host
+	// sets this in its systemd unit; self-hosters pick their own URL.
+	InstallURL string
+
+	// FrontPagePath, when non-empty, points to an HTML snippet that gets
+	// spliced into bootstrap.html at the `<!-- FRONT_PAGE -->` marker
+	// when serving `/`. Read on every request — operators can edit the
+	// snippet without restarting the service. See the package header for
+	// the contract the snippet honors.
+	FrontPagePath string
 }
 
 func loadConfig() config {
@@ -211,6 +254,8 @@ func loadConfig() config {
 		TrustProxyHeaders: strings.EqualFold(os.Getenv("TRUST_PROXY_HEADERS"), "true"),
 		MetricsPath:       os.Getenv("METRICS_PATH"),
 		MetricsInterval:   envOrInt("METRICS_INTERVAL", 300),
+		InstallURL:        os.Getenv("INSTALL_URL"),
+		FrontPagePath:     os.Getenv("FRONT_PAGE_PATH"),
 	}
 }
 

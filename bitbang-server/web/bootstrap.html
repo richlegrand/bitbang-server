@@ -54,6 +54,14 @@
     </style>
 </head>
 <body>
+    <!-- Front page snippet. On `/`, bitbang-server splices FRONT_PAGE_PATH's
+         contents in at the marker below; the snippet may include a
+         `<div id="bb-pair-input"></div>` where bootstrap.js will render the
+         pair-code form. Empty splice (or no env var) leaves this div empty,
+         and showPairingInput falls back to rendering inside #connection-ui.
+         For non-`/` routes the splice never happens (server-side), so this
+         div stays empty regardless. -->
+    <div id="bb-front-page"><!-- FRONT_PAGE --></div>
     <div id="connection-ui">
         <div id="status">Loading...</div>
     </div>

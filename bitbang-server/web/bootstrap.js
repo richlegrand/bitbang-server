@@ -2084,10 +2084,27 @@ class PairingFlow {
     }
 }
 
-// showPairingInput is the bitba.ng/ landing page: a numeric pairing-code input.
+// showPairingInput is the bitba.ng/ landing page: a numeric pairing-code
+// input. Renders into an operator-supplied `#bb-pair-input` div (from a
+// FRONT_PAGE snippet) when present; otherwise takes over #connection-ui
+// via pairUI so the page is still usable when no snippet is configured.
 function showPairingInput() {
-    pairUI.init();
-    pairUI.el.innerHTML =
+    const slot = document.getElementById('bb-pair-input');
+    let root;
+    if (slot) {
+        // Operator-supplied front page provides framing; we just fill the
+        // mount point. The surrounding snippet (headline, install hint,
+        // links) stays untouched. Inject pair-UI styles so .pair-input /
+        // .pair-btn render consistently.
+        pairUI._injectStyle();
+        slot.innerHTML = '';
+        root = slot;
+    } else {
+        // No snippet — pairUI owns #connection-ui as before.
+        pairUI.init();
+        root = pairUI.el;
+    }
+    root.innerHTML =
         `<h2>Enter pairing code</h2>` +
         `<p>Type the 6-digit code the device owner gave you.</p>` +
         `<input class="pair-input" id="pair-code-in" inputmode="numeric" pattern="\\d*" maxlength="6" autofocus>` +
@@ -2158,17 +2175,34 @@ function showBookmarkModal() {
         try { showBookmarkModal(); } catch (e) {}
     }
 
+    // The bb-front-page slot is only meaningful on `/` (the entry page).
+    // Pair-flow and direct-flow take over #connection-ui; the snippet area
+    // would otherwise sit above them as visual leftover. Hide for any
+    // non-entry route.
+    const frontPageDiv = document.getElementById('bb-front-page');
+    const connectionUIDiv = document.getElementById('connection-ui');
+
     // Routing: a bare 6-digit path is a pairing code → run code exchange; an
     // empty path shows the pairing-code input; anything else is a device URL
     // handled by the direct flow below.
     if (pathParts.length === 1 && PAIR_CODE_RE.test(pathParts[0])) {
+        if (frontPageDiv) frontPageDiv.style.display = 'none';
         new PairingFlow(pathParts[0]).run();
         return;
     }
     if (pathParts.length === 0) {
+        // Entry page. If the operator's snippet provided a #bb-pair-input
+        // slot, the form renders there and #connection-ui is unused — hide
+        // it so the "Loading..." placeholder doesn't sit below the snippet.
+        // If no slot, showPairingInput falls back to #connection-ui itself.
+        if (document.getElementById('bb-pair-input') && connectionUIDiv) {
+            connectionUIDiv.style.display = 'none';
+        }
         showPairingInput();
         return;
     }
+    // Direct flow (device URL): snippet area is leftover chrome, hide it.
+    if (frontPageDiv) frontPageDiv.style.display = 'none';
 
     const uid = pathParts[0];
     let pathFromUrl = '/' + pathParts.slice(1).join('/');

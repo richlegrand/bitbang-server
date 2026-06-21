@@ -218,7 +218,22 @@ async function findSession(event) {
     const isUidPath = /^\/[A-Za-z0-9_-]{22}(\/|$)/.test(reqUrl.pathname);
     if (isUidPath && event.request.mode === 'navigate') return null;
 
-    const isPairEntryPath = reqUrl.pathname === '/' || /^\/\d{6}$/.test(reqUrl.pathname);
+    // Short top-level paths — bare `/`, 6-digit pair codes, and any
+    // single-segment lowercase path like `/install`, `/status`, `/health`
+    // — share the server-owned namespace. They're resolved against active
+    // sessions using concrete-evidence strategies only (referer-device,
+    // client-device): an iframe inside a session that redirects to such
+    // a path is correctly proxied to the device, but a fresh tab to the
+    // same URL reaches the server.
+    //
+    // The syntactic rule means future server-side utility endpoints
+    // (`/install.ps1`, `/docs`, anything similar) route correctly with
+    // no SW change required. Convention to preserve: server routes are
+    // short, lowercase, single-segment; device-tunneled deep paths can
+    // be any shape (they're disambiguated by concrete evidence).
+    const isShortTopPath = reqUrl.pathname === '/'
+        || /^\/\d{6}$/.test(reqUrl.pathname)
+        || /^\/[a-z][a-z0-9_-]*\/?$/.test(reqUrl.pathname);
 
     // Drop sessions whose owning client is gone. Without this, an
     // auto-fetch (e.g. /favicon.ico right after a refresh) can match a
@@ -240,7 +255,7 @@ async function findSession(event) {
         referer: event.request.referrer || '',
     };
     for (const strat of SESSION_STRATEGIES) {
-        if (isPairEntryPath && strat.evidence !== 'concrete') break;
+        if (isShortTopPath && strat.evidence !== 'concrete') break;
         const sid = await strat.match(ctx);
         if (sid) return sid;
     }

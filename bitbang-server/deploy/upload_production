@@ -31,6 +31,7 @@ tar cvfz "${TARFILE}" \
     signaling-go \
     bitbang-metrics-dump \
     deploy/production.env \
+    deploy/production.front.html \
     deploy/"${SERVICE}" \
     web
 
@@ -41,8 +42,10 @@ ssh "${SERVER_SSH}" -i "${SERVER_SSH_KEY}" "
     cd ${SERVER_SSH_DIR}
     tar xvfz ${TARFILE}
 
-    # Move runtime env and service file to the locations systemd expects.
+    # Move runtime env and service file to the locations systemd expects,
+    # and the front-page snippet to where FRONT_PAGE_PATH points.
     cp deploy/production.env .env
+    cp deploy/production.front.html front.html
     cp deploy/${SERVICE} ${SERVICE}
 
     systemctl --user restart ${SERVICE}
