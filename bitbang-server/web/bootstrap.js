@@ -1796,6 +1796,326 @@ class BitBangConnection {
     }
 }
 
+// ============================================================================
+// Pairing (code exchange) — the browser connector side.
+//
+// A 6-digit URL path (bitba.ng/482731) means the user is pairing rather than
+// opening a device URL. The browser is the *answerer* (the device offers, same
+// as the direct flow), runs a commit→challenge→reveal so the short SAS can't be
+// ground by a malicious server, computes the 6-digit SAS, displays it to read
+// aloud, and reads {uid, public_key, access_code} off the (now SAS-verified)
+// data channel. On success it navigates to /<uid>#<code> — re-running the
+// standard direct flow with full pubkey verify for the actual session.
+//
+// All commit/challenge/reveal/credentials messages ride the WebRTC data channel
+// (the signaling server never sees them). Must match internal/pairing/commit.go
+// byte-for-byte: SAS = sha256(rc ‖ rd ‖ sort(upper(fp)).join('|'))[:4] read
+// big-endian, mod 1_000_000, zero-padded to 6 digits.
+// ============================================================================
+
+const PAIR_CODE_RE = /^\d{6}$/;
+const PAIR_NONCE_LEN = 32;
+
+function pairNonce() { return crypto.getRandomValues(new Uint8Array(PAIR_NONCE_LEN)); }
+
+// base64(SHA-256(nonce)) — the connector's hiding+binding commitment.
+async function pairCommitment(nonce) {
+    const h = await crypto.subtle.digest('SHA-256', nonce);
+    return bytesToBase64(new Uint8Array(h));
+}
+
+// The 6-digit SAS. rc/rd are Uint8Array(32); localFp/remoteFp are the SDP
+// fingerprint strings.
+async function pairComputeSAS(rc, rd, localFp, remoteFp) {
+    const fps = [(localFp || '').toUpperCase(), (remoteFp || '').toUpperCase()].sort();
+    const fpBytes = new TextEncoder().encode(fps[0] + '|' + fps[1]);
+    const data = new Uint8Array(rc.length + rd.length + fpBytes.length);
+    data.set(rc, 0);
+    data.set(rd, rc.length);
+    data.set(fpBytes, rc.length + rd.length);
+    const hash = await crypto.subtle.digest('SHA-256', data);
+    const n = new DataView(hash).getUint32(0); // big-endian
+    return String(n % 1000000).padStart(6, '0');
+}
+
+// Parse a data-channel message (ArrayBuffer from a binary send, or a string)
+// into a JS object, or null.
+function pairDecodeMessage(data) {
+    let text;
+    if (typeof data === 'string') text = data;
+    else text = new TextDecoder().decode(data);
+    try { return JSON.parse(text); } catch (e) { return null; }
+}
+
+function pairEscapeHtml(s) {
+    const d = document.createElement('div');
+    d.textContent = String(s);
+    return d.innerHTML;
+}
+
+function pairErrorText(serverMsg) {
+    if (serverMsg === 'unknown_code') {
+        return "That code isn't valid or has expired. Pairing codes last 5 minutes — ask for a fresh one.";
+    }
+    return 'Could not start pairing: ' + (serverMsg || 'unknown error') + '.';
+}
+
+function pairRejectText(reason) {
+    switch (reason) {
+        case 'sas_mismatch':
+            return "The codes didn't match, so the connection was refused to keep you safe. Try pairing again.";
+        case 'user_declined':
+            return 'The device owner declined the connection.';
+        case 'timeout':
+            return "The device owner didn't confirm in time. Ask them to accept and try again.";
+        default:
+            return 'Pairing was rejected (' + (reason || 'unknown') + ').';
+    }
+}
+
+// Minimal pairing UI rendered into #connection-ui.
+const pairUI = {
+    el: null,
+    _injectStyle() {
+        if (document.getElementById('pair-style')) return;
+        const s = document.createElement('style');
+        s.id = 'pair-style';
+        s.textContent = `
+            .pair-box{max-width:420px;margin:48px auto;padding:0 20px;text-align:center;font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif;}
+            .pair-box h2{font-size:18px;font-weight:600;margin-bottom:12px;color:#111;}
+            .pair-box p{font-size:14px;color:#555;line-height:1.5;margin:8px 0;}
+            .pair-sas{font-size:44px;font-weight:700;letter-spacing:.12em;color:#111;margin:18px 0;font-variant-numeric:tabular-nums;}
+            .pair-wait{color:#888;font-size:13px;margin-top:18px;}
+            .pair-err{color:#c00;}
+            .pair-spinner{display:inline-block;width:22px;height:22px;border:3px solid #ddd;border-top-color:#555;border-radius:50%;animation:pairspin .8s linear infinite;}
+            .pair-spinner.small{width:13px;height:13px;border-width:2px;vertical-align:-2px;margin-right:6px;}
+            @keyframes pairspin{to{transform:rotate(360deg)}}
+            .pair-input{font-size:28px;letter-spacing:.25em;text-align:center;width:200px;padding:10px;border:2px solid #ccc;border-radius:8px;font-variant-numeric:tabular-nums;}
+            .pair-btn{display:inline-block;margin-top:14px;padding:10px 18px;font-size:14px;border:none;border-radius:8px;background:#111;color:#fff;cursor:pointer;}
+            .pair-link{color:#06c;cursor:pointer;text-decoration:underline;background:none;border:none;font-size:14px;}
+            .pair-modal-bg{position:fixed;inset:0;background:rgba(0,0,0,.45);display:flex;align-items:center;justify-content:center;z-index:99999;}
+            .pair-modal{background:#fff;max-width:420px;width:90%;padding:24px;border-radius:14px;box-shadow:0 10px 40px rgba(0,0,0,.25);font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif;}
+            .pair-modal h3{font-size:17px;margin-bottom:10px;}
+            .pair-modal p{font-size:13px;color:#555;margin:8px 0;}
+            .pair-url{font-family:"SF Mono",Menlo,monospace;font-size:12px;background:#f4f4f4;border:1px solid #e0e0e0;border-radius:8px;padding:10px;word-break:break-all;user-select:all;margin:10px 0;}
+            .pair-modal .pair-priv{font-size:12px;}
+            .pair-row{display:flex;gap:10px;align-items:center;margin-top:14px;}
+        `;
+        document.head.appendChild(s);
+    },
+    init() {
+        this._injectStyle();
+        const root = document.getElementById('connection-ui') || document.body;
+        root.innerHTML = '';
+        this.el = document.createElement('div');
+        this.el.className = 'pair-box';
+        root.appendChild(this.el);
+    },
+    connecting(text) {
+        this.el.innerHTML = `<div class="pair-spinner"></div><p>${pairEscapeHtml(text || 'Connecting…')}</p>`;
+    },
+    showSAS(sas) {
+        if (!this.el) this.init();
+        const grouped = sas.slice(0, 3) + ' ' + sas.slice(3);
+        this.el.innerHTML =
+            `<h2>Read this code aloud</h2>` +
+            `<div class="pair-sas">${pairEscapeHtml(grouped)}</div>` +
+            `<p>Say these 6 digits to the device owner. They'll type them on their device to confirm it's really you.</p>` +
+            `<p class="pair-wait"><span class="pair-spinner small"></span>Waiting for the device owner to confirm…</p>`;
+    },
+    error(text) {
+        if (!this.el) this.init();
+        this.el.innerHTML =
+            `<h2>Pairing failed</h2>` +
+            `<p class="pair-err">${pairEscapeHtml(text)}</p>` +
+            `<p><a class="pair-link" href="/">Try again</a></p>`;
+    },
+};
+
+// runPairingFlow drives the browser connector half of code exchange.
+async function runPairingFlow(code) {
+    const params = new URLSearchParams(location.search);
+    const forceRelay = params.has('relay') && !params.has('norelay');
+    const proto = location.protocol === 'https:' ? 'wss:' : 'ws:';
+    const ws = new WebSocket(`${proto}//${location.host}/ws/pair`);
+
+    let pc = null, dc = null, remoteSet = false, aborted = false;
+    const remoteCandQueue = [], localCandQueue = [];
+
+    // Promise-based reader over data-channel pairing messages.
+    const dcInbox = [];
+    let dcWaiter = null;
+    function dcDeliver(obj) {
+        if (dcWaiter) { const w = dcWaiter; dcWaiter = null; w(obj); }
+        else dcInbox.push(obj);
+    }
+    function dcRecv(timeoutMs) {
+        return new Promise((resolve) => {
+            if (dcInbox.length) { resolve(dcInbox.shift()); return; }
+            const t = setTimeout(() => { dcWaiter = null; resolve(null); }, timeoutMs);
+            dcWaiter = (obj) => { clearTimeout(t); resolve(obj); };
+        });
+    }
+    function fail(text) {
+        if (aborted) return;
+        aborted = true;
+        pairUI.error(text);
+        try { ws.close(); } catch (e) {}
+        try { if (pc) pc.close(); } catch (e) {}
+        if (dcWaiter) { const w = dcWaiter; dcWaiter = null; w(null); }
+    }
+
+    ws.onopen = () => ws.send(JSON.stringify({ type: 'pair_init', code, force_relay: forceRelay }));
+    ws.onerror = () => fail('Connection error. Please try again.');
+    ws.onmessage = async (ev) => {
+        let msg; try { msg = JSON.parse(ev.data); } catch (e) { return; }
+        switch (msg.type) {
+            case 'pair_routed': break;
+            case 'error': fail(pairErrorText(msg.message)); break;
+            case 'offer': await handleOffer(msg); break;
+            case 'candidate':
+                if (remoteSet && pc) pc.addIceCandidate(msg.candidate).catch(() => {});
+                else remoteCandQueue.push(msg.candidate);
+                break;
+            case 'pair_approved': break; // bare ack — credentials arrive over the DC
+            case 'pair_rejected': fail(pairRejectText(msg.reason)); break;
+        }
+    };
+
+    async function handleOffer(msg) {
+      try {
+        const config = {};
+        if (Array.isArray(msg.ice_servers) && msg.ice_servers.length) config.iceServers = msg.ice_servers;
+        if (forceRelay) config.iceTransportPolicy = 'relay';
+        pc = new RTCPeerConnection(config);
+
+        pc.onicecandidate = (e) => {
+            if (!e.candidate) return;
+            const m = { type: 'candidate', candidate: e.candidate };
+            if (ws.readyState === WebSocket.OPEN && remoteSet) ws.send(JSON.stringify(m));
+            else localCandQueue.push(m);
+        };
+        pc.onconnectionstatechange = () => {
+            if (pc.connectionState === 'failed') {
+                fail('Could not connect to the device. Try again, or ask the owner to check their network.');
+            }
+        };
+        pc.ondatachannel = (e) => {
+            dc = e.channel;
+            dc.binaryType = 'arraybuffer';
+            dc.onmessage = (me) => { const o = pairDecodeMessage(me.data); if (o) dcDeliver(o); };
+            dc.onopen = () => { runHandshake(); };
+        };
+
+        await pc.setRemoteDescription({ type: 'offer', sdp: msg.sdp });
+        remoteSet = true;
+        const answer = await pc.createAnswer();
+        await pc.setLocalDescription(answer);
+        ws.send(JSON.stringify({ type: 'answer', sdp: pc.localDescription.sdp }));
+        for (const m of localCandQueue) ws.send(JSON.stringify(m));
+        localCandQueue.length = 0;
+        for (const c of remoteCandQueue) pc.addIceCandidate(c).catch(() => {});
+        remoteCandQueue.length = 0;
+      } catch (e) {
+        fail('Could not set up the connection: ' + (e && e.message ? e.message : e));
+      }
+    }
+
+    async function runHandshake() {
+        try {
+            // 1. Commit our nonce (hidden) before the device reveals its challenge.
+            const rc = pairNonce();
+            dc.send(JSON.stringify({ type: 'pair_commit', commit: await pairCommitment(rc) }));
+
+            // 2. Receive the device's challenge nonce.
+            const challenge = await dcRecv(30000);
+            if (aborted) return;
+            if (!challenge || challenge.type !== 'pair_challenge') { fail('Pairing timed out.'); return; }
+            const rd = base64ToBytes(challenge.nonce_d || '');
+            if (rd.length !== PAIR_NONCE_LEN) { fail('Pairing failed (bad challenge).'); return; }
+
+            // 3. Reveal.
+            dc.send(JSON.stringify({ type: 'pair_reveal', nonce_c: bytesToBase64(rc) }));
+
+            // 4. Compute and show the SAS to read aloud.
+            const localFp = extractDTLSFingerprint(pc.localDescription.sdp);
+            const remoteFp = extractDTLSFingerprint(pc.remoteDescription.sdp);
+            const sas = await pairComputeSAS(rc, rd, localFp, remoteFp);
+            pairUI.showSAS(sas);
+
+            // 5. Wait for credentials over the data channel (approval) — or a
+            //    pair_rejected over signaling (handled by ws.onmessage → fail).
+            const creds = await dcRecv(120000);
+            if (aborted) return;
+            if (!creds || creds.type !== 'pair_credentials' || !creds.uid || !creds.access_code) {
+                fail("The device owner didn't confirm in time.");
+                return;
+            }
+
+            // 6. Navigate into the direct flow; drop the spent pairing URL from
+            //    history, and flag the bookmark prompt for the destination load.
+            sessionStorage.setItem('bitbang_just_paired', '1');
+            location.replace('/' + creds.uid + '#' + creds.access_code);
+        } catch (e) {
+            fail('Pairing failed: ' + (e && e.message ? e.message : e));
+        }
+    }
+}
+
+// showPairingInput is the bitba.ng/ landing page: a numeric pairing-code input.
+function showPairingInput() {
+    pairUI.init();
+    pairUI.el.innerHTML =
+        `<h2>Enter pairing code</h2>` +
+        `<p>Type the 6-digit code the device owner gave you.</p>` +
+        `<input class="pair-input" id="pair-code-in" inputmode="numeric" pattern="\\d*" maxlength="6" autofocus>` +
+        `<div><button class="pair-btn" id="pair-go">Connect</button></div>`;
+    const input = document.getElementById('pair-code-in');
+    const go = () => {
+        const v = (input.value || '').replace(/\D/g, '').slice(0, 6);
+        if (PAIR_CODE_RE.test(v)) location.href = '/' + v;
+        else input.focus();
+    };
+    input.addEventListener('input', () => {
+        input.value = input.value.replace(/\D/g, '').slice(0, 6);
+    });
+    input.addEventListener('keydown', (e) => { if (e.key === 'Enter') go(); });
+    document.getElementById('pair-go').addEventListener('click', go);
+}
+
+// showBookmarkModal is shown once, on the post-pairing load, nudging the user
+// to save the device URL (the browser's only "remember"). Non-blocking overlay.
+function showBookmarkModal() {
+    pairUI._injectStyle();
+    const url = location.href;
+    const isMac = /Mac|iPhone|iPad/.test(navigator.platform || navigator.userAgent || '');
+    const shortcut = isMac ? '⌘D' : 'Ctrl+D';
+
+    const bg = document.createElement('div');
+    bg.className = 'pair-modal-bg';
+    const modal = document.createElement('div');
+    modal.className = 'pair-modal';
+    modal.innerHTML =
+        `<h3>Paired</h3>` +
+        `<p>Save this link to reconnect instantly — no code needed next time:</p>` +
+        `<div class="pair-url" id="pair-url"></div>` +
+        `<div class="pair-row"><button class="pair-btn" id="pair-copy">Copy link</button>` +
+        `<span style="font-size:12px;color:#888">or press ${shortcut} to bookmark</span></div>` +
+        `<p class="pair-priv">This link connects straight to the device — keep it private.</p>` +
+        `<div class="pair-row" style="justify-content:flex-end"><button class="pair-btn" id="pair-done">Done</button></div>`;
+    bg.appendChild(modal);
+    document.body.appendChild(bg);
+    document.getElementById('pair-url').textContent = url;
+    const copyBtn = document.getElementById('pair-copy');
+    copyBtn.addEventListener('click', async () => {
+        try { await navigator.clipboard.writeText(url); copyBtn.textContent = 'Copied'; }
+        catch (e) { copyBtn.textContent = 'Copy failed — select the link above'; }
+    });
+    const close = () => { try { document.body.removeChild(bg); } catch (e) {} };
+    document.getElementById('pair-done').addEventListener('click', close);
+    bg.addEventListener('click', (e) => { if (e.target === bg) close(); });
+}
+
 // Initialize — but only in the top-level window, not inside the device iframe.
 // If bootstrap.html accidentally loads inside the iframe (e.g. due to a redirect
 // that escapes the /__device__/ scope), skip initialization to avoid a second
@@ -1808,10 +2128,23 @@ class BitBangConnection {
     }
 
     const pathParts = window.location.pathname.split('/').filter(Boolean);
+
+    // Post-pairing bookmark nudge: shown once on the direct-flow load we just
+    // navigated to after a successful pairing (non-blocking overlay).
+    if (sessionStorage.getItem('bitbang_just_paired')) {
+        sessionStorage.removeItem('bitbang_just_paired');
+        try { showBookmarkModal(); } catch (e) {}
+    }
+
+    // Routing: a bare 6-digit path is a pairing code → run code exchange; an
+    // empty path shows the pairing-code input; anything else is a device URL
+    // handled by the direct flow below.
+    if (pathParts.length === 1 && PAIR_CODE_RE.test(pathParts[0])) {
+        await runPairingFlow(pathParts[0]);
+        return;
+    }
     if (pathParts.length === 0) {
-        const el = document.getElementById('status');
-        el.textContent = 'No device ID specified';
-        el.classList.add('error');
+        showPairingInput();
         return;
     }
 

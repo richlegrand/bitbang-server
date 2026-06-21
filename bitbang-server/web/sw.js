@@ -334,9 +334,11 @@ function getCookieHeader(jarKey, requestPath) {
 // Keep in sync with the signaling server's route table in
 // cmd/signaling/main.go.
 function isServerEndpoint(pathname) {
-    return pathname === '/status'
+    return pathname === '/'
+        || pathname === '/status'
         || pathname.startsWith('/ws/')
-        || pathname.startsWith('/__bitbang__/');
+        || pathname.startsWith('/__bitbang__/')
+        || /^\/\d{6}$/.test(pathname);
 }
 
 self.addEventListener('fetch', (event) => {

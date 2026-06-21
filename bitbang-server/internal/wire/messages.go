@@ -191,15 +191,15 @@ type PairRequest struct {
 	ICEServers []ICEServer `json:"ice_servers,omitempty"`
 }
 
-// PairApproved is sent by the device (after the operator confirms the
-// out-of-band SAS) to release the pairing. The server forwards the
-// payload to the originating connector so it can save the UID +
-// access_code pair for future direct connects.
+// PairApproved is a bare, non-secret "approved" ack the device sends over
+// signaling after the operator confirms the out-of-band SAS. The server
+// forwards it to the originating connector. The actual credentials
+// (uid, public_key, access_code) are delivered peer-to-peer over the
+// SAS-verified WebRTC data channel — never over signaling — so the server
+// can neither read nor alter them.
 type PairApproved struct {
-	Type       string `json:"type"` // "pair_approved"
-	ClientID   string `json:"client_id"`
-	UID        string `json:"uid"`
-	AccessCode string `json:"access_code"`
+	Type     string `json:"type"` // "pair_approved"
+	ClientID string `json:"client_id"`
 }
 
 // PairRejected is sent by the device to abort a pairing in progress.

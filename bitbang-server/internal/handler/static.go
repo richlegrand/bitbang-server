@@ -59,12 +59,10 @@ func Static(staticDir string) http.HandlerFunc {
 			return
 		}
 
-		// /<uid> or /<uid>/<subpath>
+		// /, /<uid>, /<uid>/<subpath>, or /<6-digit pair code> —
+		// all fall through to bootstrap.html; the SPA router picks
+		// the right state from the path.
 		trimmed := strings.TrimPrefix(path, "/")
-		if trimmed == "" {
-			http.NotFound(w, r)
-			return
-		}
 		first := trimmed
 		if i := strings.IndexByte(trimmed, '/'); i >= 0 {
 			first = trimmed[:i]
