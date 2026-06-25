@@ -84,10 +84,10 @@ type ClientConn struct {
 	BrowserIP string
 
 	// ForceRelay reflects the ?relay query flag from the browser, captured
-	// when the client sent its "request" message. When true, the server
-	// includes TURN credentials in the offer at relay time (no withholding);
-	// when false, TURN is withheld until the browser explicitly asks via
-	// RequestICE.
+	// when the client sent its "request" message. Under single-phase ICE the
+	// server stamps TURN credentials on the offer either way; ForceRelay is
+	// carried through for the pairing flow and so the connector knows to skip
+	// the relay-candidate trickle delay (relay-only by request).
 	ForceRelay bool
 
 	writeMu sync.Mutex

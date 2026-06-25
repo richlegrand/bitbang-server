@@ -81,17 +81,6 @@ type Offer struct {
 	DevicePubkey    string            `json:"device_pubkey,omitempty"`
 }
 
-// ICEServersPush carries TURN credentials to a browser after it has
-// requested them via RequestICE (or, for ?relay-forced flows, attached
-// to the initial offer instead). TURNUnavailable reflects the TURN
-// provider's capacity gate — when true, ICEServers is empty and the
-// browser should surface a "relay at capacity" banner.
-type ICEServersPush struct {
-	Type            string      `json:"type"` // "ice_servers"
-	ICEServers      []ICEServer `json:"ice_servers,omitempty"`
-	TURNUnavailable bool        `json:"turn_unavailable,omitempty"`
-}
-
 // PairInit is sent by a connector to a pairing endpoint with a 6-digit
 // code. The server looks the code up (with a built-in 3-second delay,
 // constant-time regardless of outcome) and either routes onward to the

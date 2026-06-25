@@ -224,12 +224,15 @@ func (d *Deps) deviceRelay(conn *registry.DeviceConn) {
 				d.Log.Warn("device sent invalid offer", "uid", conn.UID, "err", err)
 				continue
 			}
-			// Withhold TURN from the initial offer unless the browser asked
-			// for ?relay. The browser tries direct-only first; if its
-			// fallback timer fires, it asks for TURN via "request_ice"
-			// (handled in client_ws.go). This biases ICE toward direct
-			// peer-to-peer instead of losing the race to relay.
-			servers, unavailable := d.iceForClient(conn, env.ClientID, !client.ForceRelay)
+			// Single-phase ICE: stamp TURN credentials on the offer up
+			// front (capacity-gated at allocate time, via CredentialsFor).
+			// The connector gathers host + srflx + relay but delays
+			// trickling its relay candidate by ~messageTimeoutMs, so a
+			// direct pair settles first and relay is only used on fallback
+			// — with no ice_restart round trip. ?relay just tells the
+			// connector to skip that delay; the server stamps creds either
+			// way. The device side stays STUN-only (single relay).
+			servers, unavailable := d.iceForClient(conn, env.ClientID, false)
 			offer.ICEServers = servers
 			offer.TURNUnavailable = unavailable
 			// Hand the browser the device's pubkey alongside the SDP so it
@@ -269,24 +272,21 @@ func (d *Deps) deviceRelay(conn *registry.DeviceConn) {
 // Priority:
 //  1. Device-supplied ICE override (BYO TURN) always wins — the operator
 //     configured it deliberately, and withholding would defeat the purpose.
-//  2. If withhold is true (default, browser hasn't asked for TURN yet),
-//     return STUN-only. The browser tries direct ICE (host + srflx) without
-//     allocating a relay; ICE re-runs with TURN added after the browser
-//     sends "request_ice" via client_ws.
-//  3. Otherwise, call the TURN provider for server-managed credentials.
-//
-// withhold lets the offer relay skip TURN by default while still allowing
-// the ?relay debug flag to short-circuit to immediate TURN issuance.
+//  2. If withhold is true, return STUN-only (no relay allocation). Under
+//     single-phase ICE this is the device side: the device never allocates
+//     its own relay — it rides the connector's relay (single relay) — so it
+//     only ever needs host + srflx. The pairing handshake also uses this.
+//  3. Otherwise (the connector's offer relay), call the TURN provider for
+//     server-managed credentials, stamped on the offer up front and
+//     capacity-gated at allocate time.
 func (d *Deps) iceForClient(device *registry.DeviceConn, clientID string, withhold bool) ([]wire.ICEServer, bool) {
 	if len(device.ICEServers) > 0 {
 		return device.ICEServers, false
 	}
 	if withhold {
-		// Phase 1: hand out STUN only. The browser gathers host + srflx and
-		// tries direct peer-to-peer first; STUN creates no relay allocation,
-		// so srflx-capable peers connect without ever counting against TURN.
-		// TURN is withheld until the browser's fallback timer fires a
-		// "request_ice" (handled in client_ws.go).
+		// STUN only: gather host + srflx, allocate no relay. The connector
+		// (which got TURN creds on the offer) does all the relay allocation;
+		// this side rides it.
 		return d.TURN.StunServers(), false
 	}
 	return d.TURN.CredentialsFor(clientID)

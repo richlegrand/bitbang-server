@@ -482,17 +482,11 @@ class BitBangConnection {
             this.ws.onmessage = async (event) => {
                 const msg = JSON.parse(event.data);
                 if (msg.type === 'offer') {
-                    // A second offer on an established PC is the device's
-                    // ICE-restart re-offer (TURN-withhold fallback): renegotiate
-                    // in place so we re-answer and gather relay candidates from
-                    // the TURN creds we already added via setConfiguration. The
-                    // connect promise resolved on the first offer — leave it be.
+                    // Single-phase ICE: the device sends exactly one offer per
+                    // session (TURN creds are stamped on it up front, no ICE
+                    // restart). A second offer is unexpected — ignore it.
                     if (this.pc && this.remoteDescriptionSet) {
-                        try {
-                            await this.handleRenegotiationOffer(msg);
-                        } catch (e) {
-                            console.warn('[Bootstrap] ICE-restart renegotiation failed:', e);
-                        }
+                        console.warn('[Bootstrap] unexpected second offer on an established PC — ignoring');
                         return;
                     }
                     clearTimeout(offerTimeout);
@@ -505,8 +499,6 @@ class BitBangConnection {
                     resolve();
                 } else if (msg.type === 'candidate') {
                     this.handleRemoteCandidate(msg.candidate);
-                } else if (msg.type === 'ice_servers') {
-                    await this._handleICEServersPush(msg);
                 } else if (msg.type === 'error') {
                     clearTimeout(offerTimeout);
                     if (msg.message === 'device_preempted') {
@@ -527,26 +519,6 @@ class BitBangConnection {
                 reject(new Error('WebSocket connection failed'));
             };
         });
-    }
-
-    // Handle the device's ICE-restart re-offer (TURN-withhold fallback).
-    // Reuse the existing PC — it already has the TURN servers added by
-    // _handleICEServersPush, so creating the answer re-gathers ICE and this
-    // time produces relay candidates, which trickle to the device via the
-    // existing onicecandidate handler. No re-verify: an ICE restart leaves
-    // DTLS (and the verified fingerprint) unchanged, so we skip the encrypted
-    // payload and flag the answer so the device applies it without verifying.
-    async handleRenegotiationOffer(msg) {
-        if (this.debug) console.log('[Bootstrap] ICE-restart re-offer — renegotiating to add relay');
-        await this.pc.setRemoteDescription({ type: 'offer', sdp: msg.sdp });
-        const answer = await this.pc.createAnswer();
-        await this.pc.setLocalDescription(answer);
-        this.ws.send(JSON.stringify({
-            type: 'answer',
-            uid: this.uid,
-            sdp: this.pc.localDescription.sdp,
-            ice_restart: true,
-        }));
     }
 
     async handleOffer(msg) {
@@ -621,22 +593,12 @@ class BitBangConnection {
         // Flush buffered local candidates
         this.candidateQueue.drainLocal(m => this.ws.send(JSON.stringify(m)));
 
-        // Start the TURN-withhold fallback timers. After MESSAGE_TIMEOUT_MS,
-        // if the connection still isn't up, show the user a friendly
-        // "Negotiating connection..." banner. After another MESSAGE_TIMEOUT_MS,
-        // silently ask the server for TURN credentials.
-        //
-        // ?norelay: skip the fallback entirely — connection either works
-        // direct or fails. ?relay: server already attached TURN to the offer
-        // and the connection should converge quickly; still arm the
-        // reassurance timer in case it doesn't.
-        const params = new URLSearchParams(window.location.search);
-        const noRelay = params.has('norelay');
+        // Reassurance banner: if the connection still isn't up after
+        // MESSAGE_TIMEOUT_MS, show "Negotiating connection..." so the user
+        // knows the page hasn't stalled. Under single-phase ICE the relay
+        // candidate trickles on its own after the same delay, so there is no
+        // separate escalation step to arm.
         this._reassureTimer = setTimeout(() => this._reassureUser(), MESSAGE_TIMEOUT_MS);
-        if (!noRelay) {
-            // Phase 2 timer is armed inside _reassureUser so it always
-            // follows phase 1.5. Nothing to do here.
-        }
     }
 
     createPeerConnection(iceServers) {
@@ -665,9 +627,8 @@ class BitBangConnection {
         pc.onconnectionstatechange = () => {
             if (this.debug) console.log(`[Bootstrap] connectionState -> ${pc.connectionState}`);
             if (pc.connectionState === 'connected') {
-                // Cancel any pending TURN-withhold fallback timers; the
-                // connection is up and we no longer need to escalate.
-                this._clearFallbackTimers();
+                // Connection is up — cancel the "negotiating" reassurance banner.
+                this._clearReassureTimer();
                 this._printDebug(STATUS.CONNECTED);
                 this.pollConnectionType(pc);
                 if (!this._wasConnected) {
@@ -675,7 +636,7 @@ class BitBangConnection {
                     this._onFirstConnected(pc);
                 }
             } else if (pc.connectionState === 'failed') {
-                this._clearFallbackTimers();
+                this._clearReassureTimer();
                 if (this._wasConnected) {
                     this._handlePostHandshakeFailure();
                 } else {
@@ -717,17 +678,32 @@ class BitBangConnection {
 
         pc.onicecandidate = (event) => {
             if (event.candidate) {
+                const cand = event.candidate.candidate || '';
                 if (this.debug) {
-                    const c = event.candidate.candidate || '';
                     // SDP candidate line: candidate:foundation comp proto prio addr port typ <type> ...
-                    const m = c.match(/typ (\S+)/);
-                    console.log(`[Bootstrap] local candidate: ${m ? m[1] : '?'} ${c}`);
+                    const m = cand.match(/typ (\S+)/);
+                    console.log(`[Bootstrap] local candidate: ${m ? m[1] : '?'} ${cand}`);
                 }
                 const msg = { type: 'candidate', uid: this.uid, candidate: event.candidate };
-                if (this.ws?.readyState === WebSocket.OPEN && this.remoteDescriptionSet) {
-                    this.ws.send(JSON.stringify(msg));
+                const send = () => {
+                    if (this.ws?.readyState === WebSocket.OPEN && this.remoteDescriptionSet) {
+                        this.ws.send(JSON.stringify(msg));
+                    } else {
+                        this.candidateQueue.pushLocal(msg);
+                    }
+                };
+                // Single-phase ICE: TURN creds are stamped on the offer up
+                // front, so we gather a relay candidate immediately. Delay
+                // *trickling* it by MESSAGE_TIMEOUT_MS so a direct (host/srflx)
+                // pair has a head start to win the race; if direct connects
+                // first the relay candidate is never used. host/srflx trickle
+                // immediately. ?relay (forceRelay) is relay-only by policy, so
+                // there is nothing to bias toward — skip the delay.
+                const isRelay = / typ relay /.test(cand);
+                if (isRelay && !forceRelay) {
+                    setTimeout(send, MESSAGE_TIMEOUT_MS);
                 } else {
-                    this.candidateQueue.pushLocal(msg);
+                    send();
                 }
             } else if (this.debug) {
                 console.log('[Bootstrap] local candidate gathering complete');
@@ -881,89 +857,22 @@ class BitBangConnection {
         }
     }
 
-    _clearFallbackTimers() {
+    _clearReassureTimer() {
         if (this._reassureTimer) {
             clearTimeout(this._reassureTimer);
             this._reassureTimer = null;
         }
-        if (this._turnFallbackTimer) {
-            clearTimeout(this._turnFallbackTimer);
-            this._turnFallbackTimer = null;
-        }
     }
 
-    // Phase 1.5 of TURN-withhold fallback. Direct ICE hasn't connected yet.
-    // Show the user a "Negotiating connection..." banner so they know the
-    // page hasn't stalled, and arm phase 2 (request TURN credentials).
+    // Direct ICE hasn't connected within the first timeout window. Show the
+    // user a "Negotiating connection..." banner so they know the page hasn't
+    // stalled. Under single-phase ICE the relay candidate has already been
+    // trickled (or is about to be), so there is nothing to escalate here —
+    // this is purely reassurance UX.
     _reassureUser() {
         this._reassureTimer = null;
         if (this.pc && this.pc.connectionState === 'connected') return;
         this._print(STATUS.NEGOTIATING);
-
-        // ?norelay disables phase 2 entirely; only show the banner.
-        const params = new URLSearchParams(window.location.search);
-        if (params.has('norelay')) return;
-
-        this._turnFallbackTimer = setTimeout(() => this._requestTURNFallback(), MESSAGE_TIMEOUT_MS);
-    }
-
-    // Phase 2. Direct ICE still hasn't connected after the second timeout
-    // window. Ask the signaling server for TURN credentials; it will reply
-    // with an "ice_servers" message that triggers _handleICEServersPush.
-    // No banner change — keep "Negotiating connection..." until either
-    // direct or TURN actually connects. _onFirstConnected handles the
-    // standard "Using temporary relay (TURN)..." banner if TURN wins.
-    _requestTURNFallback() {
-        this._turnFallbackTimer = null;
-        if (this.pc && this.pc.connectionState === 'connected') return;
-        if (this.debug) console.log('[Bootstrap] direct ICE timeout, requesting TURN');
-        try {
-            this.ws.send(JSON.stringify({ type: 'request_ice' }));
-        } catch (e) {
-            console.warn('[Bootstrap] request_ice failed:', e);
-        }
-    }
-
-    // Server pushed TURN credentials in response to a request_ice we sent
-    // (or in response to a ?relay query path). Inject them into the
-    // existing RTCPeerConnection and restart ICE so the relay candidates
-    // get gathered and tried alongside the still-running direct attempts.
-    async _handleICEServersPush(msg) {
-        if (this.debug) console.log('[Bootstrap] received ice_servers push, unavailable=' + !!msg.turn_unavailable);
-        if (msg.turn_unavailable) {
-            this._print('Relay server (TURN) is at capacity — connection may fail.');
-            return;
-        }
-        if (!this.pc) return;
-        const servers = Array.isArray(msg.ice_servers) ? msg.ice_servers : [];
-        if (servers.length === 0) return;
-        this._extractTurnExpiry(servers);
-        // Make the relay creds available to the video PC too: it's negotiated
-        // after the data channel and reads this.iceServers when answering the
-        // device's video offer. Without this it gathers host-only, so a
-        // relay-required path ends up with working data but no video.
-        this.iceServers = (this.iceServers || []).concat(servers);
-        const config = this.pc.getConfiguration();
-        config.iceServers = (config.iceServers || []).concat(servers);
-        try {
-            this.pc.setConfiguration(config);
-            // The device drives the actual ICE restart: the server forwards an
-            // ice_restart trigger, the device re-offers, and handleRenegotiationOffer
-            // re-answers — gathering relay candidates from the creds just added.
-            // A browser-side restartIce() here is inert: we're the answerer, so
-            // it would only take effect on a createOffer() we never call.
-        } catch (e) {
-            console.warn('[Bootstrap] failed to apply TURN credentials:', e);
-        }
-        // If _onFirstConnected already fired before this push arrived
-        // (e.g., the page briefly reached 'connected' on a direct candidate
-        // pair before falling back to relay), its arming branch was skipped
-        // because _turnExpiryMs was still null. Arm the end timers now that
-        // we have an expiry. Idempotent — _clearTurnEndTimers first.
-        if (this._wasConnected && this._usingRelay && this._turnExpiryMs) {
-            this._clearTurnEndTimers();
-            this._armTurnEndTimers();
-        }
     }
 
     // Fired once per session, the first time pc.connectionState reaches

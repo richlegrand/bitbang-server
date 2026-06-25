@@ -155,41 +155,6 @@ func (d *Deps) clientRelay(conn *registry.ClientConn) {
 			}
 			d.Log.Debug("forwarded candidate", "client_id", conn.ClientID, "target", conn.TargetUID)
 
-		case "request_ice":
-			// Browser's direct-only ICE attempt didn't connect within the
-			// fallback window; push TURN credentials so the browser can
-			// add them via setConfiguration + restartIce. This is where
-			// the TURN capacity gate fires — the offer relay never called
-			// CredentialsFor.
-			servers, unavailable := d.TURN.CredentialsFor(conn.ClientID)
-			push := wire.ICEServersPush{
-				Type:            "ice_servers",
-				ICEServers:      servers,
-				TURNUnavailable: unavailable,
-			}
-			if err := conn.SendJSON(push); err != nil {
-				d.Log.Warn("ice_servers push failed", "client_id", conn.ClientID, "err", err)
-				return
-			}
-			d.Log.Info("served TURN credentials",
-				"client_id", conn.ClientID,
-				"target", conn.TargetUID,
-				"unavailable", unavailable,
-				"count", len(servers))
-			// The browser is the answerer and can't re-gather ICE on its own:
-			// tell the device to restart ICE (re-offer) so the browser
-			// re-answers with the relay candidates it gathers from the creds
-			// above. Pointless if TURN is unavailable (no creds to gather).
-			if !unavailable && len(servers) > 0 {
-				if err := device.SendJSON(map[string]any{
-					"type":        "ice_restart",
-					"client_id":   conn.ClientID,
-					"ice_servers": servers,
-				}); err != nil {
-					d.Log.Warn("ice_restart trigger failed", "client_id", conn.ClientID, "err", err)
-				}
-			}
-
 		case "connection_path":
 			// Fire-and-forget telemetry: the client reports the path of an
 			// established (or failed) ICE connection. We bump the matching
