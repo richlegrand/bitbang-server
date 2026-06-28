@@ -2069,6 +2069,111 @@ function showBookmarkModal() {
     bg.addEventListener('click', (e) => { if (e.target === bg) close(); });
 }
 
+// parseDeviceURL parses window.location into the pieces the direct flow
+// needs:
+//
+//   uid              — the 22-char base64url device id (path[0])
+//   code             — the 64-bit access code (URL fragment, up to the
+//                      first `/`)
+//   devicePath       — what the device should serve (URL-path + fragment-
+//                      path concatenated; default `/`)
+//   canonical        — the canonical-form URL string (path + search + hash)
+//   hasFragmentPath  — true when the URL uses the shorthand form
+//                      `/<uid>#<code>/<path>` and the caller should
+//                      redirect to `canonical` to move the path proper
+//
+// Two normalizations happen here so every caller sees the same canonical:
+//
+//  1. Trailing slash on the URL path is preserved (the listener's mux
+//     mounts cap routes with trailing slash — `/proxy/` not `/proxy` —
+//     and a 301 from the listener would lose the /__device__/<sid>
+//     prefix the iframe needs).
+//
+//  2. A bare `host:port` in the fragment-path is a proxy-target shorthand
+//     and gets a trailing slash so the proxied app's relative URLs
+//     resolve from its root; otherwise the listener 301s and the SW has
+//     to chase the redirect.
+//
+// The shorthand parser accepts paths inside the fragment alongside the
+// URL path, concatenating them — e.g. `bitba.ng/<uid>/foo#<code>/bar`
+// → devicePath `/foo/bar`. The access-code alphabet is base64url
+// (`[A-Za-z0-9_-]`) so the first `/` in the fragment unambiguously
+// separates code from path. Assumes a direct-flow URL — caller does the
+// pair-code/empty-path routing first.
+function parseDeviceURL() {
+    const pathParts = window.location.pathname.split('/').filter(Boolean);
+    const uid = pathParts[0];
+
+    let pathFromUrl = '/' + pathParts.slice(1).join('/');
+    if (window.location.pathname.endsWith('/') && pathFromUrl !== '/') {
+        pathFromUrl += '/';
+    }
+
+    const rawFragment = window.location.hash ? window.location.hash.slice(1) : '';
+    const slashAt = rawFragment.indexOf('/');
+    let code, pathFromFragment;
+    if (slashAt >= 0) {
+        code = rawFragment.substring(0, slashAt);
+        pathFromFragment = rawFragment.substring(slashAt);  // keeps leading '/'
+    } else {
+        code = rawFragment;
+        pathFromFragment = '';
+    }
+    if (/^\/[^/]+:\d+$/.test(pathFromFragment)) {
+        pathFromFragment += '/';
+    }
+
+    const urlPathSeg = (pathFromUrl === '/') ? '' : pathFromUrl;
+    const devicePath = (urlPathSeg + pathFromFragment) || '/';
+
+    const canonical = '/' + uid + devicePath
+        + (window.location.search || '')
+        + '#' + code;
+
+    return { uid, code, devicePath, canonical, hasFragmentPath: slashAt >= 0 };
+}
+
+// canonicalizeShorthandURL: if the current URL is the shorthand form
+// `/<uid>#<code>/<path>`, navigate to canonical `/<uid>/<path>#<code>`
+// via location.replace. Returns true if a redirect was issued (caller
+// should return early — navigation will tear down this JS context).
+//
+// location.replace (not history.replaceState) so the canonical URL is
+// the one actually loaded — the SW intercepts iframe fetches cleanly
+// from the start, and history ends up with only the canonical entry,
+// no shorthand to cycle through.
+function canonicalizeShorthandURL() {
+    const pathParts = window.location.pathname.split('/').filter(Boolean);
+    if (pathParts.length < 1) return false;
+    if (pathParts.length === 1 && PAIR_CODE_RE.test(pathParts[0])) return false;
+
+    const parsed = parseDeviceURL();
+    if (!parsed.hasFragmentPath) return false;
+
+    console.log('[Bootstrap] Rearranging URL to canonical form:', parsed.canonical);
+    location.replace(parsed.canonical);
+    return true;
+}
+
+// BFCache restore: Chrome can serve us back from in-memory cache on a
+// fresh-Return navigation without re-executing the IIFE. If the user
+// typed a shorthand URL, the IIFE never runs to canonicalize it.
+// pageshow with persisted=true is fired on BFCache restore — the JS
+// context is still alive, so the listener (registered when the page
+// first loaded) gets to re-check the URL and redirect.
+window.addEventListener('pageshow', (event) => {
+    if (event.persisted) canonicalizeShorthandURL();
+});
+
+// Fragment-only edits in the URL bar — e.g. user has `/<uid>#code`
+// loaded and types `/localhost:8096` onto the end of the fragment — do
+// not trigger a page reload (the path didn't change). The IIFE doesn't
+// re-run; pageshow doesn't fire. Only hashchange fires, so that's where
+// the canonicalization has to happen.
+window.addEventListener('hashchange', () => {
+    canonicalizeShorthandURL();
+});
+
 // Initialize — but only in the top-level window, not inside the device iframe.
 // If bootstrap.html accidentally loads inside the iframe (e.g. due to a redirect
 // that escapes the /__device__/ scope), skip initialization to avoid a second
@@ -2118,62 +2223,12 @@ function showBookmarkModal() {
     // Direct flow (device URL): snippet area is leftover chrome, hide it.
     if (frontPageDiv) frontPageDiv.style.display = 'none';
 
-    const uid = pathParts[0];
-    let pathFromUrl = '/' + pathParts.slice(1).join('/');
-    // Preserve trailing slash from the original pathname. URL parsing
-    // above drops it (filter(Boolean) strips the empty segment after
-    // the last /), but the listener's mux mounts cap routes WITH the
-    // trailing slash ("/proxy/" not "/proxy"). Without this, the iframe
-    // load triggers a 301 from the listener whose Location header
-    // doesn't include the /__device__/<sessionId> prefix — the iframe
-    // ends up navigating to the wrong place.
-    if (window.location.pathname.endsWith('/') && pathFromUrl !== '/') {
-        pathFromUrl += '/';
-    }
+    // Shorthand URL? Redirect to the canonical form and bail — navigation
+    // tears down this JS context. See parseDeviceURL for the parsing/
+    // normalization rules both paths share.
+    if (canonicalizeShorthandURL()) return;
 
-    // The 64-bit access code lives in the URL fragment so the signaling
-    // server never sees it. Browsers also never send fragments to servers,
-    // so even if a user accidentally posts the URL to a server log, the
-    // code part is stripped on first send. The browser bundles it inside
-    // the RSA-OAEP-encrypted verify payload sent to the device.
-    //
-    // We also accept a naively-concatenated path inside the fragment as
-    // a convenience: a user with the URL `https://srv/<uid>#<code>` who
-    // wants the subpath `/foo` can just append `/foo` to get
-    // `https://srv/<uid>#<code>/foo`, and we auto-rearrange to the
-    // canonical `https://srv/<uid>/foo#<code>`. The access-code alphabet
-    // is base64url (`[A-Za-z0-9_-]`) which never contains `/`, so the
-    // first `/` in the fragment unambiguously separates code from path.
-    //
-    // When both a URL path AND a fragment path are present (the user
-    // appended onto an already-canonical URL), we concat them: e.g.
-    // `https://srv/<uid>/foo#<code>/bar` -> devicePath `/foo/bar`.
-    const rawFragment = window.location.hash ? window.location.hash.slice(1) : '';
-    const slashAt = rawFragment.indexOf('/');
-    let code, pathFromFragment;
-    if (slashAt >= 0) {
-        code = rawFragment.substring(0, slashAt);
-        pathFromFragment = rawFragment.substring(slashAt);  // keeps the leading '/'
-    } else {
-        code = rawFragment;
-        pathFromFragment = '';
-    }
-
-    // Concatenate URL path + fragment path. Drop the lone '/' on the
-    // URL side so we don't end up with '//foo'.
-    const urlPathSeg = (pathFromUrl === '/') ? '' : pathFromUrl;
-    const devicePath = (urlPathSeg + pathFromFragment) || '/';
-
-    // Whenever the fragment contributed a path, rewrite the address bar
-    // so a reload / copy / share captures the canonical shape.
-    if (pathFromFragment) {
-        const canonical = '/' + uid + devicePath
-            + (window.location.search || '')
-            + '#' + code;
-        history.replaceState(null, '', canonical);
-        console.log('[Bootstrap] Rearranged URL to canonical form:', canonical);
-    }
-
+    const { uid, devicePath, code } = parseDeviceURL();
     const connection = new BitBangConnection(uid, devicePath, code);
     window.__bitbangConnection = connection;
     await connection.connect();
