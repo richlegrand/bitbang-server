@@ -176,9 +176,17 @@ class CandidateQueue {
 }
 
 class BitBangConnection {
-    constructor(uid, devicePath, code) {
+    constructor(uid, devicePath, code, deviceSearch, deviceHash) {
         this.uid = uid;
         this.devicePath = devicePath || '/';
+        // The proxy target (first path segment, e.g. "localhost:8096"), kept
+        // separately: SPA apps that navigate with origin-absolute paths
+        // (Jellyfin → /web/#/…) drop both the /__device__/<sid> prefix and the
+        // target from the iframe URL, so syncTopURL needs it to reconstruct a
+        // target-prefixed device path for refresh/bookmark.
+        this.target = (devicePath || '/').split('/').filter(Boolean)[0] || '';
+        this.deviceSearch = deviceSearch || '';
+        this.deviceHash = deviceHash || '';
         this.code = code || '';
         this.pc = null;
         this.dataChannel = null;
@@ -1421,7 +1429,7 @@ class BitBangConnection {
             if (event.data?.type === 'bb-navigate') {
                 this.handleNavigateRequest(event.data.path);
             } else if (event.data?.type === 'bb-open-cap') {
-                // The iframe asks us to land on /<uid><path>#<code>.
+                // The iframe asks us to land on /<uid>#<code><path>.
                 // The code lives in our fragment (never sent to the
                 // iframe), and the iframe sandbox forbids top-frame
                 // navigation, so both URL composition and navigation
@@ -1432,7 +1440,7 @@ class BitBangConnection {
                 // newTab: false → navigate this same tab (proxy form's
                 // Go button — the proxy tab becomes the target tab).
                 const path = event.data.path || '/';
-                const url = '/' + this.uid + path + '#' + this.code;
+                const url = '/' + this.uid + '#' + this.code + path;
                 if (event.data.newTab === false) {
                     window.location.href = url;
                 } else {
@@ -1663,10 +1671,142 @@ class BitBangConnection {
                     setTimeout(() => obs.disconnect(), 5000);
                 }
             }
+
+            // Mirror the iframe's location into the address bar after every
+            // navigation so refresh/bookmark land back on the same page. The
+            // iframe is same-origin (/__device__/… on this origin), so we can
+            // read its location and hook its navigation. Re-attach per load: a
+            // full navigation gives the iframe a fresh window/history.
+            //
+            // hashchange/popstate cover real hash writes and back/forward.
+            // But SPA routers (Jellyfin's React-Router hash history, etc.)
+            // navigate via history.pushState — which fires NEITHER event even
+            // when it changes the hash — so we also wrap pushState/replaceState
+            // to catch forward in-app navigation.
+            // Swallow errors: this runs inside the iframe's own pushState, so
+            // a throw here (e.g. the browser's replaceState rate limit) must
+            // not break the app's routing.
+            const sync = (src) => {
+                if (this.debug) { try { console.log('[Bootstrap] iframe nav', src, '->', iframe.contentWindow.location.href); } catch (e) {} }
+                try { this.syncTopURL(); } catch (e) {}
+            };
+            try {
+                const win = iframe.contentWindow;
+                win.addEventListener('hashchange', () => sync('hashchange'));
+                win.addEventListener('popstate', () => sync('popstate'));
+                for (const m of ['pushState', 'replaceState']) {
+                    const orig = win.history[m];
+                    win.history[m] = function (...args) {
+                        const r = orig.apply(this, args);
+                        sync(m);
+                        return r;
+                    };
+                }
+            } catch (e) {}
+            sync('load');
+
+            this.interceptNewTabLinks(iframe);
         };
 
-        iframe.src = `/__device__/${this.sessionId}${this.devicePath}`;
+        iframe.src = `/__device__/${this.sessionId}${this.devicePath}${this.deviceSearch}${this.deviceHash}`;
         document.body.appendChild(iframe);
+    }
+
+    // Keep the <uid>#<code> session "sticky" for target=_blank links. A proxied
+    // app that opens an absolute path in a new tab (e.g. OctoPrint's Reverse
+    // Proxy Test → /reverse_proxy_test/) would otherwise open a bare bitba.ng
+    // URL with no device identity → the new tab can't connect. We intercept the
+    // click and open the bitbang-form URL instead, so the new tab boots,
+    // connects to the same device, and lands on that path. Re-attached per
+    // iframe load (a full navigation gives a fresh document).
+    interceptNewTabLinks(iframe) {
+        let doc;
+        try { doc = iframe.contentDocument; } catch (e) { return; }
+        if (!doc) return;
+        doc.addEventListener('click', (e) => {
+            if (e.defaultPrevented || e.button !== 0 || e.metaKey || e.ctrlKey || e.shiftKey || e.altKey) return;
+            const a = e.target && e.target.closest && e.target.closest('a[href]');
+            if (!a || a.target !== '_blank' || a.hasAttribute('download')) return;
+            let u;
+            try { u = new URL(a.href, iframe.contentWindow.location.href); } catch (_) { return; }
+            if (u.origin !== window.location.origin) return;   // external link → open normally
+
+            // Map the link's app-absolute path to a device path: strip our
+            // /__device__/<sid> prefix if present, else prepend the proxy target.
+            const pfx = `/__device__/${this.sessionId}`;
+            let p = u.pathname;
+            if (p === pfx) p = '/';
+            else if (p.startsWith(pfx + '/')) p = p.slice(pfx.length);
+            const tseg = this.target ? '/' + this.target : '';
+            if (tseg && p !== tseg && !p.startsWith(tseg + '/')) p = tseg + (p === '/' ? '/' : p);
+
+            const top = '/' + this.uid + (window.location.search || '')
+                + '#' + this.code + (p || '/') + u.search + u.hash;
+            e.preventDefault();
+            if (this.debug) console.log('[Bootstrap] new-tab link → bitbang URL', top);
+            window.open(top, '_blank');
+        }, true);
+    }
+
+    // Normalise the device-frame iframe's current location into
+    // {devicePath, deviceSearch, deviceHash}, matching parseDeviceURL's output.
+    //
+    // The iframe may sit at the prefixed proxy URL
+    // (/__device__/<sid>/<target>/path) OR — for apps that navigate with
+    // origin-absolute paths (Jellyfin: /web/#/movies) — at a bare /path with
+    // neither the prefix nor the target. Either way we reconstruct a
+    // target-prefixed device path. Returns null if the iframe isn't readable.
+    iframeDeviceURL() {
+        const iframe = document.getElementById('device-frame');
+        if (!iframe) return null;
+        let loc;
+        try { loc = iframe.contentWindow.location; } catch (e) { return null; }
+
+        const pfx = `/__device__/${this.sessionId}`;
+        let p = loc.pathname;
+        if (p === pfx) p = '/';
+        else if (p.startsWith(pfx + '/')) p = p.slice(pfx.length);
+        const tseg = this.target ? '/' + this.target : '';
+        if (tseg && p !== tseg && !p.startsWith(tseg + '/')) {
+            p = tseg + (p === '/' ? '/' : p);
+        }
+        p = p || '/';
+        if (/^\/[^/]+:\d+$/.test(p)) p += '/';   // bare host:port → trailing slash (matches parseDeviceURL)
+        return { devicePath: p, deviceSearch: loc.search, deviceHash: loc.hash };
+    }
+
+    // True when the iframe is already displaying what the top-level address bar
+    // says. Used to tell back/forward (which restores BOTH the iframe and the
+    // top fragment, so they already agree) apart from a manual address-bar edit
+    // (where only the top fragment changed). Order-independent: reads the
+    // iframe's live, already-restored location rather than relying on the
+    // popstate-vs-hashchange firing order.
+    iframeShowsTopURL() {
+        const n = this.iframeDeviceURL();
+        if (!n) return false;
+        const p = parseDeviceURL();
+        return n.devicePath === p.devicePath
+            && n.deviceSearch === p.deviceSearch
+            && n.deviceHash === p.deviceHash;
+    }
+
+    // Mirror the iframe's current location into the top-level address bar so
+    // refresh/bookmark land back on the same page. The device URL
+    // (path?query#hash) rides in the fragment after the access code, so nothing
+    // here reaches the signaling server. replaceState (not pushState) keeps a
+    // single history entry and does not fire `hashchange`, so this never trips
+    // the reload-on-edit handler.
+    syncTopURL() {
+        const n = this.iframeDeviceURL();
+        if (!n) return;
+        this.devicePath = n.devicePath;
+        this.deviceSearch = n.deviceSearch;
+        this.deviceHash = n.deviceHash;
+        const tail = (n.devicePath === '/' && !n.deviceSearch && !n.deviceHash)
+            ? '' : n.devicePath + n.deviceSearch + n.deviceHash;
+        const top = '/' + this.uid + (window.location.search || '') + '#' + this.code + tail;
+        if (this.debug) console.log('[Bootstrap] syncTopURL ->', top);
+        history.replaceState(null, '', top);
     }
 
     wireStreams(iframe) {
@@ -2058,106 +2198,85 @@ function showBookmarkModal() {
 // parseDeviceURL parses window.location into the pieces the direct flow
 // needs:
 //
-//   uid              — the 22-char base64url device id (path[0])
-//   code             — the 64-bit access code (URL fragment, up to the
-//                      first `/`)
-//   devicePath       — what the device should serve (URL-path + fragment-
-//                      path concatenated; default `/`)
-//   canonical        — the canonical-form URL string (path + search + hash)
-//   hasFragmentPath  — true when the URL uses the shorthand form
-//                      `/<uid>#<code>/<path>` and the caller should
-//                      redirect to `canonical` to move the path proper
+//   uid          — the 22-char base64url device id (path[0])
+//   code         — the access code (start of the URL fragment)
+//   devicePath   — the device URL path the iframe loads (default `/`)
+//   deviceSearch — the device URL's own query string (leading `?`, or '')
+//   deviceHash   — the device URL's fragment / SPA route (leading `#`, or '')
 //
-// Two normalizations happen here so every caller sees the same canonical:
+// The whole device URL lives in the fragment, after the code:
 //
-//  1. Trailing slash on the URL path is preserved (the listener's mux
-//     mounts cap routes with trailing slash — `/proxy/` not `/proxy` —
-//     and a 301 from the listener would lose the /__device__/<sid>
-//     prefix the iframe needs).
+//   /<uid>#<code>/localhost:8096/web/#/livetv?collectionType=livetv
+//          └code┘└──────────── device URL ───────────────────────┘
 //
-//  2. A bare `host:port` in the fragment-path is a proxy-target shorthand
-//     and gets a trailing slash so the proxied app's relative URLs
-//     resolve from its root; otherwise the listener 301s and the SW has
-//     to chase the redirect.
+// The fragment after the code is, verbatim, the device's own URL
+// (`/path?query#hash`). The access-code alphabet is base64url
+// (`[A-Za-z0-9_-]`, no `/ ? #`), so the first such character ends the
+// code and begins the device URL. Consequences:
 //
-// The shorthand parser accepts paths inside the fragment alongside the
-// URL path, concatenating them — e.g. `bitba.ng/<uid>/foo#<code>/bar`
-// → devicePath `/foo/bar`. The access-code alphabet is base64url
-// (`[A-Za-z0-9_-]`) so the first `/` in the fragment unambiguously
-// separates code from path. Assumes a direct-flow URL — caller does the
+//   - Nothing of the path/query/route reaches the signaling server: the
+//     fragment is never transmitted in an HTTP request, even on refresh.
+//   - There is no shorthand to rearrange — the typed URL is already
+//     canonical, so no reorder/redirect step is needed.
+//   - A bare `host:port` target still gets a trailing slash so the
+//     proxied app's relative URLs resolve from its root.
+//
+// Bitbang flags (?debug, ?relay, …) live in the real query string,
+// between `/<uid>` and the `#`, and are read separately via
+// location.search. Assumes a direct-flow URL — caller does the
 // pair-code/empty-path routing first.
 function parseDeviceURL() {
-    const pathParts = window.location.pathname.split('/').filter(Boolean);
-    const uid = pathParts[0];
+    const uid = window.location.pathname.split('/').filter(Boolean)[0];
 
-    let pathFromUrl = '/' + pathParts.slice(1).join('/');
-    if (window.location.pathname.endsWith('/') && pathFromUrl !== '/') {
-        pathFromUrl += '/';
+    const frag = window.location.hash ? window.location.hash.slice(1) : '';
+    let i = 0;
+    while (i < frag.length && /[A-Za-z0-9_-]/.test(frag[i])) i++;
+    const code = frag.slice(0, i);
+    const rest = frag.slice(i);            // '' or `/path?query#hash`
+
+    let devicePath = '/', deviceSearch = '', deviceHash = '';
+    if (rest) {
+        const h = rest.indexOf('#');
+        deviceHash = h >= 0 ? rest.slice(h) : '';
+        const beforeHash = h >= 0 ? rest.slice(0, h) : rest;
+        const q = beforeHash.indexOf('?');
+        deviceSearch = q >= 0 ? beforeHash.slice(q) : '';
+        devicePath = (q >= 0 ? beforeHash.slice(0, q) : beforeHash) || '/';
     }
+    if (/^\/[^/]+:\d+$/.test(devicePath)) devicePath += '/';
 
-    const rawFragment = window.location.hash ? window.location.hash.slice(1) : '';
-    const slashAt = rawFragment.indexOf('/');
-    let code, pathFromFragment;
-    if (slashAt >= 0) {
-        code = rawFragment.substring(0, slashAt);
-        pathFromFragment = rawFragment.substring(slashAt);  // keeps leading '/'
-    } else {
-        code = rawFragment;
-        pathFromFragment = '';
-    }
-    if (/^\/[^/]+:\d+$/.test(pathFromFragment)) {
-        pathFromFragment += '/';
-    }
-
-    const urlPathSeg = (pathFromUrl === '/') ? '' : pathFromUrl;
-    const devicePath = (urlPathSeg + pathFromFragment) || '/';
-
-    const canonical = '/' + uid + devicePath
-        + (window.location.search || '')
-        + '#' + code;
-
-    return { uid, code, devicePath, canonical, hasFragmentPath: slashAt >= 0 };
+    return { uid, code, devicePath, deviceSearch, deviceHash };
 }
 
-// canonicalizeShorthandURL: if the current URL is the shorthand form
-// `/<uid>#<code>/<path>`, navigate to canonical `/<uid>/<path>#<code>`
-// via location.replace. Returns true if a redirect was issued (caller
-// should return early — navigation will tear down this JS context).
+// The pathname is always `/<uid>`, so a top-frame nav that changes only the
+// device URL fires `hashchange` without reloading. The cause is told apart by
+// whether the iframe is ALREADY showing the new URL:
+//   - Manual address-bar edit → iframe NOT yet there → reload (a fresh
+//     bootstrap re-parses the device URL and rebuilds the iframe).
+//   - Back/forward that restored a top-frame fragment entry → the browser also
+//     restored the iframe, so it already matches → do nothing.
+//   - In-iframe nav → mirrored to the bar via replaceState, which does not fire
+//     `hashchange`, so it never reaches here. (Normal in-app back/forward is
+//     iframe-driven and likewise never reaches this handler.)
 //
-// location.replace (not history.replaceState) so the canonical URL is
-// the one actually loaded — the SW intercepts iframe fetches cleanly
-// from the start, and history ends up with only the canonical entry,
-// no shorthand to cycle through.
-function canonicalizeShorthandURL() {
-    const pathParts = window.location.pathname.split('/').filter(Boolean);
-    if (pathParts.length < 1) return false;
-    if (pathParts.length === 1 && PAIR_CODE_RE.test(pathParts[0])) return false;
-
-    const parsed = parseDeviceURL();
-    if (!parsed.hasFragmentPath) return false;
-
-    console.log('[Bootstrap] Rearranging URL to canonical form:', parsed.canonical);
-    location.replace(parsed.canonical);
-    return true;
-}
-
-// BFCache restore: Chrome can serve us back from in-memory cache on a
-// fresh-Return navigation without re-executing the IIFE. If the user
-// typed a shorthand URL, the IIFE never runs to canonicalize it.
-// pageshow with persisted=true is fired on BFCache restore — the JS
-// context is still alive, so the listener (registered when the page
-// first loaded) gets to re-check the URL and redirect.
-window.addEventListener('pageshow', (event) => {
-    if (event.persisted) canonicalizeShorthandURL();
-});
-
-// Fragment-only edits in the URL bar — e.g. user has `/<uid>#code`
-// loaded and types `/localhost:8096` onto the end of the fragment — do
-// not trigger a page reload (the path didn't change). The IIFE doesn't
-// re-run; pageshow doesn't fire. Only hashchange fires, so that's where
-// the canonicalization has to happen.
+// `iframeShowsTopURL` (reads the iframe's live location) is the discriminator —
+// NOT the event type: a manual address-bar edit fires `popstate` as well as
+// `hashchange`, so popstate cannot be used to detect a traversal. The decision
+// is deferred to a microtask only so it runs once after the paired events.
 window.addEventListener('hashchange', () => {
-    canonicalizeShorthandURL();
+    queueMicrotask(() => {
+        const conn = window.__bitbangConnection;
+        if (conn && conn.iframeShowsTopURL()) return;   // back/forward restored it; nothing to do
+        // Manual address-bar edit (or back/forward to a top entry the iframe
+        // isn't showing): reload. A fresh bootstrap re-parses the device URL and
+        // rebuilds the iframe with an intact /__device__/ referer chain. We
+        // deliberately do NOT re-point the iframe in place — navigating it to
+        // the prefixed URL makes the SPA redirect to a bare origin path the SW
+        // can't re-route (→ bootstrap.html loads inside the iframe → blank
+        // hang). Reload is heavier but robust; manual edits are rare.
+        if (conn && conn.debug) console.log('[Bootstrap] address-bar edit → reload');
+        location.reload();
+    });
 });
 
 // Initialize — but only in the top-level window, not inside the device iframe.
@@ -2209,13 +2328,8 @@ window.addEventListener('hashchange', () => {
     // Direct flow (device URL): snippet area is leftover chrome, hide it.
     if (frontPageDiv) frontPageDiv.style.display = 'none';
 
-    // Shorthand URL? Redirect to the canonical form and bail — navigation
-    // tears down this JS context. See parseDeviceURL for the parsing/
-    // normalization rules both paths share.
-    if (canonicalizeShorthandURL()) return;
-
-    const { uid, devicePath, code } = parseDeviceURL();
-    const connection = new BitBangConnection(uid, devicePath, code);
+    const { uid, devicePath, deviceSearch, deviceHash, code } = parseDeviceURL();
+    const connection = new BitBangConnection(uid, devicePath, code, deviceSearch, deviceHash);
     window.__bitbangConnection = connection;
     await connection.connect();
 })();
