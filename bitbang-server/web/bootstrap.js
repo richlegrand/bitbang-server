@@ -303,12 +303,36 @@ class BitBangConnection {
             throw new Error('Service Worker not supported');
         }
 
+        // Capture whether a SW already controlled us BEFORE registering.
+        // controllerchange fires on first-install too (controller goes from
+        // null to the new SW), but we only want to reload when an *update*
+        // takes over — i.e. when a previous controller was already running.
+        const hadController = !!navigator.serviceWorker.controller;
+
         const reg = await navigator.serviceWorker.register('/__bitbang__/sw.js', {
             scope: '/',
             updateViaCache: 'none',
         });
-        // Force check for SW update on every page load
+        // Force check for SW update on every page load.
         reg.update();
+
+        // When a new SW takes over an existing controller, show a small
+        // banner offering a reload — don't auto-reload, since a mid-session
+        // refresh blows away shell scrollback, half-typed proxied-app form
+        // input, etc. The new SW already serves fresh sw.js; the banner is
+        // just the user's signal to pull in fresh bootstrap.js/.html.
+        // skipWaiting() in sw.js's install handler is what makes the
+        // takeover happen without prompting.
+        navigator.serviceWorker.addEventListener('controllerchange', () => {
+            if (!hadController) return;             // first install, not an update
+            showUpdateBanner();
+        });
+
+        // Long-lived sessions (a shell sitting open for hours) won't navigate
+        // and so won't trigger the browser's default update check. Poll every
+        // 30 min so a deploy reaches them within the window. A single fetch
+        // of sw.js per half hour is negligible bandwidth.
+        setInterval(() => reg.update().catch(() => {}), 30 * 60 * 1000);
 
         // Handle proxy requests from SW
         navigator.serviceWorker.addEventListener('message', (event) => {
@@ -2160,6 +2184,58 @@ function showPairingInput() {
     input.addEventListener('input', sync);
     input.addEventListener('keydown', (e) => { if (e.key === 'Enter') go(); });
     button.addEventListener('click', go);
+}
+
+// showUpdateBanner renders a small fixed-position banner at the top of
+// the viewport announcing that a new bootstrap version is available.
+// Triggered from the SW controllerchange handler when a deploy lands
+// mid-session. The user clicks Reload to refresh into the new code, or
+// dismisses to keep their current session state (shell scrollback,
+// half-typed proxied-app input, in-progress downloads, etc.).
+//
+// Idempotent — if the banner is already showing (a second deploy
+// arrives before the user has acted on the first), the call is a no-op.
+function showUpdateBanner() {
+    if (document.getElementById('bb-update-banner')) return;
+
+    const bar = document.createElement('div');
+    bar.id = 'bb-update-banner';
+    bar.style.cssText = [
+        'position:fixed', 'top:0', 'left:0', 'right:0', 'z-index:9999',
+        'background:#f4f4f4', 'border-bottom:1px solid #ddd',
+        'padding:8px 14px',
+        'font-family:-apple-system,"Segoe UI",Roboto,sans-serif',
+        'font-size:13px', 'color:#333',
+        'display:flex', 'align-items:center', 'gap:12px',
+        'box-shadow:0 1px 3px rgba(0,0,0,0.08)',
+    ].join(';');
+
+    const text = document.createElement('span');
+    text.textContent = 'A new version is available.';
+    text.style.flex = '1';
+
+    const reloadBtn = document.createElement('button');
+    reloadBtn.textContent = 'Reload';
+    reloadBtn.style.cssText = [
+        'border:none', 'background:#111', 'color:#fff',
+        'font-size:13px', 'padding:4px 12px', 'border-radius:4px',
+        'cursor:pointer',
+    ].join(';');
+    reloadBtn.addEventListener('click', () => window.location.reload());
+
+    const dismissBtn = document.createElement('button');
+    dismissBtn.textContent = '×';
+    dismissBtn.setAttribute('aria-label', 'Dismiss');
+    dismissBtn.style.cssText = [
+        'border:none', 'background:none', 'font-size:18px',
+        'color:#888', 'cursor:pointer', 'line-height:1', 'padding:0 4px',
+    ].join(';');
+    dismissBtn.addEventListener('click', () => bar.remove());
+
+    bar.appendChild(text);
+    bar.appendChild(reloadBtn);
+    bar.appendChild(dismissBtn);
+    document.body.appendChild(bar);
 }
 
 // showBookmarkModal is shown once, on the post-pairing load, nudging the user
