@@ -15,18 +15,15 @@ const STATUS = {
     CONNECTED: "Connected"
 };
 
-// Per-phase delay before the TURN-withhold fallback fires. The browser
-// first tries to connect with host + srflx candidates only (server
-// withholds TURN). After MESSAGE_TIMEOUT_MS, if still not connected, we
-// show the user a "Negotiating connection..." banner and start the
-// second timer. After another MESSAGE_TIMEOUT_MS (so 2 × the timeout
-// since the answer was sent), if still not connected, the browser asks
-// the server for TURN credentials and adds them via setConfiguration +
-// restartIce.
+// How long to wait, after sending the answer, before showing the user a
+// "Negotiating connection..." reassurance banner (the connection usually
+// comes up well before this). Single-phase ICE has no fallback step to arm:
+// the direct-vs-relay bias now lives on the device (the ICE-controlling
+// agent withholds relay nomination), and the connector trickles all
+// candidates immediately. See bitbang/CONVENTIONS.md "Favoring direct on
+// slow & embedded devices".
 //
-// Override via ?msg_timeout=N (seconds, float-OK). Defaults to 3 seconds
-// → 6 seconds total before a fallback. Direct paths almost always
-// resolve within phase 1; this just biases ICE toward direct.
+// Override via ?msg_timeout=N (seconds, float-OK). Defaults to 3 seconds.
 const MESSAGE_TIMEOUT_MS = (() => {
     const p = new URLSearchParams(window.location.search);
     const n = parseFloat(p.get('msg_timeout'));
@@ -260,9 +257,8 @@ class BitBangConnection {
     // Parse the coturn REST-API expiry from a TURN credential's username
     // ("<epoch>[:<user_name>]") and stash it in this._turnExpiryMs. The
     // server stamps the same epoch on every entry it returns, so the
-    // first match wins. Called from both the initial offer and the
-    // post-stall ice_servers push — forgetting one would let
-    // _armTurnEndTimers silently fall through and run past the TTL.
+    // first match wins. Called when the offer's ice_servers arrive — single-
+    // phase stamps TURN up front, so there is no separate post-stall push.
     _extractTurnExpiry(servers) {
         if (!Array.isArray(servers)) return;
         for (const s of servers) {
@@ -684,26 +680,16 @@ class BitBangConnection {
                     const m = cand.match(/typ (\S+)/);
                     console.log(`[Bootstrap] local candidate: ${m ? m[1] : '?'} ${cand}`);
                 }
+                // Trickle every candidate immediately, relay included. The
+                // direct-vs-relay bias lives on the device now (it withholds
+                // relay-pair nomination), so the connector no longer delays
+                // its relay candidate. See bitbang/CONVENTIONS.md "Favoring
+                // direct on slow & embedded devices".
                 const msg = { type: 'candidate', uid: this.uid, candidate: event.candidate };
-                const send = () => {
-                    if (this.ws?.readyState === WebSocket.OPEN && this.remoteDescriptionSet) {
-                        this.ws.send(JSON.stringify(msg));
-                    } else {
-                        this.candidateQueue.pushLocal(msg);
-                    }
-                };
-                // Single-phase ICE: TURN creds are stamped on the offer up
-                // front, so we gather a relay candidate immediately. Delay
-                // *trickling* it by MESSAGE_TIMEOUT_MS so a direct (host/srflx)
-                // pair has a head start to win the race; if direct connects
-                // first the relay candidate is never used. host/srflx trickle
-                // immediately. ?relay (forceRelay) is relay-only by policy, so
-                // there is nothing to bias toward — skip the delay.
-                const isRelay = / typ relay /.test(cand);
-                if (isRelay && !forceRelay) {
-                    setTimeout(send, MESSAGE_TIMEOUT_MS);
+                if (this.ws?.readyState === WebSocket.OPEN && this.remoteDescriptionSet) {
+                    this.ws.send(JSON.stringify(msg));
                 } else {
-                    send();
+                    this.candidateQueue.pushLocal(msg);
                 }
             } else if (this.debug) {
                 console.log('[Bootstrap] local candidate gathering complete');
