@@ -713,7 +713,7 @@ class BitBangConnection {
                     console.log(`[Bootstrap] local candidate: ${m ? m[1] : '?'} ${cand}`);
                 }
                 // Trickle every candidate immediately, relay included. The
-                // direct-vs-relay bias lives on the device now (it withholds
+                // direct-vs-relay bias lives on the device (it withholds
                 // relay-pair nomination), so the connector no longer delays
                 // its relay candidate. See bitbang/CONVENTIONS.md "Favoring
                 // direct on slow & embedded devices".
@@ -1669,37 +1669,117 @@ class BitBangConnection {
             const iframeTitle = iframe.contentDocument?.title;
             document.title = iframeTitle || this.deviceName || "BitBang";
 
-            // Set device favicon. Helper to update or create the link element.
-            const setFavicon = (href) => {
+            // Favicon forwarding. Watches the iframe's <link rel="icon">
+            // (and friends) and mirrors it into the top document, rewriting
+            // hrefs into /__device__/<sid>/… so the SW proxies favicon
+            // fetches to the device rather than to bitba.ng's own origin.
+            //
+            //   applyDeviceFavicon  updates/creates <link rel="icon"> on
+            //                       the top document with a proxied path.
+            //                       No-ops for cross-origin hrefs (rare
+            //                       but possible for icons on a CDN).
+            //
+            //   findBestIcon        picks a <link>: rel="icon" beats
+            //                       "shortcut icon" beats apple-touch-icon;
+            //                       larger declared size wins ties. Guards
+            //                       against `apple-touch-icon` clobbering
+            //                       the tab icon on apps that ship both.
+            //
+            // The MutationObserver has NO timeout — apps that init their
+            // favicon late (SPA bootstraps that run seconds after
+            // iframe.onload) still get picked up. Attribute mutations on
+            // href/rel/sizes also trigger it, covering apps that swap the
+            // href in place. Observer is re-attached per iframe.onload,
+            // so it doesn't accumulate across full navigations.
+            const applyDeviceFavicon = (rawHref) => {
+                if (!rawHref) return;
+                let finalHref;
+                // Canvas-generated favicons (data:/blob:) are inline or
+                // same-origin-scoped — apply as-is, no proxy rewrite.
+                if (rawHref.startsWith('data:') || rawHref.startsWith('blob:')) {
+                    finalHref = rawHref;
+                } else {
+                    let u;
+                    try { u = new URL(rawHref, iframe.contentWindow.location.href); }
+                    catch { return; }
+                    if (u.origin !== window.location.origin) return;
+                    let path = u.pathname + u.search;
+                    if (!path.startsWith(`/__device__/${this.sessionId}/`)) {
+                        path = `/__device__/${this.sessionId}${path.startsWith('/') ? path : '/' + path}`;
+                    }
+                    finalHref = path;
+                }
                 let link = document.querySelector('link[rel="icon"]');
                 if (!link) {
                     link = document.createElement('link');
                     link.rel = 'icon';
                     document.head.appendChild(link);
                 }
-                link.href = href;
+                if (link.getAttribute('href') !== finalHref) link.href = finalHref;
             };
 
-            // Try /favicon.ico -- only set if it exists (don't clear with a 404)
-            fetch(`/__device__/${this.sessionId}/favicon.ico`).then(r => {
-                if (r.ok) setFavicon(`/__device__/${this.sessionId}/favicon.ico`);
-            }).catch(() => {});
-
-            // Also watch for the device setting a favicon dynamically via JS
-            // (e.g. NAS sets <link rel="icon"> after page load)
-            const iframeDoc = iframe.contentDocument;
-            if (iframeDoc) {
-                const copyIcon = () => {
-                    const icon = iframeDoc.querySelector('link[rel*="icon"]');
-                    if (icon) { setFavicon(icon.href); return true; }
-                    return false;
+            const findBestIcon = (doc) => {
+                if (!doc) return null;
+                const rank = (rel) => {
+                    rel = (rel || '').toLowerCase();
+                    if (rel === 'icon') return 3;
+                    if (rel === 'shortcut icon') return 2;
+                    if (rel.includes('apple-touch-icon')) return 1;
+                    return 0;
                 };
-                if (!copyIcon()) {
-                    const obs = new MutationObserver(() => { if (copyIcon()) obs.disconnect(); });
-                    obs.observe(iframeDoc.head || iframeDoc.documentElement, { childList: true, subtree: true });
-                    setTimeout(() => obs.disconnect(), 5000);
+                const sizeArea = (link) => {
+                    const s = link.getAttribute('sizes');
+                    if (!s || s.toLowerCase() === 'any') return 0;
+                    const [w] = s.split(/[x ]/i);
+                    return parseInt(w, 10) || 0;
+                };
+                const all = [...doc.querySelectorAll('link[rel]')];
+                const candidates = all.filter(l => rank(l.rel) > 0 && l.getAttribute('href'));
+                console.log('[favicon-debug] findBestIcon: total <link>:', all.length,
+                    'candidates:', candidates.map(l => ({ rel: l.rel, sizes: l.getAttribute('sizes'), href: l.getAttribute('href') })));
+                candidates.sort((a, b) => rank(b.rel) - rank(a.rel) || sizeArea(b) - sizeArea(a));
+                const winner = candidates[0]?.getAttribute('href') || null;
+                console.log('[favicon-debug]   winner:', winner);
+                return winner;
+            };
+
+            try {
+                const doc = iframe.contentDocument;
+                if (doc) {
+                    console.log('[favicon-debug] onload initial scan; iframe URL:', iframe.contentWindow.location.href);
+                    applyDeviceFavicon(findBestIcon(doc));
+                    new MutationObserver(() => {
+                        console.log('[favicon-debug] MutationObserver fired');
+                        applyDeviceFavicon(findBestIcon(doc));
+                    }).observe(doc.head || doc.documentElement, {
+                        childList: true, subtree: true,
+                        attributes: true, attributeFilter: ['href', 'rel', 'sizes'],
+                    });
+                    console.log('[favicon-debug] observer attached');
+                } else {
+                    console.log('[favicon-debug] no iframe.contentDocument');
                 }
+            } catch (e) {
+                console.log('[favicon-debug] initial scan threw:', String(e));
             }
+
+            // Fallback: /favicon.ico static probe, applied only if no
+            // dynamic icon has been detected by the time the fetch
+            // resolves. Prevents clobbering a valid dynamic icon.
+            const initialHref = document.querySelector('link[rel="icon"]')?.href;
+            console.log('[favicon-debug] static probe scheduled; initial top href:', initialHref);
+            fetch(`/__device__/${this.sessionId}/favicon.ico`).then(r => {
+                console.log('[favicon-debug] static probe status:', r.status);
+                if (!r.ok) return;
+                const current = document.querySelector('link[rel="icon"]')?.href;
+                console.log('[favicon-debug] static probe check: current top href:', current, '/ initial:', initialHref);
+                if (current === initialHref) {
+                    console.log('[favicon-debug]   applying static probe result');
+                    applyDeviceFavicon(`/__device__/${this.sessionId}/favicon.ico`);
+                } else {
+                    console.log('[favicon-debug]   skip (dynamic icon already set)');
+                }
+            }).catch((e) => console.log('[favicon-debug] static probe error:', String(e)));
 
             // Mirror the iframe's location into the address bar after every
             // navigation so refresh/bookmark land back on the same page. The
