@@ -72,6 +72,14 @@ self.addEventListener('message', async (event) => {
             clientId: event.source.id,
             uid: uid,
             target: event.data.target || 'device',
+            // code is the URL-fragment access secret; used by
+            // redirectViaActiveSession to build correct 302 targets for
+            // popups from proxied apps.
+            code: event.data.code || '',
+            // lastActive lets redirectViaActiveSession pick the most-
+            // recently-used session when multiple are open. Bumped on
+            // registration and on every proxied fetch.
+            lastActive: Date.now(),
             debug: !!event.data.debug,
             noCookieJar: !!event.data.noCookieJar,
         });
@@ -397,6 +405,27 @@ function isServerEndpoint(pathname) {
 self.addEventListener('fetch', (event) => {
     const url = new URL(event.request.url);
     if (url.origin !== self.location.origin) return;
+
+    // Popups from proxied apps: an iframe's JS generates a root-relative
+    // URL not realizing it lives behind a proxy, then window.open(...) or
+    // a top-level nav lands at bare-origin. Catch anything that looks
+    // like it belongs to a proxied app and 302 it into the most-recently-
+    // active session's URL space. See isLikelyAppPopup for what qualifies.
+    // Popup detection: only treat as popup when the request destination
+    // is 'document' — a top-level navigation (window.open, target=_blank).
+    // Iframe navigations (destination='iframe') MUST fall through to
+    // proxyAbsolutePath so form submits and in-app navigations reach the
+    // device tunnel and don't get redirected into bootstrap.html-inside-
+    // an-iframe. Request.destination is on the Request object itself
+    // and visible in the SW; Sec-Fetch-* headers, by contrast, are added
+    // at the network layer after the SW's fetch handler runs.
+    if (event.request.mode === 'navigate'
+        && event.request.destination === 'document'
+        && isLikelyAppPopup(url)) {
+        event.respondWith(redirectViaActiveSession(event, url));
+        return;
+    }
+
     if (isServerEndpoint(url.pathname)) return;
 
     if (url.pathname.startsWith('/__device__/')) {
@@ -405,6 +434,139 @@ self.addEventListener('fetch', (event) => {
         event.respondWith(proxyAbsolutePath(event, url));
     }
 });
+
+// isLikelyAppPopup: does this URL look like a popup from a proxied app
+// rather than a legitimate bitba.ng navigation? Excludes only paths that
+// we KNOW are always server-owned or session-internal:
+//
+//   - `isServerEndpoint(p)`  — explicit list: /status, /ws/*, /__bitbang__/*
+//   - `/__device__/*`        — the SW's own internal proxy path
+//   - `/<22-char UID>`       — canonical device URL
+//   - `/<6-digit>`           — pair code path
+//   - bare `/` (no query)    — entry page
+//
+// Everything else — including single-lowercase-segment paths like
+// `/reverse_proxy_test/` that proxied apps sometimes generate — is
+// treated as a possible popup and handed to `redirectViaActiveSession`.
+// That function falls through to the network when no active session
+// exists, so cold-start users typing exotic URLs are unaffected: only
+// users who have a live session in this browser get redirected.
+//
+// We do NOT re-use findSession's `isShortTopPath` short-route reservation
+// here. That reservation exists so new server-side lowercase routes can
+// be added without SW updates, but for the popup-redirect path we'd
+// rather catch a real proxied-app popup than preserve the shortcut.
+// New server routes must be added to `isServerEndpoint` explicitly.
+function isLikelyAppPopup(url) {
+    const p = url.pathname;
+    if (p === '/') return !!url.search;
+    if (/^\/[A-Za-z0-9_-]{22}(\/|$)/.test(p)) return false;
+    if (/^\/\d{6}$/.test(p)) return false;
+    if (isServerEndpoint(p)) return false;
+    if (p.startsWith('/__device__/')) return false;
+    return true;
+}
+
+// extractRefererSession pulls the /__device__/<sid> segment out of a
+// Referer URL, or null if it's absent. Used to identify which session a
+// popup came from — a hard signal that beats the lastActive tie-breaker
+// when multiple sessions are open in the same browser.
+function extractRefererSession(referer) {
+    if (!referer) return null;
+    const m = referer.match(/\/__device__\/([^/?#]+)/);
+    return m ? m[1] : null;
+}
+
+// redirectViaActiveSession: 302 the request into the most-recently-used
+// session's URL space. Path/search from the request are preserved; the
+// session provides uid, target, and code. If no session qualifies (none
+// registered, or the ones we have lack a code), falls through to the
+// network so the entry page still loads normally for genuinely-fresh
+// visitors.
+async function redirectViaActiveSession(event, url) {
+    await sessionsReady;
+
+    // Sweep dead sessions so we don't redirect into a session whose page
+    // has been closed. Cheap here — happens only on the popup-shaped
+    // navigation, not on every fetch.
+    let swept = false;
+    for (const [sid, sess] of sessions) {
+        if (!(await self.clients.get(sess.clientId))) {
+            sessions.delete(sid);
+            swept = true;
+        }
+    }
+    if (swept) saveSessions();
+
+    // Selection priority — most specific signal first.
+    //
+    // 1. Cache API "active session" — bootstrap writes on iframe load,
+    //    window focus, and visibility→visible. Focus fires WAY before
+    //    the user can click a link, so the async write is always settled
+    //    by popup time. This is the only signal that reliably identifies
+    //    the source session when Cookie and Referer are stripped from
+    //    the popup navigation by the browser (noreferrer, cross-context).
+    //
+    // 2. Referer contains /__device__/<sid>. Works for iframes still on
+    //    the proxy prefix. Defensive fallback; not usually helpful for
+    //    popups since Referer is usually stripped there.
+    //
+    // 3. Most-recently-active (lastActive). Final fallback for the
+    //    single-session case where any answer is right.
+    let best = null;
+
+    try {
+        const cache = await caches.open('bitbang-active-session');
+        const resp = await cache.match('/_/active');
+        if (resp) {
+            const s = sessions.get(await resp.text());
+            if (s && s.uid && s.code) best = s;
+        }
+    } catch (e) {}
+
+    if (!best) {
+        const refererSid = extractRefererSession(event.request.referrer);
+        if (refererSid) {
+            const s = sessions.get(refererSid);
+            if (s && s.uid && s.code) best = s;
+        }
+    }
+
+    if (!best) {
+        for (const sess of sessions.values()) {
+            if (!sess.uid || !sess.code) continue;
+            if (!best || (sess.lastActive || 0) > (best.lastActive || 0)) {
+                best = sess;
+            }
+        }
+    }
+
+    if (!best) return fetch(event.request);
+
+    // Build the canonical URL per CONVENTIONS.md's URL scheme:
+    //
+    //   /<UID>?<flags>#<code><device-URL>
+    //
+    // Everything device-specific (target + pathname + search + hash) lives
+    // in the fragment after the code. The signaling server never sees any
+    // of it — fragments aren't transmitted in HTTP requests.
+    //
+    //   target === 'device'  is the fixed-target sentinel (no target
+    //                        segment). Any other value is a real proxy
+    //                        host, prepended as `/host` before the popup's
+    //                        own path so relative URLs resolve correctly.
+    //   url.pathname         the popup's path (`/`, `/Library`, etc.).
+    //   url.search           the popup's query (`?launchApp=…`).
+    //   url.hash             not visible to the SW (browsers don't send
+    //                        fragments), so lost. Popups rarely carry one.
+    const tseg = (best.target && best.target !== 'device') ? '/' + best.target : '';
+    const deviceUrl = tseg + url.pathname + url.search;
+    const loc = '/' + best.uid + '#' + best.code + deviceUrl;
+    return new Response(null, {
+        status: 302,
+        headers: { Location: loc },
+    });
+}
 
 /**
  * Proxy an absolute-path request through the device tunnel.
@@ -461,6 +623,9 @@ async function proxyToDevice(event) {
     await sessionsReady;
     const session = sessions.get(sessionId);
     if (session) {
+        // In-memory only; no saveSessions() per fetch. lastActive is used
+        // as a tie-breaker in redirectViaActiveSession — ephemeral is fine.
+        session.lastActive = Date.now();
         bootstrap = await self.clients.get(session.clientId);
 
         // Chrome may drop SW->client control after idle. The page is

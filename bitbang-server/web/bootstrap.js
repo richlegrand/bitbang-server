@@ -1418,6 +1418,11 @@ class BitBangConnection {
             sessionId: this.sessionId,
             uid: this.uid,
             target: target,
+            // The access code is a URL-fragment secret the SW can't see
+            // by itself (fragments never reach the SW). Passing it here
+            // lets the SW construct correct redirect URLs for popups from
+            // proxied apps — see redirectViaActiveSession in sw.js.
+            code: this.code,
             debug: this.debug,
             noCookieJar: this.noCookieJar,
         });
@@ -1727,50 +1732,55 @@ class BitBangConnection {
                     };
                 }
             } catch (e) {}
-            sync('load');
 
-            this.interceptNewTabLinks(iframe);
+            // Active-session hint for popup routing.
+            //
+            // A proxied app can pop a new tab at bare bitba.ng (root-
+            // relative window.open, target=_blank anchor). That popup
+            // lands in the SW's fetch handler, and the SW needs to know
+            // which session it belongs to. Referer often doesn't carry
+            // /__device__/<sid> (absolute-path apps like OctoPrint leave
+            // the proxy prefix), and Cookie / Referer headers are stripped
+            // from popup navigations before they reach the SW's fetch
+            // event (browser attaches them at the network layer, after
+            // the SW). postMessage races the popup's fetch (different
+            // async queues, no ordering guarantee).
+            //
+            // Cache API works: focus and visibilitychange fire seconds
+            // before any click, so the async write settles well before
+            // the popup opens. sw.js reads /_/active from the same cache
+            // in redirectViaActiveSession.
+            const markActive = () => {
+                caches.open('bitbang-active-session')
+                    .then(c => c.put('/_/active',
+                        new Response(this.sessionId, {
+                            headers: { 'Content-Type': 'text/plain' },
+                        })))
+                    .catch(() => {});
+            };
+            markActive();
+            window.addEventListener('focus', markActive);
+            document.addEventListener('visibilitychange', () => {
+                if (document.visibilityState === 'visible') markActive();
+            });
+
+            sync('load');
         };
 
         iframe.src = `/__device__/${this.sessionId}${this.devicePath}${this.deviceSearch}${this.deviceHash}`;
         document.body.appendChild(iframe);
     }
 
-    // Keep the <uid>#<code> session "sticky" for target=_blank links. A proxied
-    // app that opens an absolute path in a new tab (e.g. OctoPrint's Reverse
-    // Proxy Test → /reverse_proxy_test/) would otherwise open a bare bitba.ng
-    // URL with no device identity → the new tab can't connect. We intercept the
-    // click and open the bitbang-form URL instead, so the new tab boots,
-    // connects to the same device, and lands on that path. Re-attached per
-    // iframe load (a full navigation gives a fresh document).
-    interceptNewTabLinks(iframe) {
-        let doc;
-        try { doc = iframe.contentDocument; } catch (e) { return; }
-        if (!doc) return;
-        doc.addEventListener('click', (e) => {
-            if (e.defaultPrevented || e.button !== 0 || e.metaKey || e.ctrlKey || e.shiftKey || e.altKey) return;
-            const a = e.target && e.target.closest && e.target.closest('a[href]');
-            if (!a || a.target !== '_blank' || a.hasAttribute('download')) return;
-            let u;
-            try { u = new URL(a.href, iframe.contentWindow.location.href); } catch (_) { return; }
-            if (u.origin !== window.location.origin) return;   // external link → open normally
-
-            // Map the link's app-absolute path to a device path: strip our
-            // /__device__/<sid> prefix if present, else prepend the proxy target.
-            const pfx = `/__device__/${this.sessionId}`;
-            let p = u.pathname;
-            if (p === pfx) p = '/';
-            else if (p.startsWith(pfx + '/')) p = p.slice(pfx.length);
-            const tseg = this.target ? '/' + this.target : '';
-            if (tseg && p !== tseg && !p.startsWith(tseg + '/')) p = tseg + (p === '/' ? '/' : p);
-
-            const top = '/' + this.uid + (window.location.search || '')
-                + '#' + this.code + (p || '/') + u.search + u.hash;
-            e.preventDefault();
-            if (this.debug) console.log('[Bootstrap] new-tab link → bitbang URL', top);
-            window.open(top, '_blank');
-        }, true);
-    }
+    // Note: popup handling (target=_blank links, window.open() from
+    // proxied apps' click handlers, root-relative URLs like Synology's
+    // `/?launchApp=…`) is now done entirely in the SW. It intercepts
+    // bare-origin navigations that don't match any legitimate bitbang
+    // shape and 302s them into the most-recently-active session's URL
+    // space, using the (uid, code, target) it learned via setBootstrap.
+    // See sw.js's redirectViaActiveSession + isLikelyAppPopup. The old
+    // saveOpenHint / interceptNewTabLinks pair used to do this from the
+    // page; the SW-only approach avoids the async-cache race and covers
+    // programmatic window.open, not just <a target=_blank>.
 
     // Normalise the device-frame iframe's current location into
     // {devicePath, deviceSearch, deviceHash}, matching parseDeviceURL's output.
