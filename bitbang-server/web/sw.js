@@ -545,11 +545,14 @@ async function redirectViaActiveSession(event, url) {
 
     // Build the canonical URL per CONVENTIONS.md's URL scheme:
     //
-    //   /<UID>?<flags>#<code><device-URL>
+    //   /<UID>#<code>[!<flag-list>]<device-URL>
     //
-    // Everything device-specific (target + pathname + search + hash) lives
-    // in the fragment after the code. The signaling server never sees any
-    // of it — fragments aren't transmitted in HTTP requests.
+    // Popup redirects do NOT propagate flags (they're per-session
+    // diagnostic switches; inheriting them across popups is not the
+    // desired behavior). Everything device-specific (target + pathname +
+    // search + hash) lives in the fragment after the code and after any
+    // flag section. The signaling server never sees any of it — fragments
+    // aren't transmitted in HTTP requests.
     //
     //   target === 'device'  is the fixed-target sentinel (no target
     //                        segment). Any other value is a real proxy
@@ -733,7 +736,7 @@ async function proxyToDevice(event) {
                 if (timeout) clearTimeout(timeout);
                 resolved = true;
 
-                // Store response cookies in our jar (skipped when ?nocookiejar is set)
+                // Store response cookies in our jar (skipped when !nocookiejar is set)
                 const setCookie = headers?.['Set-Cookie'] || headers?.['set-cookie'];
                 if (setCookie && !session.noCookieJar) {
                     storeCookies(jarKey, setCookie);

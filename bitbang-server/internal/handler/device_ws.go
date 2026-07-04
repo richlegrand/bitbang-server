@@ -229,7 +229,7 @@ func (d *Deps) deviceRelay(conn *registry.DeviceConn) {
 			// The connector gathers host + srflx + relay but delays
 			// trickling its relay candidate by ~messageTimeoutMs, so a
 			// direct pair settles first and relay is only used on fallback
-			// — with no ice_restart round trip. ?relay just tells the
+			// — with no ice_restart round trip. !relay just tells the
 			// connector to skip that delay; the server stamps creds either
 			// way. The device side stays STUN-only (single relay).
 			servers, unavailable := d.iceForClient(conn, env.ClientID, false)

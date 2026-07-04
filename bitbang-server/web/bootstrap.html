@@ -11,10 +11,20 @@
          which maps favicon.ico → favicon.png. -->
     <link rel="icon" type="image/png" href="/__bitbang__/favicon.ico">
     <script>
-        // ?debug loads eruda -- a floating console/network/storage panel for
-        // mobile, where browser DevTools aren't available. Loaded async so it
-        // doesn't block the connection sequence.
-        if (new URLSearchParams(location.search).has('debug')) {
+        // !debug (fragment flag, see CONVENTIONS.md) loads eruda -- a floating
+        // console/network/storage panel for mobile, where browser DevTools
+        // aren't available. Loaded async so it doesn't block the connection
+        // sequence. Parsed inline here because this runs before bootstrap.js
+        // — grammar: `#<code>!debug[,other-flags][/device-url]`.
+        (function () {
+            const frag = location.hash ? location.hash.slice(1) : '';
+            let i = 0;
+            while (i < frag.length && /[A-Za-z0-9_-]/.test(frag[i])) i++;
+            if (frag[i] !== '!') return;
+            let j = i + 1;
+            while (j < frag.length && frag[j] !== '/') j++;
+            const flags = frag.slice(i + 1, j).split(',');
+            if (!flags.includes('debug')) return;
             const s = document.createElement('script');
             s.src = 'https://cdn.jsdelivr.net/npm/eruda';
             s.onload = () => {
@@ -23,7 +33,7 @@
                 eruda.position({ x: window.innerWidth - 60, y: window.innerHeight - 60 });
             };
             document.head.appendChild(s);
-        }
+        })();
     </script>
     <style>
         * {

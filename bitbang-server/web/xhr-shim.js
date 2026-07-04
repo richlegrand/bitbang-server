@@ -38,7 +38,10 @@
             }
         }
         if (cleanPath !== path) {
-            history.replaceState(null, '', cleanPath + location.search + location.hash);
+            // Bitbang flags now ride the fragment (see CONVENTIONS.md), so
+            // preserving location.hash is enough — location.search should
+            // be empty on the top URL by design.
+            history.replaceState(null, '', cleanPath + location.hash);
         }
     }
 

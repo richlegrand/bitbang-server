@@ -103,7 +103,7 @@ func (d *Deps) clientRelay(conn *registry.ClientConn) {
 			// via connection_path, and this is what they normalize against.
 			d.Metrics.IncRequests()
 
-			// Capture the browser's ?relay flag so the offer relay later
+			// Capture the browser's !relay flag so the offer relay later
 			// knows whether to attach TURN credentials to the offer it
 			// forwards back to the client. Once set on the conn, it's
 			// stable for the session.

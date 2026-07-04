@@ -83,7 +83,7 @@ type ClientConn struct {
 	// bad-code attempts to a source IP. Empty if not yet determined.
 	BrowserIP string
 
-	// ForceRelay reflects the ?relay query flag from the browser, captured
+	// ForceRelay reflects the !relay fragment flag from the browser, captured
 	// when the client sent its "request" message. Under single-phase ICE the
 	// server stamps TURN credentials on the offer either way; ForceRelay is
 	// carried through for the pairing flow and so the connector knows to skip

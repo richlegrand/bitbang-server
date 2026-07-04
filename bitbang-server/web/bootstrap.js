@@ -23,10 +23,51 @@ const STATUS = {
 // candidates immediately. See bitbang/CONVENTIONS.md "Favoring direct on
 // slow & embedded devices".
 //
-// Override via ?msg_timeout=N (seconds, float-OK). Defaults to 3 seconds.
+// Parse Bitbang URL flags from the fragment. Grammar (see CONVENTIONS.md
+// "URL and credential terms"):
+//
+//   fragment  = <code> [ '!' <flag-list> ] [ '/' <device-URL> ]
+//   flag-list = <flag> [ ',' <flag> ]*
+//   flag      = <name> [ '=' <value> ]
+//
+// Flags live in the fragment, so the signaling server never sees them.
+// Returns { debug, nocookiejar, relay, norelay, msg_timeout } — booleans
+// are true when the flag is present, msg_timeout carries the parsed value
+// or undefined. Reads window.location.hash every call so callers see the
+// current state (URL fragment can change via history.replaceState).
+function parseUrlFlags() {
+    const frag = window.location.hash ? window.location.hash.slice(1) : '';
+    let i = 0;
+    while (i < frag.length && /[A-Za-z0-9_-]/.test(frag[i])) i++;
+    if (frag[i] !== '!') return {};
+    let j = i + 1;
+    while (j < frag.length && frag[j] !== '/') j++;
+    const out = {};
+    for (const tok of frag.slice(i + 1, j).split(',')) {
+        if (!tok) continue;
+        const eq = tok.indexOf('=');
+        if (eq >= 0) out[tok.slice(0, eq)] = tok.slice(eq + 1);
+        else out[tok] = true;
+    }
+    return out;
+}
+
+// Read the raw '!<flag-list>' segment from the current URL fragment (with
+// leading '!'), or '' if no flag section is present. Used by syncTopURL to
+// preserve the flag tail verbatim across in-iframe navigations.
+function readUrlFlagString() {
+    const frag = window.location.hash ? window.location.hash.slice(1) : '';
+    let i = 0;
+    while (i < frag.length && /[A-Za-z0-9_-]/.test(frag[i])) i++;
+    if (frag[i] !== '!') return '';
+    let j = i + 1;
+    while (j < frag.length && frag[j] !== '/') j++;
+    return frag.slice(i, j);
+}
+
+// Override via !msg_timeout=N (seconds, float-OK). Defaults to 3 seconds.
 const MESSAGE_TIMEOUT_MS = (() => {
-    const p = new URLSearchParams(window.location.search);
-    const n = parseFloat(p.get('msg_timeout'));
+    const n = parseFloat(parseUrlFlags().msg_timeout);
     return isFinite(n) && n > 0 ? n * 1000 : 3000;
 })();
 
@@ -205,8 +246,11 @@ class BitBangConnection {
 
         this.statusEl = document.getElementById('status');
         this.connectionUI = document.getElementById('connection-ui');
-        this.debug = new URLSearchParams(window.location.search).has('debug');
-        this.noCookieJar = new URLSearchParams(window.location.search).has('nocookiejar');
+        {
+            const _flags = parseUrlFlags();
+            this.debug = !!_flags.debug;
+            this.noCookieJar = !!_flags.nocookiejar;
+        }
         this._turnHoldPromise = null;
         this._wasConnected = false;
         this._usingRelay = false;
@@ -257,7 +301,7 @@ class BitBangConnection {
         this.statusEl.appendChild(line);
     }
 
-    // Same, but only with ?debug — the extra play-by-play detail.
+    // Same, but only with !debug — the extra play-by-play detail.
     _printDebug(msg) {
         if (this.debug) this._print(msg);
     }
@@ -493,12 +537,12 @@ class BitBangConnection {
             this.deviceVerified = false;
 
             this.ws.onopen = () => {
-                // ?relay tells the server to skip TURN withholding and
+                // !relay tells the server to skip TURN withholding and
                 // include relay credentials in the initial offer (legacy
-                // behavior). ?norelay also disables the fallback (handled
+                // behavior). !norelay also disables the fallback (handled
                 // in createPeerConnection by dropping iceServers entirely).
-                const params = new URLSearchParams(window.location.search);
-                const forceRelay = params.has('relay') && !params.has('norelay');
+                const flags = parseUrlFlags();
+                const forceRelay = !!flags.relay && !flags.norelay;
                 this.ws.send(JSON.stringify({
                     type: 'request',
                     uid: this.uid,
@@ -569,7 +613,7 @@ class BitBangConnection {
         this.deviceName = msg.device_name || null;
         this._turnUnavailable = !!msg.turn_unavailable;
         // Surface "at capacity" immediately on receipt, not after connect:
-        // with ?relay + capacity gating the connection may never establish
+        // with !relay + capacity gating the connection may never establish
         // (no TURN server in iceServers + relay-only policy = no candidates),
         // so _onFirstConnected won't ever fire and the user would otherwise
         // get no feedback at all.
@@ -632,16 +676,16 @@ class BitBangConnection {
     createPeerConnection(iceServers) {
         const config = { sdpSemantics: 'unified-plan' };
         // Diagnostic flags:
-        //   ?norelay drops STUN/TURN servers entirely so ICE only has host
+        //   !norelay drops STUN/TURN servers entirely so ICE only has host
         //     candidates ("is host-to-host actually broken, or is it just
         //     losing the race to relay?").
-        //   ?relay sets iceTransportPolicy:'relay' so the browser only
+        //   !relay sets iceTransportPolicy:'relay' so the browser only
         //     gathers and uses relay candidates ("force the TURN path so
         //     we can verify the relay-in-use banner / end-of-session UX").
         // The two are mutually exclusive; norelay wins if both are set.
-        const params = new URLSearchParams(location.search);
-        const noRelay = params.has('norelay');
-        const forceRelay = params.has('relay') && !noRelay;
+        const flags = parseUrlFlags();
+        const noRelay = !!flags.norelay;
+        const forceRelay = !!flags.relay && !noRelay;
         if (iceServers && iceServers.length > 0 && !noRelay) {
             config.iceServers = iceServers;
         }
@@ -1918,7 +1962,10 @@ class BitBangConnection {
         this.deviceHash = n.deviceHash;
         const tail = (n.devicePath === '/' && !n.deviceSearch && !n.deviceHash)
             ? '' : n.devicePath + n.deviceSearch + n.deviceHash;
-        const top = '/' + this.uid + (window.location.search || '') + '#' + this.code + tail;
+        // Flags ride the fragment right after the code, before the device
+        // URL. Preserve whatever flag section the current URL carries.
+        const flagStr = readUrlFlagString();
+        const top = '/' + this.uid + '#' + this.code + flagStr + tail;
         if (this.debug) console.log('[Bootstrap] syncTopURL ->', top);
         history.replaceState(null, '', top);
     }
@@ -2094,8 +2141,8 @@ const pairUI = {
 class PairingFlow {
     constructor(code) {
         this.code = code;
-        const params = new URLSearchParams(location.search);
-        this.forceRelay = params.has('relay') && !params.has('norelay');
+        const flags = parseUrlFlags();
+        this.forceRelay = !!flags.relay && !flags.norelay;
         this.ws = null;
         this.pc = null;
         this.dc = null;
@@ -2387,9 +2434,12 @@ function showBookmarkModal() {
 //   - A bare `host:port` target still gets a trailing slash so the
 //     proxied app's relative URLs resolve from its root.
 //
-// Bitbang flags (?debug, ?relay, …) live in the real query string,
-// between `/<uid>` and the `#`, and are read separately via
-// location.search. Assumes a direct-flow URL — caller does the
+// Bitbang flags (!debug, !relay, …) live in the fragment right after the
+// code and before the device URL — `#<code>[!flag,flag=value][/device-URL]`
+// — and are read separately via `parseUrlFlags()`. The boundary between
+// flag section and device URL is exactly one character: everything after
+// the first `/` in the fragment (after the code) is device content and
+// gets forwarded verbatim. Assumes a direct-flow URL — caller does the
 // pair-code/empty-path routing first.
 function parseDeviceURL() {
     const uid = window.location.pathname.split('/').filter(Boolean)[0];
@@ -2398,6 +2448,11 @@ function parseDeviceURL() {
     let i = 0;
     while (i < frag.length && /[A-Za-z0-9_-]/.test(frag[i])) i++;
     const code = frag.slice(0, i);
+    // Skip the optional !<flag-list> — it ends at the first '/' (which
+    // starts the device URL) or at end-of-fragment.
+    if (frag[i] === '!') {
+        while (i < frag.length && frag[i] !== '/') i++;
+    }
     const rest = frag.slice(i);            // '' or `/path?query#hash`
 
     let devicePath = '/', deviceSearch = '', deviceHash = '';
