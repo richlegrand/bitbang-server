@@ -229,6 +229,12 @@ class BitBangConnection {
         this.deviceSearch = deviceSearch || '';
         this.deviceHash = deviceHash || '';
         this.code = code || '';
+        // Snapshot the URL's `!<flags>` section at session start. If the
+        // user edits the code or the flag section in the address bar,
+        // iframeShowsTopURL notices the mismatch and lets the hashchange
+        // handler reload — a code/flag edit is a genuinely different
+        // session, not an in-app navigation.
+        this.initialFlagStr = readUrlFlagString();
         this.pc = null;
         this.dataChannel = null;
         this.ws = null;
@@ -1943,6 +1949,10 @@ class BitBangConnection {
         const n = this.iframeDeviceURL();
         if (!n) return false;
         const p = parseDeviceURL();
+        // A manual edit to the code or the !<flags> section is a
+        // different session, not an in-app navigation — force reload.
+        if (p.code !== this.code) return false;
+        if (readUrlFlagString() !== this.initialFlagStr) return false;
         return n.devicePath === p.devicePath
             && n.deviceSearch === p.deviceSearch
             && n.deviceHash === p.deviceHash;
