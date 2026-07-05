@@ -1162,8 +1162,21 @@ class BitBangConnection {
             // is speaking. v2 listeners send just {type:'ready'} —
             // serverVersion defaults to 2.
             this.serverVersion = msg.server_version || 2;
+            // routing tells us how to interpret the first segment of the
+            // URL fragment's device path. "target-prefix" (bitbangproxy)
+            // means the first segment is a LAN target that isolates
+            // cookies between hosts reached through this UID.
+            // "direct" (bitbang-python WSGI/ASGI, or missing = safe
+            // default) means the whole path belongs to the app -- no
+            // target segment; all paths under this UID share cookies.
+            this.routing = msg.routing || 'direct';
+            if (this.routing === 'target-prefix') {
+                this.target = (this.devicePath || '/').split('/').filter(Boolean)[0] || '';
+            } else {
+                this.target = '';
+            }
             if (this.debug) {
-                console.log('[Bootstrap] Device ready (server v' + this.serverVersion + ')');
+                console.log('[Bootstrap] Device ready (server v' + this.serverVersion + ', routing=' + this.routing + ', target=' + JSON.stringify(this.target) + ')');
             } else {
                 console.log('[Bootstrap] Device ready');
             }
@@ -1459,24 +1472,6 @@ class BitBangConnection {
     }
 
     async onDataChannelReady() {
-        // Register this tab's session with the SW
-        const pathParts = this.devicePath.split('/').filter(Boolean);
-        const target = pathParts[0] || 'device';
-        const reg = await navigator.serviceWorker.ready;
-        reg.active.postMessage({
-            type: 'setBootstrap',
-            sessionId: this.sessionId,
-            uid: this.uid,
-            target: target,
-            // The access code is a URL-fragment secret the SW can't see
-            // by itself (fragments never reach the SW). Passing it here
-            // lets the SW construct correct redirect URLs for popups from
-            // proxied apps — see redirectViaActiveSession in sw.js.
-            code: this.code,
-            debug: this.debug,
-            noCookieJar: this.noCookieJar,
-        });
-
         // Brief delay for any pending tracks to arrive
         await new Promise(resolve => setTimeout(resolve, 100));
 
@@ -1499,6 +1494,27 @@ class BitBangConnection {
         // null and Promise.all skips immediately.
         const connectPromise = new Promise(resolve => { this.connectResolve = resolve; });
         await Promise.all([connectPromise, this._turnHoldPromise || Promise.resolve()]);
+
+        // Register this tab's session with the SW. Deferred until here so
+        // the device's routing declaration (received on 'ready') has been
+        // processed — this.target is now the routing-corrected value
+        // (empty for direct devices, LAN host for proxy devices). Empty
+        // becomes the 'device' sentinel on the SW side (see sw.js), which
+        // is what the cookie jar keys and popup redirects use.
+        const reg = await navigator.serviceWorker.ready;
+        reg.active.postMessage({
+            type: 'setBootstrap',
+            sessionId: this.sessionId,
+            uid: this.uid,
+            target: this.target || 'device',
+            // The access code is a URL-fragment secret the SW can't see
+            // by itself (fragments never reach the SW). Passing it here
+            // lets the SW construct correct redirect URLs for popups from
+            // proxied apps — see redirectViaActiveSession in sw.js.
+            code: this.code,
+            debug: this.debug,
+            noCookieJar: this.noCookieJar,
+        });
 
         // Listen for messages from the iframe (WebSocket shim + navigation
         // + open-cap launcher requests).

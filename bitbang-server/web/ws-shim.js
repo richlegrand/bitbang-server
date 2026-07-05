@@ -22,9 +22,13 @@
     // AJAX responses with Set-Cookie. The SW strips Set-Cookie from the
     // raw response, so without this mirror document.cookie goes stale.
     try {
+        // Filter on jarKey (uid:target) so broadcasts from any tab on
+        // the same device reach us. sessionId is per-tab and never
+        // matches across tabs -- filtering on it silently dropped
+        // every cross-tab cookie update.
         const cookieChannel = new BroadcastChannel('bitbang-cookies');
         cookieChannel.onmessage = (event) => {
-            if (event.data?.sessionId !== window.__bbSessionId) return;
+            if (event.data?.jarKey !== window.__bbJarKey) return;
             const cookies = event.data.cookies || [];
             for (const c of cookies) {
                 document.cookie = `${c.name}=${c.value};path=${c.path}`;

@@ -766,8 +766,13 @@ async function proxyToDevice(event) {
                     // Cross-tab fallback: another tab won't see X-BB-Set-Cookie
                     // (different fetch). The broadcast keeps its document.cookie
                     // eventually consistent.
+                    // Broadcast filtered by jarKey (uid:target), not
+                    // sessionId, so other tabs on the same device (same
+                    // jar) receive the update. Sessions are per-tab and
+                    // never match across tabs — filtering on sessionId
+                    // silently dropped every cross-tab broadcast.
                     const bc = new BroadcastChannel('bitbang-cookies');
-                    bc.postMessage({ sessionId, cookies: cookieJar.get(jarKey) || [] });
+                    bc.postMessage({ jarKey, cookies: cookieJar.get(jarKey) || [] });
                     bc.close();
                     delete headers['Set-Cookie'];
                     delete headers['set-cookie'];
@@ -817,7 +822,7 @@ async function proxyToDevice(event) {
                                 ? '<script src="https://cdn.jsdelivr.net/npm/eruda" onload="eruda.init();eruda.position({x:innerWidth-60,y:innerHeight-60})"></script>'
                                 : '';
                             const shims = '<!DOCTYPE html>'
-                                + `<script>window.__bbSessionId='${sessionId}';window.__bbDebug=${!!session?.debug};${cookieSync}</script>`
+                                + `<script>window.__bbSessionId='${sessionId}';window.__bbJarKey=${JSON.stringify(jarKey)};window.__bbDebug=${!!session?.debug};${cookieSync}</script>`
                                 + eruda
                                 + '<script src="/__bitbang__/xhr-shim.js"></script>'
                                 + '<script src="/__bitbang__/ws-shim.js"></script>';
