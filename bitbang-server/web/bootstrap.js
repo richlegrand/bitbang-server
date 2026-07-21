@@ -78,6 +78,16 @@ const FLAG_DAT = 0x0000;
 const FLAG_MORE = 0x0002;  // non-final fragment of a chunked WS message
 const SWSP_CHUNK_SIZE = 16384;  // max payload bytes per data-channel frame
 
+// Soft reconnect: when an established peer connection drops (e.g. a transient
+// network blip on a long-lived session), rebuild the transport under the live
+// page instead of showing the reload screen. Modeled as a fresh connection
+// request — the device needs no ICE-restart support; it just answers a new
+// request via its normal HandleRequest path. Bounded retries with linear
+// backoff; the reload screen is the fallback once these are exhausted.
+const MAX_RECONNECT_ATTEMPTS = 6;
+const RECONNECT_TIMEOUT_MS = 20000;  // per attempt: WS + offer + DC verify + ready
+const RECONNECT_SETTLE_MS = 2000;    // after offline→online, let the network settle
+
 // --- Bidirectional verify helpers ----------------------------------------
 //
 // The browser is the connecting party. Before opening WebRTC, it asks the
@@ -265,6 +275,12 @@ class BitBangConnection {
         this._turnExpiryMs = null;
         this._turnUnavailable = false;
         this._turnEnded = false;
+        // Soft-reconnect state.
+        this._transportReady = false;   // one-time setup (SW reg, iframe) done
+        this._reconnecting = false;     // a reconnect loop is in progress
+        this._reconnectResolve = null;  // resolves the in-flight attempt on ready
+        this._reconnectReject = null;
+        this._reconnectTimeout = null;
     }
 
     // SWSP frame helpers
@@ -410,6 +426,10 @@ class BitBangConnection {
         if (!this.dataChannel || this.dataChannel.readyState !== 'open') {
             console.warn('[Bootstrap] Data channel not open, rejecting request');
             responsePort.postMessage({ type: 'error', message: 'Data channel not open' });
+            // A live page with a dead channel should be recovering, not
+            // rejecting forever — kick the reconnect if nothing else did.
+            // (No-op while a reconnect is in flight or after a terminal end.)
+            if (this._wasConnected) this._handlePostHandshakeFailure();
             return;
         }
 
@@ -717,6 +737,11 @@ class BitBangConnection {
                 this._clearReassureTimer();
                 if (this._wasConnected) {
                     this._handlePostHandshakeFailure();
+                } else if (this._reconnecting) {
+                    // A reconnect attempt's fresh PC failed before connecting.
+                    // Let the reconnect loop's timeout drive the retry rather
+                    // than surfacing a terminal error screen.
+                    this._settleReconnect(false, new Error('pc_failed'));
                 } else {
                     this.showErrorScreen('Peer connection failed');
                 }
@@ -796,7 +821,14 @@ class BitBangConnection {
                 // (not a rogue relay), and onDataChannelReady will be called
                 // from handleControlMessage on successful verify.
             };
-            this.dataChannel.onclose = () => console.log('DataChannel closed');
+            this.dataChannel.onclose = () => {
+                console.log('DataChannel closed');
+                // The channel can die without the PC ever reporting 'failed'
+                // (e.g. the device closes its end). Route through the same
+                // recovery path; its guards skip intentional teardown
+                // (_reconnecting) and terminal ends (_turnEnded).
+                if (this._wasConnected) this._handlePostHandshakeFailure();
+            };
             this.dataChannel.onerror = (e) => console.error('DataChannel error:', e);
             this.dataChannel.onmessage = (e) => this.handleDataChannelMessage(e);
         };
@@ -1009,18 +1041,160 @@ class BitBangConnection {
         }
     }
 
-    // Idempotent. Called from either onconnectionstatechange === 'failed' or
-    // oniceconnectionstatechange transitions to failed/disconnected after we
-    // were once connected. Message text varies based on whether the session
-    // was actually using a TURN relay.
+    // Called from onconnectionstatechange === 'failed' or the ICE handler
+    // after we were once connected. Instead of giving up, attempt a soft
+    // reconnect: rebuild the transport under the live page. Only falls back to
+    // the reload screen once reconnect attempts are exhausted.
     _handlePostHandshakeFailure() {
-        if (this._turnEnded) return;
-        this._turnEnded = true;
+        if (this._turnEnded) return;      // intentional end (e.g. relay expiry)
+        if (this._reconnecting) return;   // a reconnect loop already owns this
+        this._reconnectLoop();
+    }
+
+    // Rebuild the transport with a fresh connection request, retrying with
+    // linear backoff. Each attempt tears down the dead PC/WS and re-runs the
+    // normal signaling flow (request → offer → answer → data channel → ready);
+    // the device answers via its ordinary HandleRequest path. Preserves the
+    // sessionId, iframe, and app state throughout.
+    async _reconnectLoop() {
+        this._reconnecting = true;
         this._clearTurnEndTimers();
+        this._clearReassureTimer();
+        this._showReconnecting();
+
+        let attempt = 0;
+        while (attempt < MAX_RECONNECT_ATTEMPTS) {
+            // A terminal screen (e.g. device_preempted) may have fired while we
+            // were backing off — stop trying if so.
+            if (this._turnEnded) { this._reconnecting = false; this._hideReconnecting(); return; }
+            // While the browser knows it's offline, attempts fail instantly and
+            // would burn the whole budget in seconds. Hold here until
+            // connectivity returns, let it settle, and grant a fresh budget.
+            if (!navigator.onLine) {
+                console.log('[Bootstrap] offline — waiting for connectivity before reconnecting');
+                await this._waitForOnline();
+                if (this._turnEnded) { this._reconnecting = false; this._hideReconnecting(); return; }
+                await new Promise(r => setTimeout(r, RECONNECT_SETTLE_MS));
+                attempt = 0;
+                continue;
+            }
+            attempt++;
+            this._teardownTransport();
+            try {
+                await this._reconnectOnce();
+                console.log(`[Bootstrap] reconnected on attempt ${attempt}`);
+                this._reconnecting = false;
+                this._hideReconnecting();
+                return;
+            } catch (e) {
+                console.warn(`[Bootstrap] reconnect attempt ${attempt}/${MAX_RECONNECT_ATTEMPTS} failed:`, e?.message || e);
+                const backoff = Math.min(1000 * attempt, 5000);
+                await new Promise(r => setTimeout(r, backoff));
+            }
+        }
+
+        // Exhausted — fall back to the terminal screen.
+        this._reconnecting = false;
+        this._hideReconnecting();
+        this._turnEnded = true;
         const msg = this._usingRelay
             ? 'Connection lost — relay may have expired.'
             : 'Connection lost. Reload to continue.';
         this.showReloadScreen(msg);
+    }
+
+    // One reconnect attempt: kick off signaling and resolve once the rebuilt
+    // data channel is verified and the device replies 'ready' (via
+    // _onReconnected), or reject on timeout / signaling error.
+    _reconnectOnce() {
+        return new Promise((resolve, reject) => {
+            this._reconnectResolve = resolve;
+            this._reconnectReject = reject;
+            this._reconnectTimeout = setTimeout(() => this._settleReconnect(false, new Error('reconnect_timeout')), RECONNECT_TIMEOUT_MS);
+            // connectWebSocket resolves when the offer is handled; the ready
+            // signal comes later via _onReconnected. A WS/offer error here
+            // fails this attempt.
+            this.connectWebSocket().catch(e => this._settleReconnect(false, e));
+        });
+    }
+
+    // Resolve/reject the in-flight reconnect attempt exactly once.
+    _settleReconnect(ok, err) {
+        if (this._reconnectTimeout) { clearTimeout(this._reconnectTimeout); this._reconnectTimeout = null; }
+        const resolve = this._reconnectResolve, reject = this._reconnectReject;
+        this._reconnectResolve = null;
+        this._reconnectReject = null;
+        if (ok && resolve) resolve();
+        else if (!ok && reject) reject(err || new Error('reconnect_failed'));
+    }
+
+    // Called from onDataChannelReady when the rebuilt transport reaches 'ready'.
+    _onReconnected() {
+        this._settleReconnect(true);
+    }
+
+    // Resolve once navigator.onLine is true. The 'online' event is the
+    // primary signal; a 5s poll backstops it and lets the reconnect loop
+    // notice _turnEnded while parked here.
+    async _waitForOnline() {
+        while (!navigator.onLine && !this._turnEnded) {
+            await new Promise((resolve) => {
+                const done = () => {
+                    window.removeEventListener('online', done);
+                    clearTimeout(timer);
+                    resolve();
+                };
+                const timer = setTimeout(done, 5000);
+                window.addEventListener('online', done);
+            });
+        }
+    }
+
+    // Tear down the dead transport and reset per-connection state so the next
+    // attempt re-runs _onFirstConnected (re-detects relay, re-arms TURN
+    // timers). The sessionId, iframe, SW registration, and window listener are
+    // deliberately left intact — they survive the transport swap.
+    _teardownTransport() {
+        this._clearTurnEndTimers();
+        this._clearReassureTimer();
+        try { if (this.dataChannel) this.dataChannel.close(); } catch (e) {}
+        try { if (this.pc) this.pc.close(); } catch (e) {}
+        try { if (this.ws) this.ws.close(); } catch (e) {}
+        this.dataChannel = null;
+        this.pc = null;
+        this.ws = null;
+        this.remoteDescriptionSet = false;
+        this.deviceVerified = false;
+        this.connectResolve = null;
+        this.candidateQueue = new CandidateQueue();
+        this._wasConnected = false;
+        this._usingRelay = false;
+        this._turnHoldPromise = null;
+        this._turnExpiryMs = null;
+    }
+
+    _showReconnecting() {
+        let el = document.getElementById('bb-reconnect-banner');
+        if (!el) {
+            this._prevTitle = document.title;   // restored in _hideReconnecting
+            document.title = 'Reconnecting… — bitba.ng';
+            el = document.createElement('div');
+            el.id = 'bb-reconnect-banner';
+            el.textContent = 'Reconnecting…';
+            el.style.cssText = 'position:fixed;top:0;left:0;right:0;z-index:2147483647;' +
+                'background:#333;color:#fff;font:13px/1.6 sans-serif;text-align:center;' +
+                'padding:4px;opacity:0.92;';
+            document.body.appendChild(el);
+        }
+    }
+
+    _hideReconnecting() {
+        const el = document.getElementById('bb-reconnect-banner');
+        if (el) el.remove();
+        if (this._prevTitle != null) {
+            document.title = this._prevTitle;
+            this._prevTitle = null;
+        }
     }
 
     handleDataChannelMessage(event) {
@@ -1278,6 +1452,14 @@ class BitBangConnection {
     }
 
     showReloadScreen(message) {
+        // This is terminal — cancel any in-flight soft reconnect and mark the
+        // session ended so a reconnect loop mid-backoff bails out.
+        this._turnEnded = true;
+        if (this._reconnecting) {
+            this._reconnecting = false;
+            this._settleReconnect(false, new Error('terminal'));
+        }
+        this._hideReconnecting();
         const iframe = document.getElementById('device-frame');
         if (iframe) iframe.style.display = 'none';
         if (this.connectionUI) {
@@ -1471,10 +1653,10 @@ class BitBangConnection {
         }, '*');
     }
 
-    async onDataChannelReady() {
-        // Brief delay for any pending tracks to arrive
-        await new Promise(resolve => setTimeout(resolve, 100));
-
+    // Send the connect handshake and wait for the device's 'ready' (plus the
+    // optional 2 s TURN banner hold). Shared by the initial connect and by a
+    // soft reconnect — everything here is safe to run on a rebuilt transport.
+    async _sendConnectAndAwaitReady() {
         // Send connect handshake with path (streamId 0). `version` is
         // the SWSP version we're speaking; older v2 listeners ignore
         // it. No `caps` field — bootstrap.js is a pure transport and
@@ -1487,13 +1669,29 @@ class BitBangConnection {
         });
         this.dataChannel.send(this.createFrame(0, FLAG_SYN, connectMsg));
 
-        // Wait for 'ready' response from device, AND for the optional 2 s
-        // TURN banner hold. The hold timer is armed in _onFirstConnected
-        // (which runs at DTLS-up, before this point), so the wait is
-        // concurrent with device app boot. On non-relay paths the hold is
-        // null and Promise.all skips immediately.
+        // The hold timer is armed in _onFirstConnected (which runs at DTLS-up,
+        // before this point), so the wait is concurrent with device app boot.
+        // On non-relay paths the hold is null and Promise.all skips immediately.
         const connectPromise = new Promise(resolve => { this.connectResolve = resolve; });
         await Promise.all([connectPromise, this._turnHoldPromise || Promise.resolve()]);
+    }
+
+    async onDataChannelReady() {
+        // Brief delay for any pending tracks to arrive
+        await new Promise(resolve => setTimeout(resolve, 100));
+
+        await this._sendConnectAndAwaitReady();
+
+        // Reconnect path: the transport was rebuilt under a live page. The
+        // iframe, SW registration, and window message listener all persist
+        // across the swap, so skip the one-time setup below — just resolve
+        // the in-flight attempt and let the proxied app retry over the new
+        // channel.
+        if (this._transportReady) {
+            this._onReconnected();
+            return;
+        }
+        this._transportReady = true;
 
         // Register this tab's session with the SW. Deferred until here so
         // the device's routing declaration (received on 'ready') has been
@@ -1502,6 +1700,19 @@ class BitBangConnection {
         // becomes the 'device' sentinel on the SW side (see sw.js), which
         // is what the cookie jar keys and popup redirects use.
         const reg = await navigator.serviceWorker.ready;
+        // Registration must complete before createIframe(): the iframe's
+        // first navigation races this postMessage into the SW, and if the
+        // fetch wins, proxyToDevice finds no session and 503s ("BitBang:
+        // no connection"). Send a reply port and wait for the SW's ack,
+        // with a timeout fallback so a wedged SW can't hang the page.
+        const ackChannel = new MessageChannel();
+        const ack = new Promise((resolve) => {
+            const timer = setTimeout(() => {
+                console.warn('[Bootstrap] setBootstrap ack timed out — proceeding');
+                resolve();
+            }, 2000);
+            ackChannel.port1.onmessage = () => { clearTimeout(timer); resolve(); };
+        });
         reg.active.postMessage({
             type: 'setBootstrap',
             sessionId: this.sessionId,
@@ -1514,7 +1725,8 @@ class BitBangConnection {
             code: this.code,
             debug: this.debug,
             noCookieJar: this.noCookieJar,
-        });
+        }, [ackChannel.port2]);
+        await ack;
 
         // Listen for messages from the iframe (WebSocket shim + navigation
         // + open-cap launcher requests).

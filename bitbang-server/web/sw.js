@@ -86,6 +86,9 @@ self.addEventListener('message', async (event) => {
         saveSessions();
         console.log('[SW] Bootstrap registered, session:', event.data.sessionId,
             event.data.noCookieJar ? '(nocookiejar)' : '');
+        // Ack so the page knows the session is routable before it creates
+        // the iframe (whose first fetch races this message handler).
+        event.ports?.[0]?.postMessage({ type: 'bootstrapAck' });
     } else if (event.data?.type === 'unsetBootstrap' && event.data.sessionId) {
         // Best-effort cleanup from pagehide. Don't gate on event.source --
         // it may be null when fired during page unload, and even when it's
@@ -624,7 +627,14 @@ async function proxyToDevice(event) {
     // -- Find bootstrap client --
     let bootstrap = null;
     await sessionsReady;
-    const session = sessions.get(sessionId);
+    let session = sessions.get(sessionId);
+    // A request can still beat setBootstrap here (e.g. an ack-less older
+    // page, or a fetch already in flight when the SW restarted). Give
+    // registration up to ~1s to land before declaring no connection.
+    for (let i = 0; !session && i < 10; i++) {
+        await new Promise(r => setTimeout(r, 100));
+        session = sessions.get(sessionId);
+    }
     if (session) {
         // In-memory only; no saveSessions() per fetch. lastActive is used
         // as a tie-breaker in redirectViaActiveSession — ephemeral is fine.
