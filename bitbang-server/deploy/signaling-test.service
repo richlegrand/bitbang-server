@@ -13,4 +13,9 @@ StandardOutput=journal
 StandardError=journal
 
 [Install]
-WantedBy=multi-user.target
+# default.target, not multi-user.target: this is a systemd *user* unit
+# (the upload script runs `systemctl --user`). The user manager has no
+# multi-user.target, so enabling against it silently produces a
+# multi-user.target.wants/ symlink that nothing ever pulls in — the
+# service then fails to start after a host reboot.
+WantedBy=default.target

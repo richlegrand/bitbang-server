@@ -2774,10 +2774,15 @@ window.addEventListener('hashchange', () => {
         return;
     }
     if (pathParts.length === 0) {
-        // Entry page. If the operator's snippet provided a #bb-pair-input
-        // slot, the form renders there and #connection-ui is unused — hide
-        // it so the "Loading..." placeholder doesn't sit below the snippet.
-        // If no slot, showPairingInput falls back to #connection-ui itself.
+        // Entry page. Nothing here connects to a device, so the title is
+        // never overwritten by _print() or by the iframe title the way
+        // the device flow overwrites it — set it explicitly, or the tab
+        // and any bookmark keep the bare static fallback.
+        document.title = 'BitBang';
+        // If the operator's snippet provided a #bb-pair-input slot, the
+        // form renders there and #connection-ui is unused — hide it so
+        // the placeholder doesn't sit below the snippet. If no slot,
+        // showPairingInput falls back to #connection-ui itself.
         if (document.getElementById('bb-pair-input') && connectionUIDiv) {
             connectionUIDiv.style.display = 'none';
         }

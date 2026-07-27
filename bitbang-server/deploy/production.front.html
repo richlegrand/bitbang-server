@@ -35,6 +35,61 @@ contract. bitba.ng-specific — self-hosted deployments ship their own.
   .bb-page .bb-links a:hover { text-decoration: underline; }
   .bb-page .bb-install-section a { color: #06c; text-decoration: none; }
   .bb-page .bb-install-section a:hover { text-decoration: underline; }
+
+  /* Subscribe modal. Deliberately a plain form POST — no Brevo
+     stylesheet, fonts, or JS. Their embed loads assets.brevo.com and
+     sibforms.com on every page render, which would hand a third party a
+     request log of all bitba.ng traffic and run their script in the same
+     origin as bootstrap.js. The only script here is ours. */
+  .bb-modal {
+    /* Centred explicitly rather than relying on the UA default, which
+       centres horizontally but top-aligns vertically in some browsers.
+       margin:0 overrides the UA's `margin:auto`. */
+    position: fixed;
+    top: 50%;
+    left: 50%;
+    transform: translate(-50%, -50%);
+    margin: 0;
+    border: 1px solid #e0e0e0;
+    border-radius: 12px;
+    padding: 22px;
+    max-width: 380px;
+    width: calc(100% - 40px);
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+    color: #333;
+    box-shadow: 0 10px 40px rgba(0,0,0,.18);
+  }
+  .bb-modal::backdrop { background: rgba(0,0,0,.35); }
+  .bb-modal-head { display: flex; align-items: baseline; justify-content: space-between; }
+  .bb-modal h2 { font-size: 17px; font-weight: 600; margin: 0; }
+  .bb-modal p { font-size: 13px; line-height: 1.5; color: #888; margin: 6px 0 14px; }
+  .bb-modal-x {
+    border: 0; background: none; cursor: pointer;
+    font-size: 20px; line-height: 1; color: #aaa; padding: 0 0 0 12px;
+  }
+  .bb-modal-x:hover { color: #666; }
+  .bb-modal form { display: flex; gap: 8px; }
+  .bb-modal input[type=email] {
+    flex: 1; min-width: 0; padding: 8px 10px; font-size: 13px;
+    font-family: inherit; color: #333;
+    border: 1px solid #e0e0e0; border-radius: 8px;
+  }
+  .bb-modal button[type=submit] {
+    padding: 8px 14px; font-size: 13px; font-family: inherit;
+    border: 0; border-radius: 8px;
+    background: #06c; color: #fff; cursor: pointer; white-space: nowrap;
+  }
+  .bb-modal button[type=submit]:hover { background: #0056b3; }
+  .bb-modal .bb-sub-done { color: #333; margin: 0; }
+  /* Honeypot, and the sink iframe that keeps the POST from navigating
+     the page. Brevo's own markup hides the honeypot with a class defined
+     in the stylesheet we're not loading — without this rule it renders
+     as a visible text box, real users type in it, and Brevo silently
+     drops their signup. */
+  .bb-hp {
+    position: absolute; left: -9999px; width: 1px; height: 1px;
+    border: 0; overflow: hidden;
+  }
 </style>
 <div class="bb-page">
   <div id="bb-pair-input"></div>
@@ -48,5 +103,80 @@ contract. bitba.ng-specific — self-hosted deployments ship their own.
     <a href="https://github.com/richlegrand/bitbang" target="_blank" rel="noopener">Learn more about BitBang</a>
     &nbsp;·&nbsp;
     <a href="https://github.com/richlegrand/bitbang-cli" target="_blank" rel="noopener">BitBang CLI repo</a>
+    &nbsp;·&nbsp;
+    <a href="#subscribe" id="bb-sub-open">Subscribe</a>
+    &nbsp;·&nbsp;
+    <a href="mailto:hello@bitba.ng">Questions or issues</a>
   </p>
 </div>
+
+<dialog id="bb-sub-modal" class="bb-modal" aria-labelledby="bb-sub-title">
+  <div class="bb-modal-head">
+    <h2 id="bb-sub-title">Stay updated</h2>
+    <button type="button" class="bb-modal-x" id="bb-sub-close" aria-label="Close">&times;</button>
+  </div>
+  <p>Receive BitBang related updates.</p>
+  <form method="POST" target="bb-sub-sink" id="bb-sub-form"
+        action="https://6da56970.sibforms.com/serve/MUIFAEq-XOnXeeE2q7Yj3P7TSNDr2jM84sqngAPJGD4S3VEkqPONZCBrm-MJUuyecKIzD6QA8COT3TYmOzdGwS3BYyaFihAuglU2Wbhi1mAxv8UNkKxb6y5hHfcmpZMmlbbLcawBhvcul2dtCwhiX6bBb1G7pRi4FxO9wvFZ0MsJa2hE2HxgI72N3VLuiz9-NIC_3LMdhbv6-4cH">
+    <input type="email" id="EMAIL" name="EMAIL" placeholder="you@example.com"
+           autocomplete="email" required>
+    <input class="bb-hp" type="text" name="email_address_check" value=""
+           tabindex="-1" autocomplete="off" aria-hidden="true">
+    <input type="hidden" name="locale" value="en">
+    <button type="submit">Subscribe</button>
+  </form>
+  <p class="bb-sub-done" id="bb-sub-done" hidden>Thanks — check your email to confirm.</p>
+</dialog>
+
+<!-- Submissions post into this sink so the browser never navigates to
+     Brevo's raw JSON response. The response is cross-origin and can't be
+     read, so the confirmation below is optimistic — which is accurate
+     anyway, since double opt-in means the real outcome depends on the
+     confirmation email. -->
+<iframe name="bb-sub-sink" class="bb-hp" aria-hidden="true" tabindex="-1"></iframe>
+
+<script>
+  (function () {
+    var modal = document.getElementById('bb-sub-modal');
+    var open  = document.getElementById('bb-sub-open');
+    var form  = document.getElementById('bb-sub-form');
+    var done  = document.getElementById('bb-sub-done');
+    var xBtn  = document.getElementById('bb-sub-close');
+    if (!modal || !open || !form) return;
+
+    // Older browsers without <dialog>: leave the link as a plain anchor
+    // rather than trapping the click and doing nothing.
+    if (typeof modal.showModal !== 'function') return;
+
+    function reset() {
+      form.hidden = false;
+      done.hidden = true;
+      form.reset();
+    }
+
+    open.addEventListener('click', function (e) {
+      e.preventDefault();
+      reset();
+      modal.showModal();
+    });
+
+    xBtn.addEventListener('click', function () { modal.close(); });
+
+    // Click outside the panel closes it. <dialog> reports backdrop
+    // clicks as clicks on the dialog element itself.
+    modal.addEventListener('click', function (e) {
+      if (e.target === modal) modal.close();
+    });
+
+    form.addEventListener('submit', function () {
+      // The POST proceeds into the sink iframe; swap in the confirmation
+      // and dismiss shortly after so the action is acknowledged rather
+      // than the modal just vanishing.
+      setTimeout(function () {
+        form.hidden = true;
+        done.hidden = false;
+        setTimeout(function () { modal.close(); }, 1400);
+      }, 200);
+    });
+  })();
+</script>

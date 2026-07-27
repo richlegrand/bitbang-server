@@ -2,7 +2,21 @@
 <html>
 <head>
     <meta charset="utf-8">
-    <title>Loading...</title>
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <!-- Static fallback title. The device flow overwrites this almost
+         immediately (_print() puts connection status in the tab, then
+         the proxied app's own title takes over), and the entry page sets
+         its own in bootstrap.js. This value is what a link-preview
+         scraper sees and what shows before any JS runs, so it must be
+         the product name rather than a status word. -->
+    <title>BitBang</title>
+    <meta name="description" content="Connect to any device from your browser. No account, no port forwarding, no client to install — end-to-end encrypted peer-to-peer links.">
+    <meta property="og:type" content="website">
+    <meta property="og:site_name" content="BitBang">
+    <meta property="og:title" content="BitBang">
+    <meta property="og:description" content="Connect to any device from your browser. No account, no port forwarding, no client to install — end-to-end encrypted peer-to-peer links.">
+    <meta property="og:url" content="https://bitba.ng/">
+    <meta name="twitter:card" content="summary">
     <!-- Explicit favicon link bypasses the browser's default
          autodiscovery of /favicon.ico, which the SW intercepts and
          tries to proxy through the device (where it 404s). The
