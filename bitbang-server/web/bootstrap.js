@@ -82,9 +82,19 @@ const SWSP_CHUNK_SIZE = 16384;  // max payload bytes per data-channel frame
 // network blip on a long-lived session), rebuild the transport under the live
 // page instead of showing the reload screen. Modeled as a fresh connection
 // request — the device needs no ICE-restart support; it just answers a new
-// request via its normal HandleRequest path. Bounded retries with linear
-// backoff; the reload screen is the fallback once these are exhausted.
-const MAX_RECONNECT_ATTEMPTS = 6;
+// request via its normal HandleRequest path.
+//
+// Recovery is budgeted by wall-clock time, not attempt count: failures differ
+// wildly in cost (a restarting signaling server refuses in milliseconds; a
+// device that hasn't re-registered yet answers "not found" just as fast; a
+// dead path times out in seconds), and they are all the same condition — the
+// way back isn't ready yet. So: retry with capped exponential backoff until
+// RECONNECT_WINDOW_MS of effort has elapsed against a reachable network.
+// While the browser knows it's offline, attempts are provably pointless;
+// park until the 'online' event and start a fresh window. The reload screen
+// is the fallback once the window closes.
+const RECONNECT_WINDOW_MS = 5 * 60 * 1000;  // give up after this much failed effort
+const RECONNECT_MAX_BACKOFF_MS = 10000;     // cap on the delay between attempts
 const RECONNECT_TIMEOUT_MS = 20000;  // per attempt: WS + offer + DC verify + ready
 const RECONNECT_SETTLE_MS = 2000;    // after offline→online, let the network settle
 
@@ -616,6 +626,19 @@ class BitBangConnection {
                 clearTimeout(offerTimeout);
                 reject(new Error('WebSocket connection failed'));
             };
+
+            this.ws.onclose = () => {
+                // A clean close (e.g. the signaling server restarting) fires
+                // no 'error' event — without this, a setup in progress would
+                // ride out its full timeout instead of failing fast. Once
+                // setup has resolved, reject is a no-op: the signaling WS is
+                // setup-only by design, the session runs P2P, and recovery
+                // redials on demand — so a post-setup close is expected and
+                // harmless (it also fires on our own teardown's close()).
+                clearTimeout(offerTimeout);
+                if (this.debug) console.log('[Bootstrap] signaling WS closed');
+                reject(new Error('WebSocket closed'));
+            };
         });
     }
 
@@ -1062,20 +1085,22 @@ class BitBangConnection {
         this._clearReassureTimer();
         this._showReconnecting();
 
+        // deadline is (re)armed whenever attempting becomes newly possible:
+        // at entry, and again when connectivity returns after an offline
+        // park. Between those points it only counts down.
+        let deadline = Date.now() + RECONNECT_WINDOW_MS;
+        let backoff = 1000;
         let attempt = 0;
-        while (attempt < MAX_RECONNECT_ATTEMPTS) {
-            // A terminal screen (e.g. device_preempted) may have fired while we
-            // were backing off — stop trying if so.
-            if (this._turnEnded) { this._reconnecting = false; this._hideReconnecting(); return; }
-            // While the browser knows it's offline, attempts fail instantly and
-            // would burn the whole budget in seconds. Hold here until
-            // connectivity returns, let it settle, and grant a fresh budget.
+        // A terminal screen (e.g. device_preempted, relay expiry) may fire at
+        // any await point — _turnEnded ends the loop wherever it's checked.
+        while (!this._turnEnded) {
             if (!navigator.onLine) {
                 console.log('[Bootstrap] offline — waiting for connectivity before reconnecting');
                 await this._waitForOnline();
-                if (this._turnEnded) { this._reconnecting = false; this._hideReconnecting(); return; }
+                if (this._turnEnded) break;
                 await new Promise(r => setTimeout(r, RECONNECT_SETTLE_MS));
-                attempt = 0;
+                deadline = Date.now() + RECONNECT_WINDOW_MS;
+                backoff = 1000;
                 continue;
             }
             attempt++;
@@ -1087,15 +1112,17 @@ class BitBangConnection {
                 this._hideReconnecting();
                 return;
             } catch (e) {
-                console.warn(`[Bootstrap] reconnect attempt ${attempt}/${MAX_RECONNECT_ATTEMPTS} failed:`, e?.message || e);
-                const backoff = Math.min(1000 * attempt, 5000);
+                console.warn(`[Bootstrap] reconnect attempt ${attempt} failed:`, e?.message || e);
+                if (Date.now() + backoff >= deadline) break;
                 await new Promise(r => setTimeout(r, backoff));
+                backoff = Math.min(backoff * 2, RECONNECT_MAX_BACKOFF_MS);
             }
         }
 
-        // Exhausted — fall back to the terminal screen.
+        // Window closed (or a terminal screen owns the page) — fall back.
         this._reconnecting = false;
         this._hideReconnecting();
+        if (this._turnEnded) return;
         this._turnEnded = true;
         const msg = this._usingRelay
             ? 'Connection lost — relay may have expired.'
