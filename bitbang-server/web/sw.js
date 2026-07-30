@@ -20,6 +20,31 @@ self.addEventListener('activate', (event) => event.waitUntil(self.clients.claim(
 const sessions = new Map();
 const SESSIONS_CACHE_KEY = '/__bitbang__/sessions';
 
+// -- Client -> session binding (fix 1c) --------------------------------------
+//
+// Maps clientId -> sessionId. Recorded when the SW proxies a navigation for
+// an already-resolved session: FetchEvent.resultingClientId is the id of the
+// client that navigation will create, so the frame that lands can later be
+// resolved by IDENTITY instead of by parsing a URL.
+//
+// Why this exists: xhr-shim.js:44 deliberately strips /__device__/<sid> from
+// the iframe's own URL (SPA routers read location.pathname and can't match a
+// route with the proxy prefix in it). That erases the routing key from BOTH
+// signals the concrete strategies read -- the frame's client.url and the
+// referrer it sends. So a short-top-path navigation out of a proxied iframe
+// (Frigate's post-login `location.href = '/'`) is structurally unresolvable:
+// confirmed live 2026-07-30, sessions map populated, no strategy matched.
+//
+// A clientId binding is immune to that rewriting, and unlike frameType or
+// request.destination it names WHICH session -- so it stays exact with
+// several tabs open, instead of degrading to a most-recent guess.
+//
+// Persisted alongside sessions because SW idle-termination (~30s) is easily
+// reached while a user types a password; an in-memory-only binding would be
+// gone by the time the login POST completes.
+const clientSessions = new Map();
+const CLIENT_SESSIONS_CACHE_KEY = '/__bitbang__/client-sessions';
+
 async function loadSessions() {
     try {
         const cache = await caches.open('bitbang-sessions');
@@ -34,7 +59,57 @@ async function loadSessions() {
                 console.log(`[SW] Restored ${entries.length} session(s) from cache`);
             }
         }
+        const cresp = await cache.match(CLIENT_SESSIONS_CACHE_KEY);
+        if (cresp) {
+            const cdata = await cresp.json();
+            for (const [cid, sid] of Object.entries(cdata)) {
+                clientSessions.set(cid, sid);
+            }
+        }
     } catch (e) {}
+}
+
+// Serialized like the cookie jar: full-snapshot writes that land out of
+// order would revert the whole binding table, not just lose one entry.
+let clientSessionsSaveChain = Promise.resolve();
+
+function saveClientSessions() {
+    const data = {};
+    for (const [cid, sid] of clientSessions) data[cid] = sid;
+    const body = JSON.stringify(data);
+    clientSessionsSaveChain = clientSessionsSaveChain
+        .then(() => caches.open('bitbang-sessions'))
+        .then(cache => cache.put(CLIENT_SESSIONS_CACHE_KEY,
+            new Response(body, { headers: { 'Content-Type': 'application/json' } })
+        ))
+        .catch(() => {});
+    return clientSessionsSaveChain;
+}
+
+// Drop bindings whose session is gone, then bound the table. Each navigation
+// within a session mints a new clientId, so without a cap a long-lived
+// session would grow this without limit. Map preserves insertion order, so
+// deleting from the front evicts oldest-first.
+const MAX_CLIENT_BINDINGS = 200;
+
+function pruneClientSessions() {
+    for (const [cid, sid] of clientSessions) {
+        if (!sessions.has(sid)) clientSessions.delete(cid);
+    }
+    while (clientSessions.size > MAX_CLIENT_BINDINGS) {
+        clientSessions.delete(clientSessions.keys().next().value);
+    }
+}
+
+// Record the binding for a navigation the SW is about to proxy. resultingClientId
+// is populated only for navigations, which is exactly when a new client appears.
+function rememberClientSession(event, sessionId) {
+    const rcid = event?.resultingClientId;
+    if (!rcid || !sessionId) return;
+    if (clientSessions.get(rcid) === sessionId) return;   // no-op, skip the write
+    clientSessions.set(rcid, sessionId);
+    pruneClientSessions();
+    keepAlive(event, saveClientSessions());
 }
 
 function saveSessions() {
@@ -151,6 +226,20 @@ self.addEventListener('message', async (event) => {
 //     otherwise leak to whatever session another tab has open.
 const SESSION_STRATEGIES = [
     {
+        name: 'client-binding',  // clientId recorded when this frame was navigated
+        evidence: 'concrete',
+        // Strongest signal available and the cheapest (a Map lookup, no
+        // await), so it runs first. Concrete because the binding was
+        // recorded by the SW itself while proxying a navigation for a
+        // known session -- it is not inferred from anything the page
+        // controls, and it survives xhr-shim.js:44 rewriting the URL.
+        async match({ event }) {
+            if (!event.clientId) return null;
+            const sid = clientSessions.get(event.clientId);
+            return sid && sessions.has(sid) ? sid : null;
+        },
+    },
+    {
         name: 'referer-device',  // referer has /__device__/<sid>
         evidence: 'concrete',
         async match({ referer }) {
@@ -258,7 +347,13 @@ async function findSession(event) {
             swept = true;
         }
     }
-    if (swept) saveSessions();
+    if (swept) {
+        saveSessions();
+        // Bindings pointing at a swept session must go too, or a recycled
+        // clientId could resolve to a dead session.
+        pruneClientSessions();
+        saveClientSessions();
+    }
 
     const ctx = {
         event,
@@ -268,7 +363,19 @@ async function findSession(event) {
     for (const strat of SESSION_STRATEGIES) {
         if (isShortTopPath && strat.evidence !== 'concrete') break;
         const sid = await strat.match(ctx);
-        if (sid) return sid;
+        if (sid) {
+            // Confirmation log for fix 1c. A short top path resolving via
+            // client-binding is exactly the case that used to fall through
+            // to the signaling server and load bootstrap.html into the
+            // iframe. Rare by nature, so it is not noisy -- if this never
+            // prints on a post-login navigation, the binding is not being
+            // recorded and the fix is inert.
+            if (isShortTopPath && strat.name === 'client-binding') {
+                console.log('[SW] client-binding resolved short top path',
+                    reqUrl.pathname, '->', sid);
+            }
+            return sid;
+        }
     }
     return null;
 }
@@ -601,6 +708,12 @@ self.addEventListener('fetch', (event) => {
     if (isServerEndpoint(url.pathname)) return;
 
     if (url.pathname.startsWith('/__device__/')) {
+        // Bind the client this navigation creates to the session named in
+        // the URL. This is the iframe's FIRST load (bootstrap sets
+        // src=/__device__/<sid>/…), and it is what makes the binding
+        // available later, once xhr-shim has stripped the prefix away.
+        const m = url.pathname.match(/^\/__device__\/([^/]+)/);
+        if (m && sessions.has(m[1])) rememberClientSession(event, m[1]);
         event.respondWith(proxyToDevice(event));
     } else {
         event.respondWith(proxyAbsolutePath(event, url));
@@ -756,6 +869,10 @@ async function redirectViaActiveSession(event, url) {
 async function proxyAbsolutePath(event, url) {
     const sessionId = await findSession(event);
     if (sessionId) {
+        // Keep the chain alive: an in-session navigation to an absolute path
+        // mints a new client, which must inherit the binding or the NEXT
+        // navigation out of that frame loses it again.
+        rememberClientSession(event, sessionId);
         const deviceUrl = `${url.origin}/__device__/${sessionId}${url.pathname}${url.search}`;
         const reqInit = {
             method: event.request.method,
