@@ -121,7 +121,7 @@ self.addEventListener('message', async (event) => {
         if (!session) return;
         await cookieJarReady;
         const jarKey = `${session.uid}:${session.target}`;
-        storeCookies(jarKey, event.data.value);
+        keepAlive(event, storeCookies(jarKey, event.data.value));
     }
 });
 
@@ -282,34 +282,113 @@ async function loadCookieJar() {
     try {
         const cache = await caches.open('bitbang-cookies');
         const resp = await cache.match(COOKIE_CACHE_KEY);
-        if (resp) {
-            const data = await resp.json();
-            for (const [key, cookies] of Object.entries(data)) {
-                cookieJar.set(key, cookies);
+        if (!resp) return;
+        const data = await resp.json();
+        if (!data || typeof data !== 'object') return;
+
+        const now = Date.now();
+        for (const [key, cookies] of Object.entries(data)) {
+            // Normalize on the way in rather than trusting the cache.
+            //
+            // The persisted shape has already changed once (httpOnly was
+            // added), and a partial or corrupt write is possible. Without
+            // this, a non-array value here makes every later
+            // jar.filter/findIndex throw -- inside the response handler,
+            // where an uncaught throw can leave the request promise
+            // unsettled and hang the fetch. One bad entry would break
+            // cookies permanently until the user cleared site data.
+            if (!Array.isArray(cookies)) continue;
+            const clean = [];
+            for (const c of cookies) {
+                if (!c || typeof c.name !== 'string' || typeof c.value !== 'string') continue;
+                const expires = typeof c.expires === 'number' ? c.expires : null;
+                // Filter expired on the way in, mirroring saveCookieJar's
+                // filter on the way out. Without this the two sides
+                // disagree and expired cookies get resurrected on restart.
+                if (expires !== null && expires <= now) continue;
+                clean.push({
+                    name: c.name,
+                    value: c.value,
+                    path: typeof c.path === 'string' && c.path ? c.path : '/',
+                    expires,
+                    httpOnly: !!c.httpOnly,
+                });
             }
+            if (clean.length > 0) cookieJar.set(key, clean);
         }
     } catch (e) {}
 }
 
+// Serializes jar writes. Every save persists a FULL snapshot, so two
+// concurrent saves resolving out of order would revert the whole jar to an
+// older state, not just lose one cookie. Chaining guarantees the last
+// caller's snapshot is the last one written.
+let cookieSaveChain = Promise.resolve();
+
 function saveCookieJar() {
     const data = {};
+    const now = Date.now();
     for (const [key, cookies] of cookieJar) {
-        const now = Date.now();
         const valid = cookies.filter(c => c.expires === null || c.expires > now);
         if (valid.length > 0) data[key] = valid;
     }
-    caches.open('bitbang-cookies').then(cache => {
-        cache.put(COOKIE_CACHE_KEY,
-            new Response(JSON.stringify(data), {
+    // Serialize synchronously so the snapshot is frozen at call time.
+    // Deferring JSON.stringify into the .then would stringify whatever the
+    // jar looks like when the promise runs, not when the save was requested.
+    const body = JSON.stringify(data);
+
+    cookieSaveChain = cookieSaveChain
+        .then(() => caches.open('bitbang-cookies'))
+        .then(cache => cache.put(COOKIE_CACHE_KEY,
+            new Response(body, {
                 headers: { 'Content-Type': 'application/json' }
             })
-        );
-    }).catch(() => {});
+        ))
+        .catch(() => {});
+    // Returned so callers can hand it to keepAlive() -- an unawaited
+    // cache.put is dropped outright if the SW is terminated first.
+    return cookieSaveChain;
+}
+
+// Hold the service worker alive until an async persistence write settles.
+// Chrome terminates an idle SW ~30s after the last event; without this a
+// cache.put issued while responding can simply never run, silently
+// reverting the persisted jar to an older state.
+//
+// Accepts either a real FetchEvent/ExtendableMessageEvent (has waitUntil)
+// or the synthetic event object proxyAbsolutePath constructs, which carries
+// a _waitUntil bound to the originating real event.
+function keepAlive(event, promise) {
+    try {
+        if (typeof event?.waitUntil === 'function') {
+            event.waitUntil(promise);
+        } else if (typeof event?._waitUntil === 'function') {
+            event._waitUntil(promise);
+        }
+    } catch (e) {
+        // waitUntil throws if the event is no longer active. The write is
+        // already in flight either way; losing the keepalive is not fatal.
+    }
+    return promise;
 }
 
 // Load persisted cookies on SW startup. The promise is awaited in the
 // fetch handler to ensure cookies are available for the first request.
 const cookieJarReady = loadCookieJar();
+
+// Browsers cap cookie lifetime at 400 days (RFC 6265bis; Chrome 104+).
+// The jar clamps to the same ceiling so it is never MORE permissive than
+// the browser the app would be talking to directly -- a proxy whose cookies
+// outlive the origin's own rules is a bug, not a feature.
+//
+// This also contains a real bug class: servers that put an absolute Unix
+// timestamp in Max-Age, which is defined as a relative duration in seconds.
+// Frigate does exactly this -- it sends Max-Age=<the JWT's own exp claim>,
+// so Date.now() + maxAge*1000 lands ~57 years out. Unclamped, the jar keeps
+// replaying a token that actually died 24 hours in and never expires it,
+// producing an authenticated-looking session that 401s on every request and
+// does not self-heal across reloads.
+const MAX_COOKIE_LIFETIME_MS = 400 * 24 * 60 * 60 * 1000;
 
 function parseCookie(setCookieStr) {
     const parts = setCookieStr.split(';').map(p => p.trim());
@@ -320,12 +399,39 @@ function parseCookie(setCookieStr) {
     const cookie = {
         name: nameValue.substring(0, eqIdx),
         value: nameValue.substring(eqIdx + 1),
+        // KNOWN DIVERGENCE FROM RFC 6265 §5.1.4 -- deliberate, do not
+        // "fix" casually. The spec's default-path is the directory of the
+        // request URI (a Set-Cookie with no Path from /app/x defaults to
+        // /app); we default to "/" instead, because parseCookie has no
+        // access to the request path.
+        //
+        // Consequences, both currently latent:
+        //   - Over-sharing: a cookie scoped to /app/ is sent to every path
+        //     under the same jarKey. Contained -- jarKey is uid:target, so
+        //     it cannot cross hosts or devices, only paths on one host.
+        //   - Dedupe collision: storeCookies keys on (name, path), so two
+        //     same-named cookies legitimately scoped to /a/ and /b/ both
+        //     land at "/" and clobber each other.
+        //
+        // Left alone on purpose: correcting it NARROWS cookie scope, which
+        // can only break apps that work today, and there is no coverage
+        // against real apps to catch that. Reviewed 2026-07-30 -- no
+        // observed misbehaviour, so it stays until an actual bug points
+        // here. If you do fix it, thread the request path in from
+        // storeCookies' caller and expect to retest every proxied app.
         path: '/',
         expires: null,
+        // Tracked so the jar can keep HttpOnly cookies out of the
+        // document.cookie mirror. See "HttpOnly invariant" below.
+        httpOnly: false,
     };
 
     for (const attr of attrs) {
-        const [k, v] = attr.split('=').map(s => s.trim());
+        // Split on the FIRST '=' only. attr.split('=') would truncate any
+        // attribute value that itself contains '=' (e.g. Path=/a=b).
+        const eq = attr.indexOf('=');
+        const k = (eq < 0 ? attr : attr.slice(0, eq)).trim();
+        const v = eq < 0 ? undefined : attr.slice(eq + 1).trim();
         const kl = k.toLowerCase();
         if (kl === 'path') {
             cookie.path = v || '/';
@@ -335,13 +441,69 @@ function parseCookie(setCookieStr) {
         } else if (kl === 'expires' && cookie.expires === null) {
             const d = new Date(v);
             if (!isNaN(d.getTime())) cookie.expires = d.getTime();
+        } else if (kl === 'httponly') {
+            cookie.httpOnly = true;
         }
+    }
+
+    // Clamp to the browser's 400-day ceiling. Applied after the attribute
+    // loop so it covers both Max-Age and Expires.
+    if (cookie.expires !== null) {
+        const ceiling = Date.now() + MAX_COOKIE_LIFETIME_MS;
+        if (cookie.expires > ceiling) cookie.expires = ceiling;
     }
     return cookie;
 }
 
+// -- HttpOnly invariant ------------------------------------------------------
+//
+// HttpOnly cookies live ONLY in the SW jar. They are attached to outbound
+// requests (getCookieHeader, and the WebSocket upgrade via the getCookies
+// message) but are never written into document.cookie by any of the three
+// mirror paths: the per-response X-BB-Set-Cookie header, the parse-time
+// cookieSync injection, and the cross-tab BroadcastChannel.
+//
+// Rationale: the mirror exists so app code can read values it legitimately
+// reads (CSRF tokens and the like). App code by definition never reads an
+// HttpOnly cookie, so mirroring one buys nothing -- and costs the protection,
+// because the browser ignores the HttpOnly attribute on a document.cookie
+// write, turning a protected session token into a JS-readable one. For a
+// proxied app that means XSS could exfiltrate a session it could not have
+// touched on the origin site.
+//
+// Note: jars persisted before this flag existed have httpOnly === undefined
+// (falsy), so their cookies keep mirroring until the app re-issues them.
+function isMirrorable(cookie) {
+    return !cookie.httpOnly;
+}
+
+// Serialize a value for embedding inside an inline <script> element.
+//
+// JSON.stringify alone is NOT safe here. It produces a valid JS literal but
+// does not escape "<", and the HTML parser terminates a script block at the
+// first "</script" sequence regardless of JS string context. A cookie whose
+// value contains "</script><img src=x onerror=...>" would therefore close
+// the shim's script tag and inject arbitrary markup into the bitba.ng page.
+//
+// That path is reachable: app code writing document.cookie is mirrored into
+// the jar via the cookieWrite message, and the jar is replayed into every
+// subsequent HTML navigation by cookieSync. So an XSS inside a proxied app
+// could otherwise escalate into persistent injection in the proxy wrapper --
+// and persist across sessions, because the jar lives in the Cache API.
+//
+// Escaping "<" closes both "</script" and "<!--". U+2028/U+2029 are escaped
+// because they are literal line terminators in JS source.
+function jsonForScript(value) {
+    return JSON.stringify(value)
+        .replace(/</g, '\\u003c')
+        .replace(/\u2028/g, '\\u2028')
+        .replace(/\u2029/g, '\\u2029');
+}
+
+// Returns the persistence promise so callers can keepAlive() it. Always
+// returns a promise, including on the no-op path.
 function storeCookies(jarKey, setCookieHeaders) {
-    if (!setCookieHeaders) return;
+    if (!setCookieHeaders) return Promise.resolve();
     const headers = Array.isArray(setCookieHeaders) ? setCookieHeaders : [setCookieHeaders];
 
     if (!cookieJar.has(jarKey)) cookieJar.set(jarKey, []);
@@ -360,7 +522,7 @@ function storeCookies(jarKey, setCookieHeaders) {
         jar.push(cookie);
     }
 
-    saveCookieJar();
+    return saveCookieJar();
 }
 
 function getCookieHeader(jarKey, requestPath) {
@@ -378,9 +540,16 @@ function getCookieHeader(jarKey, requestPath) {
         return true;
     });
 
+    let pruned = false;
     for (let i = jar.length - 1; i >= 0; i--) {
-        if (jar[i].expires !== null && jar[i].expires <= now) jar.splice(i, 1);
+        if (jar[i].expires !== null && jar[i].expires <= now) {
+            jar.splice(i, 1);
+            pruned = true;
+        }
     }
+    // Persist the prune. Previously this read path mutated the in-memory jar
+    // and left the cache untouched, so the two drifted apart.
+    if (pruned) saveCookieJar();
 
     if (valid.length === 0) return null;
     valid.sort((a, b) => b.path.length - a.path.length);
@@ -603,7 +772,13 @@ async function proxyAbsolutePath(event, url) {
             reqInit.body = event.request.body;
             reqInit.duplex = 'half';
         }
-        const proxyEvent = { request: new Request(deviceUrl, reqInit) };
+        const proxyEvent = {
+            request: new Request(deviceUrl, reqInit),
+            // Bridge to the real FetchEvent so proxyToDevice can keep the SW
+            // alive for async jar writes. The synthetic event has no
+            // waitUntil of its own.
+            _waitUntil: (p) => event.waitUntil(p),
+        };
         // Carry the navigate flag so proxyToDevice can inject shims
         if (event.request.mode === 'navigate') {
             proxyEvent._isNavigate = true;
@@ -749,7 +924,9 @@ async function proxyToDevice(event) {
                 // Store response cookies in our jar (skipped when !nocookiejar is set)
                 const setCookie = headers?.['Set-Cookie'] || headers?.['set-cookie'];
                 if (setCookie && !session.noCookieJar) {
-                    storeCookies(jarKey, setCookie);
+                    // keepAlive: the jar write is async and the SW can be
+                    // terminated the moment this response is done streaming.
+                    keepAlive(event, storeCookies(jarKey, setCookie));
                     // Surface cookies via a custom header so xhr-shim can
                     // sync them into document.cookie *synchronously* in the
                     // same Promise/event chain as the response, before app
@@ -761,18 +938,21 @@ async function proxyToDevice(event) {
                     // current document origin (bitba.ng) instead of silently
                     // refusing the write when the upstream's Domain attribute
                     // (e.g. octoprint.local, 192.168.1.10) doesn't match.
-                    // HttpOnly is also dropped -- it's silently ignored on JS
-                    // writes anyway, just cleaner to omit.
                     const stripCookieAttrs = (s) => s.split(';')
                         .map(p => p.trim())
-                        .filter(p => {
-                            const lower = p.toLowerCase();
-                            return !lower.startsWith('domain=') && lower !== 'httponly';
-                        })
+                        .filter(p => !p.toLowerCase().startsWith('domain='))
                         .join('; ');
+                    // HttpOnly cookies are withheld from the mirror entirely
+                    // (see "HttpOnly invariant"). They are already in the jar,
+                    // so outbound requests still carry them.
+                    const isHttpOnlyHeader = (s) => s.split(';').slice(1)
+                        .some(p => p.trim().toLowerCase() === 'httponly');
                     const list = (Array.isArray(setCookie) ? setCookie : [setCookie])
+                        .filter(s => !isHttpOnlyHeader(s))
                         .map(stripCookieAttrs);
-                    headers['X-BB-Set-Cookie'] = JSON.stringify(list);
+                    if (list.length > 0) {
+                        headers['X-BB-Set-Cookie'] = JSON.stringify(list);
+                    }
                     // Cross-tab fallback: another tab won't see X-BB-Set-Cookie
                     // (different fetch). The broadcast keeps its document.cookie
                     // eventually consistent.
@@ -782,7 +962,10 @@ async function proxyToDevice(event) {
                     // never match across tabs — filtering on sessionId
                     // silently dropped every cross-tab broadcast.
                     const bc = new BroadcastChannel('bitbang-cookies');
-                    bc.postMessage({ jarKey, cookies: cookieJar.get(jarKey) || [] });
+                    bc.postMessage({
+                        jarKey,
+                        cookies: (cookieJar.get(jarKey) || []).filter(isMirrorable),
+                    });
                     bc.close();
                     delete headers['Set-Cookie'];
                     delete headers['set-cookie'];
@@ -823,7 +1006,9 @@ async function proxyToDevice(event) {
                                     const now = Date.now();
                                     for (const c of jar) {
                                         if (c.expires !== null && c.expires <= now) continue;
-                                        cookieSync += `document.cookie=${JSON.stringify(c.name + '=' + c.value + ';path=' + c.path)};`;
+                                        // HttpOnly stays jar-only (see invariant).
+                                        if (!isMirrorable(c)) continue;
+                                        cookieSync += `document.cookie=${jsonForScript(c.name + '=' + c.value + ';path=' + c.path)};`;
                                     }
                                 }
                             }
@@ -832,7 +1017,7 @@ async function proxyToDevice(event) {
                                 ? '<script src="https://cdn.jsdelivr.net/npm/eruda" onload="eruda.init();eruda.position({x:innerWidth-60,y:innerHeight-60})"></script>'
                                 : '';
                             const shims = '<!DOCTYPE html>'
-                                + `<script>window.__bbSessionId='${sessionId}';window.__bbJarKey=${JSON.stringify(jarKey)};window.__bbDebug=${!!session?.debug};${cookieSync}</script>`
+                                + `<script>window.__bbSessionId=${jsonForScript(sessionId)};window.__bbJarKey=${jsonForScript(jarKey)};window.__bbDebug=${!!session?.debug};${cookieSync}</script>`
                                 + eruda
                                 + '<script src="/__bitbang__/xhr-shim.js"></script>'
                                 + '<script src="/__bitbang__/ws-shim.js"></script>';

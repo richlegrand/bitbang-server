@@ -1996,6 +1996,14 @@ class BitBangConnection {
             // href/rel/sizes also trigger it, covering apps that swap the
             // href in place. Observer is re-attached per iframe.onload,
             // so it doesn't accumulate across full navigations.
+            // Favicon diagnostics. These fire on every DOM mutation in the
+            // proxied app, so they are gated behind the debug flag rather
+            // than left on -- silent in normal operation, recoverable with
+            // the !debug URL flag when the favicon misbehaves.
+            const dbg = this.debug
+                ? (...args) => console.log('[favicon]', ...args)
+                : () => {};
+
             const applyDeviceFavicon = (rawHref) => {
                 if (!rawHref) return;
                 let finalHref;
@@ -2040,51 +2048,44 @@ class BitBangConnection {
                 };
                 const all = [...doc.querySelectorAll('link[rel]')];
                 const candidates = all.filter(l => rank(l.rel) > 0 && l.getAttribute('href'));
-                console.log('[favicon-debug] findBestIcon: total <link>:', all.length,
-                    'candidates:', candidates.map(l => ({ rel: l.rel, sizes: l.getAttribute('sizes'), href: l.getAttribute('href') })));
                 candidates.sort((a, b) => rank(b.rel) - rank(a.rel) || sizeArea(b) - sizeArea(a));
                 const winner = candidates[0]?.getAttribute('href') || null;
-                console.log('[favicon-debug]   winner:', winner);
+                dbg('scan:', all.length, 'links,', candidates.length, 'candidates, winner:', winner);
                 return winner;
             };
 
             try {
                 const doc = iframe.contentDocument;
                 if (doc) {
-                    console.log('[favicon-debug] onload initial scan; iframe URL:', iframe.contentWindow.location.href);
+                    dbg('initial scan;', iframe.contentWindow.location.href);
                     applyDeviceFavicon(findBestIcon(doc));
                     new MutationObserver(() => {
-                        console.log('[favicon-debug] MutationObserver fired');
                         applyDeviceFavicon(findBestIcon(doc));
                     }).observe(doc.head || doc.documentElement, {
                         childList: true, subtree: true,
                         attributes: true, attributeFilter: ['href', 'rel', 'sizes'],
                     });
-                    console.log('[favicon-debug] observer attached');
                 } else {
-                    console.log('[favicon-debug] no iframe.contentDocument');
+                    dbg('no iframe.contentDocument');
                 }
             } catch (e) {
-                console.log('[favicon-debug] initial scan threw:', String(e));
+                dbg('initial scan threw:', String(e));
             }
 
             // Fallback: /favicon.ico static probe, applied only if no
             // dynamic icon has been detected by the time the fetch
             // resolves. Prevents clobbering a valid dynamic icon.
             const initialHref = document.querySelector('link[rel="icon"]')?.href;
-            console.log('[favicon-debug] static probe scheduled; initial top href:', initialHref);
             fetch(`/__device__/${this.sessionId}/favicon.ico`).then(r => {
-                console.log('[favicon-debug] static probe status:', r.status);
                 if (!r.ok) return;
                 const current = document.querySelector('link[rel="icon"]')?.href;
-                console.log('[favicon-debug] static probe check: current top href:', current, '/ initial:', initialHref);
                 if (current === initialHref) {
-                    console.log('[favicon-debug]   applying static probe result');
+                    dbg('static probe applied');
                     applyDeviceFavicon(`/__device__/${this.sessionId}/favicon.ico`);
                 } else {
-                    console.log('[favicon-debug]   skip (dynamic icon already set)');
+                    dbg('static probe skipped (dynamic icon already set)');
                 }
-            }).catch((e) => console.log('[favicon-debug] static probe error:', String(e)));
+            }).catch((e) => dbg('static probe error:', String(e)));
 
             // Mirror the iframe's location into the address bar after every
             // navigation so refresh/bookmark land back on the same page. The
