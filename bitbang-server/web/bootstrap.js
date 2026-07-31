@@ -2730,9 +2730,35 @@ function parseDeviceURL() {
         deviceSearch = q >= 0 ? beforeHash.slice(q) : '';
         devicePath = (q >= 0 ? beforeHash.slice(0, q) : beforeHash) || '/';
     }
+    devicePath = stripDeviceScheme(devicePath);
     if (/^\/[^/]+:\d+$/.test(devicePath)) devicePath += '/';
 
     return { uid, code, devicePath, deviceSearch, deviceHash };
+}
+
+// Strip an explicit http/https scheme from the device path.
+//
+// The target is a host:port, never a URL -- but users reasonably type
+// "https://nas.local:8971", and the scheme then rides along in the fragment.
+// Left in place, the first path segment is "https:", which every downstream
+// consumer treats as the hostname: this.target becomes "https:", the iframe
+// is built against it, and syncTopURL mirrors "#<code>/https:/login" into the
+// address bar -- a URL that is neither representative nor refreshable.
+//
+// Normalising here (rather than at each consumer) means target derivation,
+// the iframe URL, and the address-bar mirror all see a clean path. The device
+// side strips schemes too, so this is belt-and-braces rather than the only
+// guard.
+//
+// Tolerates "//" collapsed to "/", case variation, and percent-encoding,
+// since this string crosses several URL normalisers before it gets here.
+// Order matters in the alternation: the longer separators must precede
+// their own prefixes or "://" would match as ":/" and leave a stray slash.
+function stripDeviceScheme(p) {
+    return p.replace(
+        /^\/(?:https?)(?::\/\/|%3A%2F%2F|:\/|%3A%2F)/i,
+        '/'
+    );
 }
 
 // The pathname is always `/<uid>`, so a top-frame nav that changes only the
