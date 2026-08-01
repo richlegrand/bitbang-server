@@ -6,9 +6,11 @@ deploy/production.deploy
 deploy/test.env
 deploy/test.deploy
 
-# Build artifacts (produced by upload_production / local builds):
-signaling-go
-bitbang-metrics-dump
+# Build artifacts from upload_production / local builds. Leading slash
+# anchors these to the module root so cmd/bitbang-metrics-dump/ is not
+# ignored too.
+/signaling-go
+/bitbang-metrics-dump
 *.tgz
 
 # Local SQLite metrics, if running the server locally for testing:
