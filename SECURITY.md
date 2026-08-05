@@ -40,8 +40,8 @@ finding.
 
 The browser runtime is **served code**, which makes its integrity and its origin boundary
 critical. The installed clients run no served code and therefore have a stronger guarantee;
-that distinction is documented in the
-[security claims](https://github.com/richlegrand/bitbang) writeup.
+that distinction is documented in
+[*Trustless Signaling*](https://github.com/richlegrand/bitbang/blob/main/trustless-signaling.md).
 
 **In scope**
 
