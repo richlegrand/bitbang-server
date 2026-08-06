@@ -20,11 +20,13 @@ const frontPagePlaceholder = "<!-- FRONT_PAGE -->"
 // allowedBitbangAssets is the whitelist of files served at /__bitbang__/<file>.
 // Anything else returns 404. Matches signaling.py exactly.
 var allowedBitbangAssets = map[string]bool{
-	"sw.js":         true,
-	"bootstrap.js":  true,
-	"ws-shim.js":    true,
-	"xhr-shim.js":   true,
-	"favicon.ico":   true, // handler internally maps this to favicon.png
+	"sw.js":           true,
+	"sw-upload.js":    true,
+	"flow-control.js": true,
+	"bootstrap.js":    true,
+	"ws-shim.js":      true,
+	"xhr-shim.js":     true,
+	"favicon.ico":     true, // handler internally maps this to favicon.png
 }
 
 // Static returns an http.Handler that serves the signaling server's static
