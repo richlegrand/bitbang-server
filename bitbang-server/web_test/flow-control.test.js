@@ -49,7 +49,7 @@ test('frame codec rejects oversized, truncated, and trailing payloads', () => {
     assert.throws(() => parseFrame(trailing), /does not match/);
 });
 
-test('sender stops at the advertised window and resumes on update', async () => {
+test('sender uses the implicit initial window and resumes on update', async () => {
     const controls = [];
     const flow = new Controller(msg => {
         controls.push(msg);
@@ -57,14 +57,14 @@ test('sender stops at the advertised window and resumes on update', async () => 
     });
     flow.reset(true);
     flow.open(1);
-    flow.advertise(1);
 
-    assert.deepEqual(controls, [{
-        type: 'window_update', stream_id: 1, max_bytes: WINDOW_BYTES,
-    }]);
-
-    assert.equal(flow.updateWindow(1, WINDOW_BYTES), true);
-    await flow.waitToSend(1, WINDOW_BYTES);
+    let initialReleased = false;
+    const initial = flow.waitToSend(1, WINDOW_BYTES)
+        .then(() => { initialReleased = true; });
+    await Promise.resolve();
+    assert.equal(initialReleased, true);
+    await initial;
+    assert.deepEqual(controls, []);
 
     let released = false;
     const blocked = flow.waitToSend(1, 1).then(() => { released = true; });
@@ -84,15 +84,14 @@ test('receive limit is replenished only after the consumption threshold', () => 
     });
     flow.reset(true);
     flow.open(3);
-    flow.advertise(3);
 
     assert.equal(flow.receive(3, UPDATE_BYTES - 1), true);
     flow.consume(3, UPDATE_BYTES - 1);
-    assert.equal(controls.length, 1);
+    assert.equal(controls.length, 0);
 
     assert.equal(flow.receive(3, 1), true);
     flow.consume(3, 1);
-    assert.deepEqual(controls[1], {
+    assert.deepEqual(controls[0], {
         type: 'window_update',
         stream_id: 3,
         max_bytes: WINDOW_BYTES + UPDATE_BYTES,
@@ -153,9 +152,9 @@ test('window updates require a positive maximum', () => {
     assert.equal(flow.updateWindow(1, 0), false);
     assert.equal(flow.updateWindow(1, -1), false);
     assert.equal(flow.updateWindow(1, Number.NaN), false);
-    assert.equal(flow.updateWindow(1, 10), true);
-    assert.equal(flow.updateWindow(1, 5), true);
-    assert.equal(flow.updateWindow(1, 10), true);
+    assert.equal(flow.updateWindow(1, WINDOW_BYTES + 10), true);
+    assert.equal(flow.updateWindow(1, WINDOW_BYTES + 5), true);
+    assert.equal(flow.updateWindow(1, WINDOW_BYTES + 10), true);
 });
 
 test('zero-byte sends still require a live stream', async () => {
@@ -172,6 +171,7 @@ test('reset rejects blocked senders without affecting another stream', async () 
     flow.open(1);
     flow.open(3);
 
+    await flow.waitToSend(1, WINDOW_BYTES);
     const blocked = flow.waitToSend(1, 1);
     flow.resetStream(1, new Error('stalled'));
     await assert.rejects(blocked, /stalled/);
@@ -184,7 +184,6 @@ test('legacy mode never waits for credit', async () => {
     const flow = new Controller(() => assert.fail('legacy mode sent control'));
     flow.reset(false);
     flow.open(1);
-    flow.advertise(1);
     await flow.waitToSend(1, WINDOW_BYTES);
 });
 
@@ -205,24 +204,18 @@ test('legacy mode still bounds local receive queues without sending controls', (
     assert.equal(flow.receive(3, 0), true);
 });
 
-test('failed window controls are surfaced without recording a grant', () => {
-    let send = false;
+test('failed replenishment control is surfaced without recording a grant', () => {
     const controls = [];
     const flow = new Controller(msg => {
         controls.push(msg);
-        return send;
+        return false;
     });
     flow.reset(true);
     flow.open(1);
 
-    assert.equal(flow.advertise(1), false);
-    send = true;
-    assert.equal(flow.advertise(1), true);
-    assert.equal(controls.length, 2);
-
     assert.equal(flow.receive(1, UPDATE_BYTES), true);
-    send = false;
     assert.equal(flow.consume(1, UPDATE_BYTES), false);
+    assert.equal(controls.length, 1);
     assert.equal(flow.streams.get(1).lastUpdateBytes, 0);
     assert.equal(flow.streams.get(1).recvLimit, WINDOW_BYTES);
 });

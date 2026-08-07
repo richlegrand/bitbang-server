@@ -14,6 +14,8 @@
     const VERSION = 4;
     const WINDOW_BYTES = 1024 * 1024;
     const UPDATE_BYTES = WINDOW_BYTES / 2;
+    // The byte window caps payload memory; this separately bounds queue and
+    // dispatch work for tiny or empty frames that consume little byte credit.
     const MAX_PENDING_FRAMES = 256;
     const MAX_PAYLOAD_BYTES = 32768;
 
@@ -97,8 +99,8 @@
             let state = this.streams.get(streamId);
             if (state) return state;
             state = {
-                advertised: false,
-                sendLimit: this.enabled ? 0 : Number.MAX_SAFE_INTEGER,
+                // A v4 SYN opens both directions with this implicit credit.
+                sendLimit: this.enabled ? WINDOW_BYTES : Number.MAX_SAFE_INTEGER,
                 sentBytes: 0,
                 sendWaiters: [],
                 recvLimit: WINDOW_BYTES,
@@ -114,20 +116,6 @@
 
         has(streamId) {
             return this.streams.has(streamId);
-        }
-
-        advertise(streamId) {
-            if (!this.enabled) return true;
-            if (this.closed) return false;
-            const state = this.open(streamId);
-            if (state.advertised) return true;
-            if (!this.sendControl({
-                type: 'window_update',
-                stream_id: streamId,
-                max_bytes: state.recvLimit,
-            })) return false;
-            state.advertised = true;
-            return true;
         }
 
         updateWindow(streamId, maxBytes) {
