@@ -18,7 +18,8 @@ import (
 const frontPagePlaceholder = "<!-- FRONT_PAGE -->"
 
 // allowedBitbangAssets is the whitelist of files served at /__bitbang__/<file>.
-// Anything else returns 404. Matches signaling.py exactly.
+// Anything else returns 404. A new browser-runtime asset has to be added here
+// or it 404s at load time with no other symptom.
 var allowedBitbangAssets = map[string]bool{
 	"sw.js":         true,
 	"bootstrap.js":  true,
