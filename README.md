@@ -139,12 +139,17 @@ Rolling back means redeploying a previous commit -- there's no built-in versione
 
 Set `METRICS_PATH` to also persist snapshots to SQLite on a timer. Counters survive restarts: on startup the server loads the most recent row, seeds its in-memory atomics, and writes a fresh row immediately so time-series queries don't show a phantom gap. At most one interval of un-flushed events is lost in a hard crash. Schema and PRAGMAs (WAL, `synchronous=NORMAL`) are applied on first open -- no setup. Budget roughly **30 MB/year** at the 5-minute default.
 
-Read it back with the bundled tool (no `sqlite3` package required):
+Read it back with the bundled tool (no `sqlite3` package required). The
+deploy ships the binary to `/opt/bitbang` and sets `METRICS_PATH` only in
+the service unit, so on the server point it at the database explicitly:
 
 ```bash
-bitbang-metrics-dump | jq .                # latest snapshot
-bitbang-metrics-dump -history 100 | jq .   # last 100 rows
+/opt/bitbang/bitbang-metrics-dump -db /opt/bitbang/metrics.db | jq .              # latest snapshot
+/opt/bitbang/bitbang-metrics-dump -db /opt/bitbang/metrics.db -history 100 | jq . # last 100 rows
 ```
+
+`-db` defaults to `$METRICS_PATH`, so if that variable is exported in your
+shell you can drop the flag.
 
 A bad `METRICS_PATH` is a **hard startup failure** -- better to refuse to boot than to silently discard metrics.
 

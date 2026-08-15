@@ -1,0 +1,41 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build-test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    defaults:
+      run:
+        working-directory: bitbang-server
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: bitbang-server/go.mod
+          cache-dependency-path: bitbang-server/go.sum
+
+      - name: go vet
+        run: go vet ./...
+
+      - name: go test
+        run: go test ./...
+
+      - name: Deploy cross-builds (linux/amd64, CGO_ENABLED=0)
+        # These mirror deploy/upload_production exactly. If either command
+        # directory goes missing, this step fails the build.
+        run: |
+          CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -o /tmp/signaling-go ./cmd/signaling
+          CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -o /tmp/bitbang-metrics-dump ./cmd/bitbang-metrics-dump
