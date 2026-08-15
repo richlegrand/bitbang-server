@@ -8,7 +8,8 @@ import (
 	"bitbang-server-go/internal/wire"
 )
 
-// Status payload — field names and shape match Python signaling.py:144-154,
+// Status payload. Field names and shape are inherited from the original
+// Python signaling server,
 // minus the TURN-client counters (active_turn_clients / turn_max_active),
 // which were dropped: the count tracked TURN grants, not actual relay paths,
 // so it was misleading and of unclear value. Replaced (in spirit) by the

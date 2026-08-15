@@ -1,7 +1,9 @@
 // Package handler implements the HTTP and WebSocket endpoints of the
-// signaling server. Behaviors mirror the Python implementation in
-// ~/bitbang-server/bitbang-server/signaling/signaling.py — wire-compatible
-// behavior is the contract.
+// signaling server.
+//
+// These endpoints are what every client speaks to: bitbang-cli, the browser
+// runtime in web/, and bitbang-python. Wire-compatible behavior is the
+// contract -- a change here is a change to all three at once.
 package handler
 
 import (

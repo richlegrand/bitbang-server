@@ -56,7 +56,8 @@ func (d *Deps) ClientWS(w http.ResponseWriter, r *http.Request, targetUID string
 	}()
 
 	// Device-not-found case: slow UID enumeration with a 3-second delay,
-	// then send "Device not found" and close. Matches Python signaling.py:413.
+	// then send "Device not found" and close. The delay is the point -- a
+	// fast negative lets someone sweep the UID space to find live devices.
 	if _, ok := d.Devices.Get(targetUID); !ok {
 		time.Sleep(3 * time.Second)
 		_ = conn.SendJSON(wire.Error{Type: "error", Message: "Device not found"})

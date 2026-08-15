@@ -1,6 +1,11 @@
 // Package identity implements UID derivation and signature verification
-// for the signaling server. Mirrors the Python implementation in
-// signaling.py — wire-compatible behavior is the contract.
+// for the signaling server.
+//
+// UID derivation and the signature scheme are a three-way contract: this
+// package, bitbang-cli's internal/identity, and bitbang-python's
+// bitbang/identity.py must agree exactly, or devices built against one cannot
+// register with a server built against another. Wire-compatible behavior is
+// the contract, not shared code.
 //
 // Supported key algorithms:
 //   - RSA  (>= 2048 bits): RSASSA-PKCS1v15 + SHA-256
@@ -28,7 +33,9 @@ import (
 )
 
 // AuthDomain is the domain separation tag prepended to challenge nonces
-// before signing. Must match signaling.py: AUTH_DOMAIN.
+// before signing. Must match bitbang-cli's identity.AuthDomain and
+// bitbang-python's identity.AUTH_DOMAIN. A mismatch fails every signature
+// check against that implementation, with no other symptom.
 var AuthDomain = []byte("bitbang-auth-v1:")
 
 // MinRSAKeySize is the smallest RSA modulus we accept (NIST SP 800-57 floor).

@@ -184,7 +184,7 @@ func main() {
 	}
 
 	// Graceful shutdown: SIGINT/SIGTERM → Server.Shutdown with 2s grace,
-	// then hard exit. Matches Python signaling.py behavior.
+	// then hard exit.
 	stopChan := make(chan os.Signal, 1)
 	signal.Notify(stopChan, syscall.SIGINT, syscall.SIGTERM)
 
