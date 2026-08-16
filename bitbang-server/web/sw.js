@@ -353,6 +353,7 @@ async function findSession(event) {
         // clientId could resolve to a dead session.
         pruneClientSessions();
         saveClientSessions();
+        if (dropSessionCookiesForDeadDevices()) keepAlive(event, saveCookieJar());
     }
 
     const ctx = {
@@ -384,6 +385,65 @@ async function findSession(event) {
 
 const cookieJar = new Map();
 const COOKIE_CACHE_KEY = '/__bitbang__/cookie-jar';
+
+// Bounds on the jar. Without them it only ever grew: entries leave when a
+// cookie's own expiry passes, and a session cookie (expires === null) has
+// none, so proxying an app once left its cookies here permanently.
+//
+// Map preserves insertion order, so evicting from the front drops the
+// least-recently-created partition first.
+const MAX_JAR_PARTITIONS = 100;   // uid:target pairs held at once
+const MAX_JAR_COOKIES = 2000;     // cookies across all partitions
+
+function pruneCookieJar() {
+    let changed = false;
+    while (cookieJar.size > MAX_JAR_PARTITIONS) {
+        cookieJar.delete(cookieJar.keys().next().value);
+        changed = true;
+    }
+    let total = 0;
+    for (const cookies of cookieJar.values()) total += cookies.length;
+    while (total > MAX_JAR_COOKIES && cookieJar.size > 0) {
+        const oldest = cookieJar.keys().next().value;
+        total -= cookieJar.get(oldest).length;
+        cookieJar.delete(oldest);
+        changed = true;
+    }
+    return changed;
+}
+
+// Discard session cookies for devices that no longer have a live session.
+//
+// Session cookies are the ones a browser drops at the end of a browsing
+// session, and this is the equivalent moment: the last tab proxying that
+// device is gone. Cookies with an explicit expiry survive, exactly as they
+// would in a normal browser, so "remember me" still works.
+//
+// Called only from the authoritative sweeps, never from the pagehide fast
+// path. A refresh removes the old session and registers a new one for the
+// same uid, and the ordering between those two is not guaranteed -- dropping
+// on pagehide would log people out on every reload.
+function dropSessionCookiesForDeadDevices() {
+    const live = new Set();
+    for (const sess of sessions.values()) {
+        if (sess.uid) live.add(sess.uid);
+    }
+    let changed = false;
+    for (const [key, cookies] of [...cookieJar]) {
+        const sep = key.indexOf(':');
+        const uid = sep < 0 ? '' : key.slice(0, sep);
+        if (!uid || live.has(uid)) continue;
+        const keep = cookies.filter(c => c.expires !== null);
+        if (keep.length === cookies.length) continue;
+        changed = true;
+        if (keep.length > 0) {
+            cookieJar.set(key, keep);
+        } else {
+            cookieJar.delete(key);
+        }
+    }
+    return changed;
+}
 
 async function loadCookieJar() {
     try {
@@ -629,6 +689,7 @@ function storeCookies(jarKey, setCookieHeaders) {
         jar.push(cookie);
     }
 
+    pruneCookieJar();
     return saveCookieJar();
 }
 
@@ -781,7 +842,10 @@ async function redirectViaActiveSession(event, url) {
             swept = true;
         }
     }
-    if (swept) saveSessions();
+    if (swept) {
+        saveSessions();
+        if (dropSessionCookiesForDeadDevices()) keepAlive(event, saveCookieJar());
+    }
 
     // Selection priority — most specific signal first.
     //
