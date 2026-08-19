@@ -1433,7 +1433,24 @@ class BitBangConnection {
             }
         } else if (msg.type === 'error') {
             console.error('[Bootstrap] Device error:', msg.message);
-            this.showErrorScreen(msg.message || 'Connection refused');
+            // Two very different moments produce this. Before the device UI
+            // is up (a refused code, a rejected connect path) #connection-ui
+            // is what the user is looking at, so print into it as always.
+            //
+            // Once the iframe exists it is position:fixed, full viewport,
+            // opaque, z-index 1 -- it paints straight over #connection-ui, so
+            // showErrorScreen would say nothing at all. Worse, the device is
+            // about to close the channel, and onclose routes into the
+            // reconnect loop: the user would be left watching "Reconnecting..."
+            // for a session that has intentionally ended, which is the
+            // opposite of the truth. showReloadScreen is the existing
+            // terminal path (relay expiry uses it): it marks the session
+            // ended so nothing retries, hides the iframe, and offers Reload.
+            if (document.getElementById('device-frame')) {
+                this.showReloadScreen(msg.message || 'The device ended this session');
+            } else {
+                this.showErrorScreen(msg.message || 'Connection refused');
+            }
         }
     }
 
