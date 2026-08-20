@@ -126,6 +126,7 @@ func (d *Deps) DeviceWS(w http.ResponseWriter, r *http.Request, uid string) {
 	// reply carries the code so the operator can read it out loud.
 	// Pairing.Release fires on disconnect so the code is freed
 	// promptly (rather than waiting for TTL).
+	conn.WantsCode = regMsg.WantCode
 	reply := wire.Registered{Type: "registered"}
 	if regMsg.WantCode && d.Pairing != nil {
 		reply.Code = d.Pairing.Issue(uid)
@@ -198,7 +199,10 @@ func (d *Deps) authenticateDevice(uid string, conn *registry.DeviceConn) (*wire.
 	return &reg, nil
 }
 
-// deviceRelay reads messages from the device and forwards to the target client.
+// deviceRelay reads messages from the device. Most are relayed to the
+// client named in client_id; a few are about the device itself and are
+// answered here, before the lookup that requires one.
+//
 // Runs until the WS closes or an unrecoverable error occurs.
 func (d *Deps) deviceRelay(conn *registry.DeviceConn) {
 	for {
@@ -210,6 +214,28 @@ func (d *Deps) deviceRelay(conn *registry.DeviceConn) {
 		var env wire.Envelope
 		if err := json.Unmarshal(data, &env); err != nil {
 			d.Log.Warn("device sent invalid JSON", "uid", conn.UID, "err", err)
+			continue
+		}
+
+		// Device-scoped messages are about the device itself and carry no
+		// client_id, so they are answered before the relay lookup below
+		// drops anything that names no client.
+		if env.Type == "renew_code" {
+			// Issue is idempotent inside the code's lifetime and mints a
+			// fresh one past it, so one message covers both cases and
+			// both are what the operator wants: read the live code out
+			// again, or get another once it has gone.
+			//
+			// Only answered for a device that asked for a code at
+			// register time. One that did not is not in the pairing
+			// table, and quietly enrolling it here would turn this
+			// message into a way around --nocode.
+			reply := wire.CodeIssued{Type: "code_issued"}
+			if conn.WantsCode && d.Pairing != nil {
+				reply.Code = d.Pairing.Issue(conn.UID)
+				d.Log.Info("reissued pairing code", "uid", conn.UID, "code", reply.Code)
+			}
+			_ = conn.SendJSON(reply)
 			continue
 		}
 

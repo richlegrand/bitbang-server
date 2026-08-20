@@ -48,6 +48,32 @@ type Register struct {
 	WantCode   bool        `json:"want_code,omitempty"`
 }
 
+// RenewCode is sent by a device asking for a pairing code when the one it
+// was issued has lapsed. Codes live five minutes, and before this the
+// only way to another was restarting the listener, which drops every
+// live session.
+//
+// Additive: a server that does not know the type logs it and carries on,
+// and a device that never sends it is unaffected. No protocol bump --
+// MinProtocolVersion gates the register message, and raising it would
+// lock out devices that work.
+type RenewCode struct {
+	Type string `json:"type"` // "renew_code"
+}
+
+// CodeIssued answers a RenewCode.
+//
+// A distinct type rather than reusing Registered, which also carries a
+// code: the device's registration read accepts only registered or error
+// and errors on anything else, so a Registered arriving outside that
+// window would break an older device. Keeping them separate means this
+// reply can only ever follow a request, which is the property that makes
+// the change safe in both directions.
+type CodeIssued struct {
+	Type string `json:"type"`           // "code_issued"
+	Code string `json:"code,omitempty"` // empty when the server issues none
+}
+
 // Registered is sent by the server after a successful register. Code is
 // populated only when the device sent WantCode=true (and pairing is
 // enabled server-side); legacy devices that don't set WantCode get a

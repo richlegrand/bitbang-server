@@ -26,6 +26,12 @@ type DeviceConn struct {
 	ICEServers []wire.ICEServer // device-supplied override; empty if none
 	ConnectAt  time.Time
 
+	// WantsCode records that the device asked for a pairing code at
+	// register time. Renewal is answered only for those: a device that
+	// declined codes is not in the pairing table, and enrolling it on
+	// request would make the message a way around --nocode.
+	WantsCode bool
+
 	// PublicKey is the base64 DER SubjectPublicKeyInfo the device presented at
 	// register time, retained so clients can fetch it via "request_pubkey".
 	// hash(decoded) == UID is enforced before this is stored.
