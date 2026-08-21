@@ -57,6 +57,11 @@ type Deps struct {
 	// that strips these headers from inbound requests; otherwise clients
 	// can spoof the value.
 	TrustProxyHeaders bool
+
+	// StatusToken, when non-empty, restricts /status to requests bearing
+	// it. Empty leaves /status public, which is what it was before this
+	// existed -- so an operator who sets nothing sees no change.
+	StatusToken string
 }
 
 // DeviceWS handles /ws/device/<uid>.

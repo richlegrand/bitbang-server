@@ -9,6 +9,8 @@
 //	TURN_MAX_ACTIVE      Max concurrent clients granted TURN (0 = no cap)
 //	LOG_LEVEL            DEBUG | INFO | WARN | ERROR (default INFO)
 //	STATIC_DIR           Path to web/ asset directory (default ./web)
+//	STATUS_TOKEN         When set, /status needs "Authorization: Bearer <token>"
+//	                     from anywhere but loopback. Empty leaves it public.
 //	TRUST_PROXY_HEADERS  When "true", honor X-Real-IP/X-Forwarded-For for
 //	                     browser-IP capture. Enable only behind a proxy
 //	                     that strips these headers from inbound requests.
@@ -146,6 +148,7 @@ func main() {
 		PingInterval:      60 * time.Second,
 		PongWait:          300 * time.Second,
 		TrustProxyHeaders: cfg.TrustProxyHeaders,
+		StatusToken:       cfg.StatusToken,
 	}
 
 	mux := http.NewServeMux()
@@ -221,6 +224,10 @@ type config struct {
 	StaticDir         string
 	TrustProxyHeaders bool
 
+	// StatusToken, when non-empty, requires a bearer token on /status
+	// from anywhere but loopback. Empty leaves it public.
+	StatusToken string
+
 	// MetricsPath, when non-empty, enables the periodic JSONL snapshot of
 	// /status counters at MetricsInterval seconds. Empty disables.
 	MetricsPath     string
@@ -252,6 +259,7 @@ func loadConfig() config {
 		LogLevel:          parseLogLevel(envOr("LOG_LEVEL", "INFO")),
 		StaticDir:         staticDir,
 		TrustProxyHeaders: strings.EqualFold(os.Getenv("TRUST_PROXY_HEADERS"), "true"),
+		StatusToken:       os.Getenv("STATUS_TOKEN"),
 		MetricsPath:       os.Getenv("METRICS_PATH"),
 		MetricsInterval:   envOrInt("METRICS_INTERVAL", 300),
 		InstallURL:        os.Getenv("INSTALL_URL"),
