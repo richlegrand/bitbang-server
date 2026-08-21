@@ -5,7 +5,57 @@
  * and wires up media streams to the iframe.
  */
 
-console.log('[Bootstrap] script evaluated', performance.now().toFixed(1));
+// BUILD is spliced in by the server as this file is served (see
+// handler.buildStamp). sw.js carries the same value for a given deploy,
+// so if the active worker reports a different one, this page is stale.
+const BUILD = '__BB_BUILD__';
+
+console.log('[Bootstrap] script evaluated', BUILD, performance.now().toFixed(1));
+
+// askServiceWorkerBuild returns the build stamp of the worker that would
+// serve this page, or null if nothing answers. Uses a MessageChannel so
+// it works before the worker controls us.
+function askServiceWorkerBuild(worker) {
+    if (!worker) return Promise.resolve(null);
+    return new Promise((resolve) => {
+        const ch = new MessageChannel();
+        const timer = setTimeout(() => resolve(null), 2000);
+        ch.port1.onmessage = (e) => {
+            clearTimeout(timer);
+            resolve(e.data?.build ?? null);
+        };
+        try {
+            worker.postMessage({ type: 'getBuild' }, [ch.port2]);
+        } catch {
+            clearTimeout(timer);
+            resolve(null);
+        }
+    });
+}
+
+// reloadIfStale compares our build stamp against the worker's and
+// reloads when they differ. No cosmetic/breaking distinction: any deploy
+// reloads, because a reload costs a second and running mismatched halves
+// of the same release costs a support thread.
+//
+// A stamp is reloaded for at most once per tab. If a deploy somehow left
+// the two files disagreeing, the guard turns an endless reload loop into
+// one wasted refresh. A worker that predates the stamp reports null and
+// is left alone.
+async function reloadIfStale(worker) {
+    const theirs = await askServiceWorkerBuild(worker);
+    if (!theirs || theirs === BUILD) return;
+    const key = 'bb-reloaded-for';
+    try {
+        if (sessionStorage.getItem(key) === theirs) {
+            console.warn('[Bootstrap] build still', BUILD, 'after reloading for', theirs);
+            return;
+        }
+        sessionStorage.setItem(key, theirs);
+    } catch { /* private mode: fall through and reload once */ }
+    console.log('[Bootstrap] stale page', BUILD, '-> reloading for', theirs);
+    window.location.reload();
+}
 
 const STATUS = {
     CONNECTING: "Connecting to server...",
@@ -392,17 +442,30 @@ class BitBangConnection {
         // Force check for SW update on every page load.
         reg.update();
 
-        // When a new SW takes over an existing controller, show a small
-        // banner offering a reload — don't auto-reload, since a mid-session
-        // refresh blows away shell scrollback, half-typed proxied-app form
-        // input, etc. The new SW already serves fresh sw.js; the banner is
-        // just the user's signal to pull in fresh bootstrap.js/.html.
-        // skipWaiting() in sw.js's install handler is what makes the
-        // takeover happen without prompting.
+        // When a new SW takes over an existing controller, reload if the
+        // build stamps disagree. skipWaiting() in sw.js's install handler
+        // is what makes the takeover happen without prompting, which is
+        // also what creates the window this closes: the new worker claims
+        // the page immediately, while the page itself may still be running
+        // the previous deploy's bootstrap.js.
+        //
+        // The reload does cost a mid-session refresh -- shell scrollback,
+        // half-typed proxied-app input. That is the accepted trade: a
+        // second of lost state beats two halves of different releases
+        // talking to each other.
         navigator.serviceWorker.addEventListener('controllerchange', () => {
             if (!hadController) return;             // first install, not an update
-            showUpdateBanner();
+            // Only a page that is actually behind gets reloaded. The
+            // common case after a deploy is a fresh navigation that
+            // already has the new bootstrap.js and merely watched the
+            // worker turn over underneath it -- nothing to do there.
+            reloadIfStale(navigator.serviceWorker.controller);
         });
+
+        // Covers the tab that was already open and never saw a
+        // controllerchange, e.g. a deploy that reached the worker before
+        // this listener was attached.
+        reloadIfStale(reg.active || navigator.serviceWorker.controller);
 
         // Long-lived sessions (a shell sitting open for hours) won't navigate
         // and so won't trigger the browser's default update check. Poll every
@@ -2604,58 +2667,6 @@ function showPairingInput() {
     input.addEventListener('input', sync);
     input.addEventListener('keydown', (e) => { if (e.key === 'Enter') go(); });
     button.addEventListener('click', go);
-}
-
-// showUpdateBanner renders a small fixed-position banner at the top of
-// the viewport announcing that a new bootstrap version is available.
-// Triggered from the SW controllerchange handler when a deploy lands
-// mid-session. The user clicks Reload to refresh into the new code, or
-// dismisses to keep their current session state (shell scrollback,
-// half-typed proxied-app input, in-progress downloads, etc.).
-//
-// Idempotent — if the banner is already showing (a second deploy
-// arrives before the user has acted on the first), the call is a no-op.
-function showUpdateBanner() {
-    if (document.getElementById('bb-update-banner')) return;
-
-    const bar = document.createElement('div');
-    bar.id = 'bb-update-banner';
-    bar.style.cssText = [
-        'position:fixed', 'top:0', 'left:0', 'right:0', 'z-index:9999',
-        'background:#f4f4f4', 'border-bottom:1px solid #ddd',
-        'padding:8px 14px',
-        'font-family:-apple-system,"Segoe UI",Roboto,sans-serif',
-        'font-size:13px', 'color:#333',
-        'display:flex', 'align-items:center', 'gap:12px',
-        'box-shadow:0 1px 3px rgba(0,0,0,0.08)',
-    ].join(';');
-
-    const text = document.createElement('span');
-    text.textContent = 'A new version is available.';
-    text.style.flex = '1';
-
-    const reloadBtn = document.createElement('button');
-    reloadBtn.textContent = 'Reload';
-    reloadBtn.style.cssText = [
-        'border:none', 'background:#111', 'color:#fff',
-        'font-size:13px', 'padding:4px 12px', 'border-radius:4px',
-        'cursor:pointer',
-    ].join(';');
-    reloadBtn.addEventListener('click', () => window.location.reload());
-
-    const dismissBtn = document.createElement('button');
-    dismissBtn.textContent = '×';
-    dismissBtn.setAttribute('aria-label', 'Dismiss');
-    dismissBtn.style.cssText = [
-        'border:none', 'background:none', 'font-size:18px',
-        'color:#888', 'cursor:pointer', 'line-height:1', 'padding:0 4px',
-    ].join(';');
-    dismissBtn.addEventListener('click', () => bar.remove());
-
-    bar.appendChild(text);
-    bar.appendChild(reloadBtn);
-    bar.appendChild(dismissBtn);
-    document.body.appendChild(bar);
 }
 
 // showBookmarkModal is shown once, on the post-pairing load, nudging the user

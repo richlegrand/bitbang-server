@@ -7,7 +7,12 @@
  * are rewritten at the source by xhr-shim.js.
  */
 
-console.log('[SW] booted');
+// BUILD is spliced in by the server as this file is served (see
+// handler.buildStamp). Every asset in a given deploy carries the same
+// value, so a page whose copy differs from ours is running older code.
+const BUILD = '__BB_BUILD__';
+
+console.log('[SW] booted', BUILD);
 
 self.addEventListener('install', () => self.skipWaiting());
 self.addEventListener('activate', (event) => event.waitUntil(self.clients.claim()));
@@ -127,6 +132,13 @@ function saveSessions() {
 const sessionsReady = loadSessions();
 
 self.addEventListener('message', async (event) => {
+    // Answered on the port the page supplied, so it works before we
+    // control the page (a claim may not have landed yet).
+    if (event.data?.type === 'getBuild') {
+        event.ports[0]?.postMessage({ type: 'build', build: BUILD });
+        return;
+    }
+
     if (event.data?.type === 'setBootstrap' && event.data.sessionId) {
         const uid = event.data.uid || '';
 

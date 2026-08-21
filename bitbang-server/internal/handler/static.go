@@ -1,6 +1,8 @@
 package handler
 
 import (
+	"crypto/sha256"
+	"encoding/hex"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -17,15 +19,88 @@ import (
 // the page degrades to the bare pair input.
 const frontPagePlaceholder = "<!-- FRONT_PAGE -->"
 
+// buildPlaceholder is the literal marker bootstrap.js and sw.js contain
+// where the build stamp is spliced in as they are served.
+//
+// The stamp is how a page works out whether it is still current. Both
+// files get the same value, so a page whose copy disagrees with the
+// active service worker's is by definition running older code -- which
+// only happens to a tab that has been open across a deploy, since the
+// assets are served no-store and any fresh navigation gets both anew.
+const buildPlaceholder = "__BB_BUILD__"
+
+// stampedAssets are the files the build stamp is spliced into. Serving
+// them means reading and rewriting rather than handing off to
+// http.ServeFile; they are a few tens of KB, and already served
+// no-store, so nothing is lost.
+var stampedAssets = map[string]bool{
+	"bootstrap.js": true,
+	"sw.js":        true,
+}
+
+// stampInputs are the files whose contents define a build. Every asset
+// the browser runtime is made of belongs here, not just the two that
+// carry the stamp: a deploy that changed only a shim would otherwise
+// leave the stamp still and every open tab holding stale code -- which
+// is the whole failure this exists to catch.
+//
+// favicon.png is left out deliberately. It is served cacheable, nothing
+// depends on its version, and reloading everyone's tab over an icon is
+// not a trade worth making.
+var stampInputs = []string{
+	"bootstrap.html",
+	"bootstrap.js",
+	"sw.js",
+	"ws-shim.js",
+	"xhr-shim.js",
+}
+
+// buildStamp hashes the on-disk bytes of every stamp input, with their
+// placeholders still in place, so each stamped file receives an
+// identical value. Names are hashed alongside contents so that moving
+// bytes between files still moves the stamp.
+//
+// Computed once when the handler is built: a deploy ships web/ and
+// restarts the service, so process lifetime and asset lifetime are the
+// same thing. An unreadable file is folded in as a miss rather than
+// being fatal -- the stamp still changes if it later appears, and a
+// server that boots is worth more than one that refuses over a shim.
+func buildStamp(staticDir string) string {
+	h := sha256.New()
+	for _, name := range stampInputs {
+		h.Write([]byte(name))
+		b, err := os.ReadFile(filepath.Join(staticDir, name))
+		if err != nil {
+			h.Write([]byte("<unreadable>"))
+			continue
+		}
+		h.Write(b)
+	}
+	return hex.EncodeToString(h.Sum(nil))[:12]
+}
+
+// serveStamped writes a stamped asset with the build value spliced in.
+func serveStamped(w http.ResponseWriter, staticDir, name, stamp string) {
+	b, err := os.ReadFile(filepath.Join(staticDir, name))
+	if err != nil {
+		http.Error(w, "internal error", http.StatusInternalServerError)
+		return
+	}
+	out := strings.Replace(string(b), buildPlaceholder, stamp, 1)
+	w.Header().Set("Cache-Control", "no-cache, no-store, must-revalidate")
+	w.Header().Set("Content-Type", "text/javascript; charset=utf-8")
+	_, _ = w.Write([]byte(out))
+}
+
 // allowedBitbangAssets is the whitelist of files served at /__bitbang__/<file>.
 // Anything else returns 404. A new browser-runtime asset has to be added here
 // or it 404s at load time with no other symptom.
 var allowedBitbangAssets = map[string]bool{
-	"sw.js":         true,
-	"bootstrap.js":  true,
-	"ws-shim.js":    true,
-	"xhr-shim.js":   true,
-	"favicon.ico":   true, // handler internally maps this to favicon.png
+	"sw.js":        true,
+	"bootstrap.js": true,
+	"ws-shim.js":   true,
+	"xhr-shim.js":  true,
+	"favicon.ico":  true, // handler internally maps this to favicon.png
 }
 
 // Static returns an http.Handler that serves the signaling server's static
@@ -45,6 +120,7 @@ var allowedBitbangAssets = map[string]bool{
 // always replaced (with empty string if no snippet) so the marker never
 // leaks to the browser.
 func Static(staticDir, frontPagePath string) http.HandlerFunc {
+	stamp := buildStamp(staticDir)
 	return func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodGet && r.Method != http.MethodHead {
 			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
@@ -70,11 +146,14 @@ func Static(staticDir, frontPagePath string) http.HandlerFunc {
 			}
 			// Top-level .js files served with no-cache; sw.js gets the
 			// Service-Worker-Allowed header so it can claim the root scope.
-			noCache := true
 			if name == "sw.js" {
 				w.Header().Set("Service-Worker-Allowed", "/")
 			}
-			serveFile(w, r, staticDir, name, "", noCache)
+			if stampedAssets[name] {
+				serveStamped(w, staticDir, name, stamp)
+				return
+			}
+			serveFile(w, r, staticDir, name, "", true)
 			return
 		}
 
@@ -90,7 +169,14 @@ func Static(staticDir, frontPagePath string) http.HandlerFunc {
 		// Special case: /<file>.js at the top level — serve that JS file
 		// (matches Python's "if uid.endswith('.js'): send_file(uid)" branch).
 		if strings.HasSuffix(first, ".js") && !strings.ContainsAny(first, "/\\") && !strings.Contains(first, "..") {
-			serveFile(w, r, staticDir, first, "", false)
+			// no-cache like the /__bitbang__/ route. This branch served
+			// cacheable until now, which meant the same asset had a stale
+			// and a fresh spelling depending on which URL you asked for.
+			if stampedAssets[first] {
+				serveStamped(w, staticDir, first, stamp)
+				return
+			}
+			serveFile(w, r, staticDir, first, "", true)
 			return
 		}
 
