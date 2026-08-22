@@ -1,0 +1,54 @@
+#!/bin/bash
+# status - read /status from a deployed signaling server.
+#
+# Usage: deploy/status [test|production]      (default: test)
+#
+# Reads STATUS_TOKEN from deploy/<env>.env and sends it as a bearer
+# token. An empty or absent token means the server is still serving
+# /status publicly, so the header is simply omitted.
+#
+# Deliberately defaults to test: production is the one you least want to
+# hit by reflex, and it is the shorter word to type when you mean it.
+set -euo pipefail
+
+ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+cd "${ROOT}"
+
+ENV_NAME="${1:-test}"
+case "${ENV_NAME}" in
+    test)       HOST=test.bitba.ng ;;
+    production) HOST=bitba.ng ;;
+    *) echo "usage: $0 [test|production]" >&2; exit 2 ;;
+esac
+
+ENV_FILE="deploy/${ENV_NAME}.env"
+if [[ ! -f "${ENV_FILE}" ]]; then
+    echo "no ${ENV_FILE} — copy ${ENV_FILE}.example and fill it in" >&2
+    exit 1
+fi
+
+# Only the value, and only the first match. `cut -d=` would truncate a
+# token containing '=', which hex tokens do not but a pasted one might.
+TOKEN="$(sed -n 's/^STATUS_TOKEN=//p' "${ENV_FILE}" | head -1)"
+
+declare -a AUTH=()
+[[ -n "${TOKEN}" ]] && AUTH=(-H "Authorization: Bearer ${TOKEN}")
+
+# -w writes the status line last so it survives the pretty-printer.
+BODY="$(curl -sS --fail-with-body "${AUTH[@]}" "https://${HOST}/status")" || {
+    echo >&2
+    if [[ -z "${TOKEN}" ]]; then
+        echo "Request failed, and ${ENV_FILE} sets no STATUS_TOKEN." >&2
+        echo "If /status is gated there, add one and redeploy." >&2
+    else
+        echo "Request failed. A 404 here usually means the deployed server" >&2
+        echo "has a different STATUS_TOKEN than ${ENV_FILE} — redeploy it." >&2
+    fi
+    exit 1
+}
+
+if command -v python3 >/dev/null; then
+    printf '%s' "${BODY}" | python3 -m json.tool
+else
+    printf '%s\n' "${BODY}"
+fi
