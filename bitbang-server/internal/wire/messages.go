@@ -81,6 +81,16 @@ type CodeIssued struct {
 type Registered struct {
 	Type string `json:"type"`           // "registered"
 	Code string `json:"code,omitempty"` // 6-digit pairing code
+
+	// Versions is the newest published release of each BitBang client
+	// project, keyed by product ("cli", "octoprint"). Every device gets
+	// the same table and looks up its own row, so a client never has to
+	// say what it is or what version it runs -- which is the whole point
+	// of answering here instead of letting clients poll GitHub.
+	//
+	// Omitted when the server tracks nothing. A client that finds no key
+	// for itself says nothing.
+	Versions map[string]string `json:"versions,omitempty"`
 }
 
 // Error is sent by the server when any validation/auth step fails.

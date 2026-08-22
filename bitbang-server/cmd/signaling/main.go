@@ -11,6 +11,10 @@
 //	STATIC_DIR           Path to web/ asset directory (default ./web)
 //	STATUS_TOKEN         When set, /status needs "Authorization: Bearer <token>"
 //	                     from anywhere but loopback. Empty leaves it public.
+//	VERSION_REPOS        Comma-separated owner/repo=key pairs whose latest
+//	                     release is reported to clients. Empty disables
+//	                     polling entirely (no outbound requests).
+//	VERSION_POLL_INTERVAL  Seconds between polls (default 3600)
 //	TRUST_PROXY_HEADERS  When "true", honor X-Real-IP/X-Forwarded-For for
 //	                     browser-IP capture. Enable only behind a proxy
 //	                     that strips these headers from inbound requests.
@@ -53,6 +57,7 @@ import (
 	"bitbang-server-go/internal/pairing"
 	"bitbang-server-go/internal/ratelimit"
 	"bitbang-server-go/internal/registry"
+	"bitbang-server-go/internal/releases"
 	"bitbang-server-go/internal/turn"
 )
 
@@ -73,6 +78,12 @@ func main() {
 	// SQLite schema and durability story. Lifetime tied to recorderCtx
 	// so the goroutine exits on shutdown via the same SIGINT/SIGTERM
 	// that drains the HTTP server.
+	tracker := releases.New(
+		cfg.VersionRepos,
+		time.Duration(cfg.VersionPollInterval)*time.Second,
+		logger,
+	)
+
 	recorderCtx, stopRecorder := context.WithCancel(context.Background())
 	defer stopRecorder()
 	recorder, err := metrics.NewRecorder(
@@ -149,6 +160,7 @@ func main() {
 		PongWait:          300 * time.Second,
 		TrustProxyHeaders: cfg.TrustProxyHeaders,
 		StatusToken:       cfg.StatusToken,
+		Releases:          tracker,
 	}
 
 	mux := http.NewServeMux()
@@ -185,6 +197,11 @@ func main() {
 		// HTTP clients on non-WS endpoints.
 		IdleTimeout: 120 * time.Second,
 	}
+
+	// Release polling. Lifetime tied to recorderCtx like the metrics
+	// recorder, so the same SIGINT/SIGTERM stops it. nil Tracker (no
+	// VERSION_REPOS) makes Run a no-op and issues no requests.
+	go tracker.Run(recorderCtx)
 
 	// Graceful shutdown: SIGINT/SIGTERM → Server.Shutdown with 2s grace,
 	// then hard exit.
@@ -228,6 +245,12 @@ type config struct {
 	// from anywhere but loopback. Empty leaves it public.
 	StatusToken string
 
+	// VersionRepos are the GitHub projects whose latest release is
+	// reported to clients, and VersionPollInterval is how often to look.
+	// Empty repos means no polling and no outbound requests.
+	VersionRepos        []releases.Repo
+	VersionPollInterval int
+
 	// MetricsPath, when non-empty, enables the periodic JSONL snapshot of
 	// /status counters at MetricsInterval seconds. Empty disables.
 	MetricsPath     string
@@ -251,19 +274,21 @@ func loadConfig() config {
 	port := envOr("BITBANG_SERVER_PORT", "8082")
 	staticDir := envOr("STATIC_DIR", "./web")
 	return config{
-		Bind:              "0.0.0.0:" + port,
-		CoturnHost:        os.Getenv("COTURN_HOST"),
-		CoturnSecret:      os.Getenv("COTURN_SECRET"),
-		CoturnTTL:         envOrInt("COTURN_TTL", 86400),
-		TURNMaxActive:     envOrInt("TURN_MAX_ACTIVE", 0),
-		LogLevel:          parseLogLevel(envOr("LOG_LEVEL", "INFO")),
-		StaticDir:         staticDir,
-		TrustProxyHeaders: strings.EqualFold(os.Getenv("TRUST_PROXY_HEADERS"), "true"),
-		StatusToken:       os.Getenv("STATUS_TOKEN"),
-		MetricsPath:       os.Getenv("METRICS_PATH"),
-		MetricsInterval:   envOrInt("METRICS_INTERVAL", 300),
-		InstallURL:        os.Getenv("INSTALL_URL"),
-		FrontPagePath:     os.Getenv("FRONT_PAGE_PATH"),
+		Bind:                "0.0.0.0:" + port,
+		CoturnHost:          os.Getenv("COTURN_HOST"),
+		CoturnSecret:        os.Getenv("COTURN_SECRET"),
+		CoturnTTL:           envOrInt("COTURN_TTL", 86400),
+		TURNMaxActive:       envOrInt("TURN_MAX_ACTIVE", 0),
+		LogLevel:            parseLogLevel(envOr("LOG_LEVEL", "INFO")),
+		StaticDir:           staticDir,
+		TrustProxyHeaders:   strings.EqualFold(os.Getenv("TRUST_PROXY_HEADERS"), "true"),
+		StatusToken:         os.Getenv("STATUS_TOKEN"),
+		VersionRepos:        parseVersionRepos(os.Getenv("VERSION_REPOS")),
+		VersionPollInterval: envOrInt("VERSION_POLL_INTERVAL", 3600),
+		MetricsPath:         os.Getenv("METRICS_PATH"),
+		MetricsInterval:     envOrInt("METRICS_INTERVAL", 300),
+		InstallURL:          os.Getenv("INSTALL_URL"),
+		FrontPagePath:       os.Getenv("FRONT_PAGE_PATH"),
 	}
 }
 
@@ -320,4 +345,30 @@ func requestLogger(log *slog.Logger, next http.Handler, trustProxyHeaders bool) 
 		log.Debug("http", "method", r.Method, "path", r.URL.Path, "remote", remote)
 		next.ServeHTTP(w, r)
 	})
+}
+
+// parseVersionRepos reads VERSION_REPOS: comma-separated owner/repo=key
+// pairs, e.g. "richlegrand/bitbang-cli=cli,richlegrand/Octoprint-BitBang=octoprint".
+//
+// The key is separate from the repo name because they differ, and
+// because the key is what goes on the wire -- clients look themselves up
+// by it, so it has to survive a repo being renamed.
+//
+// A malformed entry is skipped rather than fatal: one typo should cost
+// one product's update notice, not the server's ability to start.
+func parseVersionRepos(s string) []releases.Repo {
+	var out []releases.Repo
+	for _, part := range strings.Split(s, ",") {
+		part = strings.TrimSpace(part)
+		if part == "" {
+			continue
+		}
+		repo, key, ok := strings.Cut(part, "=")
+		repo, key = strings.TrimSpace(repo), strings.TrimSpace(key)
+		if !ok || repo == "" || key == "" {
+			continue
+		}
+		out = append(out, releases.Repo{Repo: repo, Key: key})
+	}
+	return out
 }

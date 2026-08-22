@@ -21,6 +21,7 @@ import (
 	"bitbang-server-go/internal/pairing"
 	"bitbang-server-go/internal/ratelimit"
 	"bitbang-server-go/internal/registry"
+	"bitbang-server-go/internal/releases"
 	"bitbang-server-go/internal/turn"
 	"bitbang-server-go/internal/wire"
 )
@@ -62,6 +63,11 @@ type Deps struct {
 	// it. Empty leaves /status public, which is what it was before this
 	// existed -- so an operator who sets nothing sees no change.
 	StatusToken string
+
+	// Releases supplies the latest-version table stamped on the
+	// registered reply. nil when nothing is tracked; its Latest() is
+	// nil-safe, so no call site needs to check.
+	Releases *releases.Tracker
 }
 
 // DeviceWS handles /ws/device/<uid>.
@@ -133,6 +139,9 @@ func (d *Deps) DeviceWS(w http.ResponseWriter, r *http.Request, uid string) {
 	// promptly (rather than waiting for TTL).
 	conn.WantsCode = regMsg.WantCode
 	reply := wire.Registered{Type: "registered"}
+	// Same table for every device, so nothing about this one is implied
+	// by what it receives. nil-safe on a nil Tracker.
+	reply.Versions = d.Releases.Latest()
 	if regMsg.WantCode && d.Pairing != nil {
 		reply.Code = d.Pairing.Issue(uid)
 		d.Log.Info("issued pairing code", "uid", uid, "code", reply.Code)
