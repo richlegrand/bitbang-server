@@ -160,6 +160,7 @@ cd bitbang-server
 go build ./...
 go test ./...     # ~16s; pairing and handler suites include real timing waits
 go vet ./...
+node --test web_test/*.test.js
 ```
 
 The handler and pairing suites exercise the 3-second lookup delay and full pair round-trips against a live `httptest` server, so they're slow by design.

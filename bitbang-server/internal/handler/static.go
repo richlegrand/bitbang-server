@@ -21,11 +21,13 @@ const frontPagePlaceholder = "<!-- FRONT_PAGE -->"
 // Anything else returns 404. A new browser-runtime asset has to be added here
 // or it 404s at load time with no other symptom.
 var allowedBitbangAssets = map[string]bool{
-	"sw.js":         true,
-	"bootstrap.js":  true,
-	"ws-shim.js":    true,
-	"xhr-shim.js":   true,
-	"favicon.ico":   true, // handler internally maps this to favicon.png
+	"sw.js":           true,
+	"sw-upload.js":    true,
+	"flow-control.js": true,
+	"bootstrap.js":    true,
+	"ws-shim.js":      true,
+	"xhr-shim.js":     true,
+	"favicon.ico":     true, // handler internally maps this to favicon.png
 }
 
 // Static returns an http.Handler that serves the signaling server's static

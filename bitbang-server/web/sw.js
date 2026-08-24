@@ -7,6 +7,8 @@
  * are rewritten at the source by xhr-shim.js.
  */
 
+importScripts('/__bitbang__/sw-upload.js');
+
 console.log('[SW] booted');
 
 self.addEventListener('install', () => self.skipWaiting());
@@ -1063,37 +1065,111 @@ async function proxyToDevice(event) {
         contentLength
     }, [channel.port2]);
 
-    // -- Stream request body (if any) --
-    if (hasBody) {
-        if (event.request.body) {
-            const reader = event.request.body.getReader();
-            try {
-                while (true) {
-                    const { done, value } = await reader.read();
-                    if (done) break;
-                    channel.port1.postMessage({ type: 'bodyChunk', data: value }, [value.buffer]);
-                }
-            } finally {
-                reader.releaseLock();
+    // Upload acknowledgements and response frames share this MessagePort.
+    // Install a router before reading the request body so an ack cannot race
+    // the response handler setup. Non-ack messages are retained until the
+    // response promise below is ready to consume them.
+    const uploadAcks = new SWSPUpload.AckGate(30000);
+    let bodyReader = null;
+    let responseHandler = null;
+    const pendingResponseMessages = [];
+    channel.port1.onmessage = (msg) => {
+        if (msg.data?.type === 'bodyAck') {
+            if (uploadAcks.acknowledge(msg.data.seq)) return;
+        }
+        if (msg.data?.type === 'error') {
+            const error = uploadAcks.fail(new Error(msg.data.message || 'upload failed'));
+            if (bodyReader) {
+                Promise.resolve(bodyReader.cancel(error)).catch(() => {});
             }
         }
-        channel.port1.postMessage({ type: 'bodyEnd' });
+        if (responseHandler) responseHandler(msg);
+        else pendingResponseMessages.push(msg);
+    };
+
+    // -- Stream request body (if any) --
+    if (hasBody) {
+        try {
+            if (event.request.body) {
+                bodyReader = event.request.body.getReader();
+                let seq = 0;
+                try {
+                    while (true) {
+                        const { done, value } = await bodyReader.read();
+                        uploadAcks.throwIfFailed();
+                        if (done) break;
+
+                        for (let offset = 0; offset < value.byteLength;) {
+                            uploadAcks.throwIfFailed();
+                            const chunk = SWSPUpload.copySlice(value, offset);
+                            offset += chunk.byteLength;
+                            seq++;
+                            const ack = uploadAcks.wait(seq);
+                            channel.port1.postMessage({
+                                type: 'bodyChunk', data: chunk, seq,
+                            }, [chunk.buffer]);
+                            await ack;
+                        }
+                    }
+                } finally {
+                    bodyReader.releaseLock();
+                    bodyReader = null;
+                }
+            }
+            uploadAcks.throwIfFailed();
+            channel.port1.postMessage({ type: 'bodyEnd' });
+        } catch (e) {
+            channel.port1.postMessage({
+                type: 'cancel', message: e.message || 'upload failed',
+            });
+            return new Response(`BitBang: ${e.message || 'upload failed'}`, { status: 500 });
+        }
     }
 
     // -- Stream response back to browser --
     return new Promise((resolve) => {
         let streamController;
         let resolved = false;
+        let responseDone = false;
+        let responseClosed = false;
+        const responseChunks = [];
         let timeout;
+        const closeResponsePort = () => {
+            if (responseClosed) return;
+            responseClosed = true;
+            channel.port1.postMessage({ type: 'responseClosed' });
+        };
+        const pumpResponse = () => {
+            if (!streamController) return;
+            try {
+                while (responseChunks.length > 0 && streamController.desiredSize > 0) {
+                    const chunk = responseChunks.shift();
+                    streamController.enqueue(chunk.data);
+                    if (chunk.wireBytes) {
+                        channel.port1.postMessage({
+                            type: 'responseConsumed', bytes: chunk.wireBytes, frames: 1,
+                        });
+                    }
+                }
+                if (responseDone && responseChunks.length === 0) {
+                    streamController.close();
+                    closeResponsePort();
+                }
+            } catch (e) {
+                channel.port1.postMessage({ type: 'cancel', message: String(e) });
+                closeResponsePort();
+            }
+        };
         if (!hasBody) {
             timeout = setTimeout(() => {
                 if (!resolved) {
+                    channel.port1.postMessage({ type: 'cancel', message: 'request timeout' });
                     resolve(new Response('BitBang: request timeout', { status: 504 }));
                 }
             }, 30000);
         }
 
-        channel.port1.onmessage = (msg) => {
+        responseHandler = (msg) => {
             const { type, status, headers, data, message } = msg.data;
 
             if (type === 'uploadProgress') {
@@ -1204,7 +1280,18 @@ async function proxyToDevice(event) {
                                 + '<script src="/__bitbang__/ws-shim.js"></script>';
                             controller.enqueue(new TextEncoder().encode(shims));
                         }
-                    }
+                        pumpResponse();
+                    },
+                    pull() {
+                        pumpResponse();
+                    },
+                    cancel(reason) {
+                        responseChunks.length = 0;
+                        channel.port1.postMessage({
+                            type: 'cancel', message: String(reason || 'response cancelled'),
+                        });
+                        closeResponsePort();
+                    },
                 });
 
                 // CORS headers for fonts with crossorigin attributes
@@ -1216,17 +1303,22 @@ async function proxyToDevice(event) {
                 const nullBodyStatus = (status === 204 || status === 304);
                 resolve(new Response(nullBodyStatus ? null : stream, { status, headers }));
             } else if (type === 'chunk') {
-                try { streamController?.enqueue(data); } catch (e) {}
+                responseChunks.push({ data, wireBytes: msg.data.wireBytes || 0 });
+                pumpResponse();
             } else if (type === 'done') {
-                try { streamController?.close(); } catch (e) {}
+                responseDone = true;
+                pumpResponse();
             } else if (type === 'error') {
                 if (timeout) clearTimeout(timeout);
+                responseChunks.length = 0;
                 if (!resolved) {
                     resolve(new Response(`BitBang: ${message}`, { status: 500 }));
                 } else {
                     try { streamController?.error(new Error(message)); } catch (e) {}
                 }
+                closeResponsePort();
             }
         };
+        for (const msg of pendingResponseMessages.splice(0)) responseHandler(msg);
     });
 }
