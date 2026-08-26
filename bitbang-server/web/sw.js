@@ -1046,7 +1046,28 @@ async function proxyToDevice(event) {
     const jarKey = `${session.uid}:${session.target}`;
     const channel = new MessageChannel();
     const hasBody = event.request.method !== 'GET' && event.request.method !== 'HEAD';
-    const contentLength = parseInt(
+
+    // Request.body is not available everywhere: Firefox does not support it in
+    // any version, Samsung Internet gained it in 20, Chrome in 105. Without a
+    // fallback the body was simply never sent -- the request went out empty and
+    // the server rejected it, which looked like a login failure rather than a
+    // missing body. Buffer it in that case; there is no streaming option there.
+    let bufferedBody = null;
+    if (hasBody && !event.request.body) {
+        try {
+            bufferedBody = new Uint8Array(await event.request.arrayBuffer());
+        } catch (e) {
+            // Nothing readable. Send an empty body rather than hanging: the
+            // request still has to be completed or the page waits forever.
+            bufferedBody = new Uint8Array(0);
+        }
+    }
+
+    // Buffering has one upside: the exact size is known, so the listener can
+    // send a real Content-Length instead of chunked encoding. The streaming
+    // path has to fall back to the header, which browsers do not expose to a
+    // service worker -- so it is usually absent and the request goes chunked.
+    const contentLength = bufferedBody !== null ? bufferedBody.byteLength : parseInt(
         event.request.headers.get('content-length') ||
         event.request.headers.get('x-file-size') ||
         '0', 10
@@ -1077,7 +1098,14 @@ async function proxyToDevice(event) {
 
     // -- Stream request body (if any) --
     if (hasBody) {
-        if (event.request.body) {
+        if (bufferedBody !== null) {
+            if (bufferedBody.byteLength > 0) {
+                // bootstrap.js splits this into MAX_CHUNK frames and applies
+                // backpressure, so one message is fine however large it is.
+                channel.port1.postMessage(
+                    { type: 'bodyChunk', data: bufferedBody }, [bufferedBody.buffer]);
+            }
+        } else if (event.request.body) {
             const reader = event.request.body.getReader();
             try {
                 while (true) {
