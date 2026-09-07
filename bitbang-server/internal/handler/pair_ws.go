@@ -101,6 +101,7 @@ func (d *Deps) PairWS(w http.ResponseWriter, r *http.Request) {
 
 	d.setReadKeepalive(ws)
 	d.startPingLoop(ws)
+	d.sendHello(ws)
 
 	// First (and only) message before normal relay: PairInit. We use a
 	// short read deadline here so an idle WS doesn't park a goroutine

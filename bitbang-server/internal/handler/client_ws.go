@@ -35,6 +35,7 @@ func (d *Deps) ClientWS(w http.ResponseWriter, r *http.Request, targetUID string
 
 	d.setReadKeepalive(ws)
 	d.startPingLoop(ws)
+	d.sendHello(ws)
 
 	clientID := targetUID + "_" + shortRandomHex(4)
 	connectAt := time.Now()
@@ -65,6 +66,23 @@ func (d *Deps) ClientWS(w http.ResponseWriter, r *http.Request, targetUID string
 	}
 
 	d.clientRelay(conn)
+}
+
+// sendHello opens a connector socket with the latest-release table, the
+// connector side of what Registered does for a device. Shared by both
+// connector endpoints (/ws/client/<uid> and /ws/pair).
+//
+// Silent when nothing is tracked, so a server built without VERSION_REPOS
+// behaves exactly as it did before. Sent before the connector has said
+// anything and identically to everyone, so it discloses nothing -- and
+// nothing downstream waits on it, which is why a failed write is dropped:
+// the socket is about to fail on its own if it is really gone.
+func (d *Deps) sendHello(ws *websocket.Conn) {
+	versions := d.Releases.Latest()
+	if len(versions) == 0 {
+		return
+	}
+	_ = sendJSON(ws, wire.Hello{Type: "hello", Versions: versions})
 }
 
 // clientRelay reads messages from the client and forwards to its target device.

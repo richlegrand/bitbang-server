@@ -93,6 +93,26 @@ type Registered struct {
 	Versions map[string]string `json:"versions,omitempty"`
 }
 
+// Hello is the first thing the server writes on a connector socket --
+// /ws/client/<uid> and /ws/pair alike -- before the connector has sent
+// anything. It exists to carry Versions to the side of a session that has
+// no registration to stamp it on: a device is told about a release in the
+// reply to a register it was already making, and a connector has no such
+// reply.
+//
+// Sent unconditionally when the table is non-empty, so it says nothing
+// about the connector, the UID it asked for, or whether that device
+// exists. Connectors that predate it ignore an unknown type (the CLI logs
+// it under -v, bootstrap.js falls through its dispatch), which is what
+// makes this safe to deploy ahead of any client.
+type Hello struct {
+	Type string `json:"type"` // "hello"
+
+	// Versions is the same table Registered carries, with the same
+	// contract -- see there.
+	Versions map[string]string `json:"versions,omitempty"`
+}
+
 // Error is sent by the server when any validation/auth step fails.
 type Error struct {
 	Type    string `json:"type"`    // "error"
