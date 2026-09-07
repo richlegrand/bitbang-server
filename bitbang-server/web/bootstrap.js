@@ -493,8 +493,13 @@ class BitBangConnection {
         const secs = (performance.now() - this.videoStats.since) / 1000;
         if (secs >= 5) {
             const st = this.videoStats;
-            console.log(`[video] ${(st.drawn / secs).toFixed(1)} fps, ` +
-                        `${st.drawn} drawn, ${st.dropped} incomplete`);
+            // Debug only: this is the counter that says whether reassembly is
+            // keeping up, which matters while something is wrong and is noise
+            // the rest of the time.
+            if (this.debug) {
+                console.log(`[video] ${(st.drawn / secs).toFixed(1)} fps, ` +
+                            `${st.drawn} drawn, ${st.dropped} incomplete`);
+            }
             st.drawn = 0; st.dropped = 0; st.since = performance.now();
         }
 
