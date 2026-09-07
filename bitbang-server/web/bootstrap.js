@@ -126,6 +126,27 @@ const FLAG_SYN = 0x0001;
 const FLAG_FIN = 0x0004;
 const FLAG_DAT = 0x0000;
 const FLAG_MORE = 0x0002;  // non-final fragment of a chunked WS message
+
+// Stream chunk header, little-endian:
+//
+//    0  u32  frame id      monotonic per stream, never reused
+//    4  u16  chunk index
+//    6  u16  chunk count
+//    8  u16  flags         bit 0 = keyframe
+//   10  u16  reserved
+//   12  u32  pts_ms        capture time, milliseconds since the device booted
+//
+// pts and the keyframe flag are carried before anything reads them. Audio has
+// to share a timebase with video to be synchronized, and H.264 cannot be
+// decoded without knowing which frames are independent. See
+// av-streaming-api.md in the design notes.
+const VIDEO_CHUNK_HEADER = 16;
+const VIDEO_FLAG_KEYFRAME = 0x0001;
+// How many frames may be part-assembled at once. Chunks of consecutive frames
+// interleave on an unordered channel, so this needs to be more than one -- but
+// only just, since a frame that is still short by the time two newer ones have
+// arrived is missing a chunk that is never coming.
+const VIDEO_FRAME_SLOTS = 3;
 const SWSP_CHUNK_SIZE = 16384;  // max payload bytes per data-channel frame
 
 // Soft reconnect: when an established peer connection drops (e.g. a transient
@@ -314,11 +335,15 @@ class BitBangConnection {
         this.connectResolve = null;   // resolved when device sends 'ready'
         this.nextStreamId = 1;        // streamId 0 is reserved for control
         this.wsStreams = new Map();    // streamId -> { iframe } for WebSocket bridging
+        this.benchStreams = new Map(); // streamId -> stats, for the transport benchmark
         this.sessionId = Array.from(crypto.getRandomValues(new Uint8Array(4)), b => b.toString(16).padStart(2, '0')).join(''); // 8 hex chars
         console.log('[Bootstrap] ctor', this.sessionId);
         this.candidateQueue = new CandidateQueue();
         this.remoteDescriptionSet = false;
         this.progressChannel = new BroadcastChannel('bitbang-progress');
+        // Frames arriving on a video channel, forwarded to whatever page the
+        // device served. The page owns the canvas; this only carries bytes.
+        this.videoFrameChannel = new BroadcastChannel('bitbang-video');
 
         this.statusEl = document.getElementById('status');
         this.connectionUI = document.getElementById('connection-ui');
@@ -371,6 +396,287 @@ class BitBangConnection {
         const length = view.getUint16(6, true);
         const payload = buffer.slice(8, 8 + length);
         return { streamId, flags, payload };
+    }
+
+    // A channel carrying frames rather than SWSP. Each message is one chunk of
+    // one frame; see VIDEO_CHUNK_HEADER on the device for why frames are split.
+    attachVideoChannel(ch) {
+        console.log(`[Bootstrap] video channel open (${ch.label})`);
+        ch.binaryType = 'arraybuffer';
+        this.videoChannel = ch;
+        this.videoFrames = new Map();   // frame id -> partial frame
+        this.videoNewest = -1;          // newest frame id already drawn
+        this.videoStats = { drawn: 0, dropped: 0, since: performance.now() };
+        ch.onmessage = (e) => {
+            if (this.benchVideo) {
+                this.countBenchMessage(e.data);
+                return;
+            }
+            this.handleVideoChunk(e.data);
+        };
+        ch.onclose = () => {
+            console.log('[Bootstrap] video channel closed');
+            this.videoChannel = null;
+            this.videoFrames = null;
+        };
+    }
+
+    // Reassemble one frame from its chunks.
+    //
+    // The channel is unordered and lifetime-limited, so chunks arrive in any
+    // order, chunks of different frames interleave, and some never arrive at
+    // all. A frame is drawn only once every chunk is in hand; one that is still
+    // short when newer frames are completing is missing a chunk that is not
+    // coming, and waiting for it would only add latency to everything behind
+    // it.
+    handleVideoChunk(buf) {
+        if (buf.byteLength < VIDEO_CHUNK_HEADER) return;
+        const dv = new DataView(buf);
+        const frameId = dv.getUint32(0, true);
+        const index = dv.getUint16(4, true);
+        const count = dv.getUint16(6, true);
+        const flags = dv.getUint16(8, true);
+        const ptsMs = dv.getUint32(12, true);
+        if (count === 0 || index >= count) return;
+
+        // A device that restarts begins numbering at zero again.
+        if (frameId + 1000 < this.videoNewest) {
+            this.videoFrames.clear();
+            this.videoNewest = -1;
+        }
+        // Already drawn, or older than what has been drawn.
+        if (frameId <= this.videoNewest) return;
+
+        let f = this.videoFrames.get(frameId);
+        if (f === undefined) {
+            f = { count, got: 0, bytes: 0, parts: new Array(count),
+                  ptsMs, keyframe: (flags & VIDEO_FLAG_KEYFRAME) !== 0 };
+            this.videoFrames.set(frameId, f);
+            if (this.videoFrames.size > VIDEO_FRAME_SLOTS) {
+                let oldest = Infinity;
+                for (const id of this.videoFrames.keys()) {
+                    if (id < oldest) oldest = id;
+                }
+                this.videoFrames.delete(oldest);
+                this.videoStats.dropped++;
+                // The chunk that just arrived belongs to the frame that was
+                // evicted: it is behind everything else in flight.
+                if (oldest === frameId) return;
+            }
+        }
+        if (f.parts[index] !== undefined) return;   // duplicate
+
+        const part = new Uint8Array(buf, VIDEO_CHUNK_HEADER);
+        f.parts[index] = part;
+        f.bytes += part.byteLength;
+        if (++f.got !== f.count) return;
+
+        const frame = new Uint8Array(f.bytes);
+        let off = 0;
+        for (const p of f.parts) {
+            frame.set(p, off);
+            off += p.byteLength;
+        }
+        this.videoFrames.delete(frameId);
+        this.videoNewest = frameId;
+        // Anything still pending is older than what is about to be drawn.
+        for (const id of [...this.videoFrames.keys()]) {
+            if (id < frameId) {
+                this.videoFrames.delete(id);
+                this.videoStats.dropped++;
+            }
+        }
+
+        if (f.bytes === 0) return;   // nothing to draw
+
+        this.videoStats.drawn++;
+        const secs = (performance.now() - this.videoStats.since) / 1000;
+        if (secs >= 5) {
+            const st = this.videoStats;
+            console.log(`[video] ${(st.drawn / secs).toFixed(1)} fps, ` +
+                        `${st.drawn} drawn, ${st.dropped} incomplete`);
+            st.drawn = 0; st.dropped = 0; st.since = performance.now();
+        }
+
+        // The device's page owns the canvas; forwarding the bytes keeps the
+        // rendering where the markup is.
+        //
+        // pts is relative to the device's boot, so it is only meaningful
+        // against other frames from the same device. The consumer takes the
+        // first one it sees as the origin -- which also means a device restart
+        // is just a new origin rather than a discontinuity to handle.
+        this.videoFrameChannel.postMessage(
+            { type: 'frame', data: frame.buffer, ptsMs: f.ptsMs, keyframe: f.keyframe },
+            [frame.buffer]);
+    }
+
+    // Benchmark accounting for messages arriving on the video channel. The
+    // run is still started and finished over SWSP, so only the payload moved.
+    countBenchMessage(buf) {
+        const st = this.benchVideo;
+        const len = buf.byteLength;
+        if (len < 4) return;
+        const p = new Uint8Array(buf);
+        const seq = (p[0] | (p[1] << 8) | (p[2] << 16) | (p[3] << 24)) >>> 0;
+
+        st.seen++;
+        if (seq > st.maxSeq) st.maxSeq = seq;
+        if (seq < st.lastSeq) st.reordered++;
+        st.lastSeq = seq;
+
+        let b = st.bySize.get(len);
+        if (!b) {
+            b = { bytes: 0, count: 0, first: performance.now(), last: 0, minSeq: seq, maxSeq: seq };
+            st.bySize.set(len, b);
+        }
+        b.bytes += len;
+        b.count++;
+        b.last = performance.now();
+        if (seq < b.minSeq) b.minSeq = seq;
+        if (seq > b.maxSeq) b.maxSeq = seq;
+    }
+
+    // -- Transport benchmark --
+    //
+    // Run from the console: __bitbangConnection.startBench(). The device sweeps
+    // message sizes and sends flat out; we count what arrives.
+    //
+    // Both halves are needed. The device reports what it offered to the
+    // transport, which on an unreliable channel is not what gets delivered --
+    // the difference is the number the ordered/unordered comparison is about.
+    startBench() {
+        if (!this.dataChannel || this.dataChannel.readyState !== 'open') {
+            console.error('[bench] data channel is not open');
+            return;
+        }
+        if (!this.videoChannel) {
+            console.error('[bench] the video channel is not open');
+            return;
+        }
+        const streamId = this.nextStreamId++;
+        // Started and finished over SWSP, counted on the video channel.
+        this.benchVideo = {
+            bySize: new Map(),   // payload length -> bucket
+            maxSeq: -1,
+            lastSeq: -1,
+            reordered: 0,
+            seen: 0,
+        };
+        this.benchStreams.set(streamId, this.benchVideo);
+        this.dataChannel.send(this.createFrame(streamId, FLAG_SYN, JSON.stringify({ bench: true })));
+        console.log(`[bench] run started on stream ${streamId}`);
+        this.pollIceDuringBench(streamId);
+    }
+
+    // Whether the peer's connectivity checks are actually leaving this browser.
+    //
+    // The device sees roughly one check in four go missing while a transfer is
+    // running. From its end there is no way to tell a check that was never sent
+    // from one lost on the air. Chrome knows: requestsSent counts what it put
+    // on the wire, responsesReceived what came back.
+    pollIceDuringBench(streamId) {
+        let prev = null;
+        const tick = async () => {
+            if (!this.benchStreams.has(streamId)) return;   // run finished
+            try {
+                const stats = await this.pc.getStats();
+                const now = { req: 0, res: 0, consent: 0, recv: 0,
+                              tbytes: 0, dcmsgs: 0, dcbytes: 0, pairs: 0 };
+                for (const [, r] of stats) {
+                    if (r.type === 'candidate-pair' && r.nominated) {
+                        now.pairs++;
+                        now.req += r.requestsSent || 0;
+                        now.res += r.responsesReceived || 0;
+                        now.consent += r.consentRequestsSent || 0;
+                        now.recv += r.packetsReceived || 0;
+                    } else if (r.type === 'transport') {
+                        // Counted below DTLS, so it moves even when the
+                        // candidate-pair counter does not.
+                        now.tbytes += r.bytesReceived || 0;
+                    } else if (r.type === 'data-channel' && r.label === 'video') {
+                        // What Chrome actually handed up as complete messages.
+                        now.dcmsgs += r.messagesReceived || 0;
+                        now.dcbytes += r.bytesReceived || 0;
+                    }
+                }
+                if (prev) {
+                    const kb = (n) => Math.round(n / 1024);
+                    console.log(`[bench/ice] +${now.req - prev.req} requests sent, ` +
+                                `+${now.res - prev.res} responses back, ` +
+                                `+${now.consent - prev.consent} consent, ` +
+                                `+${now.recv - prev.recv} packets in ` +
+                                `(${now.pairs} pair) | transport +${kb(now.tbytes - prev.tbytes)} KB ` +
+                                `| video dc +${now.dcmsgs - prev.dcmsgs} msgs ` +
+                                `+${kb(now.dcbytes - prev.dcbytes)} KB`);
+                }
+                prev = now;
+            } catch (e) { /* getStats can throw during teardown */ }
+            setTimeout(tick, 5000);
+        };
+        setTimeout(tick, 5000);
+    }
+
+    handleBenchFrame(frame, st) {
+        if (frame.flags & FLAG_FIN) {
+            this.benchVideo = null;
+            // The device names its own configuration in the closing frame, so
+            // a printed result always says what produced it.
+            let mode = null;
+            if (frame.payload.byteLength > 0) {
+                try { mode = JSON.parse(new TextDecoder().decode(frame.payload)); } catch (e) { /* older device */ }
+            }
+            this.reportBench(frame.streamId, st, mode);
+            this.benchStreams.delete(frame.streamId);
+            return;
+        }
+
+        const len = frame.payload.byteLength;
+        if (len < 4) return;
+        const p = new Uint8Array(frame.payload);
+        const seq = (p[0] | (p[1] << 8) | (p[2] << 16) | (p[3] << 24)) >>> 0;
+
+        st.seen++;
+        if (seq > st.maxSeq) st.maxSeq = seq;
+        // Arriving behind the previous frame is expected on an unordered
+        // channel and should never happen on an ordered one.
+        if (seq < st.lastSeq) st.reordered++;
+        st.lastSeq = seq;
+
+        let b = st.bySize.get(len);
+        if (!b) {
+            b = { bytes: 0, count: 0, first: performance.now(), last: 0, minSeq: seq, maxSeq: seq };
+            st.bySize.set(len, b);
+        }
+        b.bytes += len;
+        b.count++;
+        b.last = performance.now();
+        if (seq < b.minSeq) b.minSeq = seq;
+        if (seq > b.maxSeq) b.maxSeq = seq;
+    }
+
+    reportBench(streamId, st, mode) {
+        const how = mode
+            ? `${mode.ordered ? 'ordered' : 'unordered'}, ` +
+              (mode.lifetime_ms ? `lifetime ${mode.lifetime_ms}ms` : 'reliable')
+            : 'mode not reported';
+        console.log(`[bench] stream ${streamId} complete -- ${how}`);
+        for (const [size, b] of [...st.bySize.entries()].sort((a, c) => a[0] - c[0])) {
+            const secs = (b.last - b.first) / 1000;
+            const rate = secs > 0 ? (b.bytes / 1024 / secs) : 0;
+            // The device numbers each message, so the span between the first
+            // and last sequence seen at this size says how many it sent, and
+            // the shortfall is what did not arrive.
+            const sent = b.maxSeq - b.minSeq + 1;
+            const lost = sent - b.count;
+            const lossPct = sent > 0 ? (100 * lost / sent) : 0;
+            console.log(
+                `[bench] ${String(size).padStart(6)} B  ` +
+                `${String(b.count).padStart(5)} msgs  ` +
+                `${rate.toFixed(0).padStart(6)} KB/s  ` +
+                `lost ${lost} (${lossPct.toFixed(1)}%)`);
+        }
+        console.log(`[bench] totals: ${st.seen} received, ${st.maxSeq + 1} sent, ` +
+                    `${st.maxSeq + 1 - st.seen} lost, ${st.reordered} out of order`);
     }
 
     // Append one line to the connection log — a plain append-only terminal:
@@ -482,11 +788,28 @@ class BitBangConnection {
 
         // Drop our session entry when this window goes away (refresh or close)
         // so the SW doesn't carry stale records into the next page load.
-        window.addEventListener('pagehide', () => {
+        window.addEventListener('pagehide', (event) => {
             navigator.serviceWorker.controller?.postMessage({
                 type: 'unsetBootstrap',
                 sessionId: this.sessionId,
             });
+            // Tell the device too, by closing rather than just walking away.
+            //
+            // Without this the device only learns the browser is gone when ICE
+            // consent stops being answered, which takes about 24 seconds. A
+            // refresh brings the new session up well inside that window, so the
+            // device is holding two: the cap is two, its thread stacks have to
+            // come out of internal RAM, and the new connection can fail to get
+            // one while the dead session still holds its own. The result is a
+            // page that connects to nothing for half a minute.
+            //
+            // Not on a bfcache hide -- there the page can still come back, and
+            // closing would strand it. A page holding an open RTCPeerConnection
+            // is usually not eligible anyway, so this is close to always taken.
+            if (event.persisted) return;
+            try { if (this.dataChannel) this.dataChannel.close(); } catch (e) { /* already gone */ }
+            try { if (this.videoChannel) this.videoChannel.close(); } catch (e) { /* already gone */ }
+            try { if (this.pc) this.pc.close(); } catch (e) { /* already gone */ }
         });
 
         await navigator.serviceWorker.ready;
@@ -896,6 +1219,15 @@ class BitBangConnection {
         };
 
         pc.ondatachannel = (event) => {
+            // Dispatch by label. A device may open more than one channel, and
+            // attaching the SWSP parser to a channel carrying anything else
+            // reads its payload as frame headers -- and reassigning
+            // this.dataChannel would send SWSP out on the wrong one.
+            if (event.channel.label === 'video') {
+                this.attachVideoChannel(event.channel);
+                return;
+            }
+
             this.dataChannel = event.channel;
             this.dataChannel.binaryType = 'arraybuffer';  // SWSP uses binary frames
             this.dataChannel.onopen = () => {
@@ -1307,6 +1639,13 @@ class BitBangConnection {
             const ws = this.wsStreams.get(frame.streamId);
             if (ws) {
                 this.handleWSFrame(frame, ws);
+                return;
+            }
+
+            // Transport benchmark -- see startBench()
+            const bench = this.benchStreams.get(frame.streamId);
+            if (bench) {
+                this.handleBenchFrame(frame, bench);
                 return;
             }
 
@@ -1865,7 +2204,56 @@ class BitBangConnection {
             }
         });
 
+        // The iframe's first fetch must reach the service worker: nothing on
+        // the network serves /__device__/<sid>/.
+        await this.waitForController();
+
         this.createIframe();
+    }
+
+    // A page loaded with a hard reload (Ctrl+Shift+R) starts uncontrolled --
+    // Chrome bypasses the service worker for that navigation. Everything else
+    // works: bootstrap.js runs, the peer connection comes up, video frames
+    // arrive. Only the iframe fetch goes to the network instead of the SW, and
+    // nothing there serves it, so the page is white behind a working data
+    // channel. It looks like a video failure and is not one.
+    //
+    // clients.claim() in sw.js's activate handler does claim us, but it can
+    // land after the iframe has already navigated, so waiting for it is the
+    // fix rather than reloading. Reload only if the claim never arrives.
+    async waitForController(timeoutMs = 3000) {
+        const key = 'bb-reloaded-uncontrolled';
+        if (navigator.serviceWorker.controller) {
+            try { sessionStorage.removeItem(key); } catch (e) { /* private mode */ }
+            return true;
+        }
+
+        const claimed = await new Promise((resolve) => {
+            const timer = setTimeout(() => resolve(false), timeoutMs);
+            navigator.serviceWorker.addEventListener('controllerchange', () => {
+                clearTimeout(timer);
+                resolve(true);
+            }, { once: true });
+        });
+        if (claimed) {
+            try { sessionStorage.removeItem(key); } catch (e) { /* private mode */ }
+            return true;
+        }
+
+        // Once per tab, so a service worker that genuinely cannot claim this
+        // page produces one wasted reload rather than a loop.
+        try {
+            if (sessionStorage.getItem(key)) {
+                console.error('[Bootstrap] no service worker controller after reloading; '
+                            + 'the device page cannot be fetched');
+                return false;
+            }
+            sessionStorage.setItem(key, '1');
+        } catch (e) { /* private mode: fall through and reload once */ }
+
+        console.warn('[Bootstrap] no service worker controller (hard reload?); reloading normally');
+        window.location.reload();
+        return false;
     }
 
     handleNavigateRequest(path) {
