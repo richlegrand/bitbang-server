@@ -142,6 +142,14 @@ const FLAG_MORE = 0x0002;  // non-final fragment of a chunked WS message
 // av-streaming-api.md in the design notes.
 const VIDEO_CHUNK_HEADER = 16;
 const VIDEO_FLAG_KEYFRAME = 0x0001;
+
+// A stream channel announces itself with this in RTCDataChannel.protocol,
+// followed by the codec: bitbang-stream/mjpeg, .../h264, .../opus, .../fmp4.
+// The label carries <presentation>/<component> -- cam/video, cam/audio -- so
+// the label names the stream and the protocol names its type. Both are needed:
+// a decoder has to be chosen before the first frame, and one element binds to
+// a presentation rather than to a component.
+const STREAM_PROTOCOL_PREFIX = 'bitbang-stream/';
 // How many frames may be part-assembled at once. Chunks of consecutive frames
 // interleave on an unordered channel, so this needs to be more than one -- but
 // only just, since a frame that is still short by the time two newer ones have
@@ -401,7 +409,17 @@ class BitBangConnection {
     // A channel carrying frames rather than SWSP. Each message is one chunk of
     // one frame; see VIDEO_CHUNK_HEADER on the device for why frames are split.
     attachVideoChannel(ch) {
-        console.log(`[Bootstrap] video channel open (${ch.label})`);
+        // cam/video -> presentation "cam", component "video". A bare label from
+        // older firmware is treated as its own presentation, which is what it
+        // effectively was when there could only be one.
+        const slash = ch.label.indexOf('/');
+        const presentation = slash > 0 ? ch.label.slice(0, slash) : ch.label;
+        const component = slash > 0 ? ch.label.slice(slash + 1) : 'video';
+        const codec = ch.protocol && ch.protocol.startsWith(STREAM_PROTOCOL_PREFIX)
+            ? ch.protocol.slice(STREAM_PROTOCOL_PREFIX.length)
+            : 'mjpeg';
+        console.log(`[Bootstrap] stream channel open: ${presentation}/${component}, codec ${codec}`);
+        this.videoStream = { presentation, component, codec };
         ch.binaryType = 'arraybuffer';
         this.videoChannel = ch;
         this.videoFrames = new Map();   // frame id -> partial frame
@@ -510,8 +528,11 @@ class BitBangConnection {
         // against other frames from the same device. The consumer takes the
         // first one it sees as the origin -- which also means a device restart
         // is just a new origin rather than a discontinuity to handle.
+        // The stream name and codec ride along so a page can bind an element to
+        // a presentation and pick a decoder without asking anything else.
         this.videoFrameChannel.postMessage(
-            { type: 'frame', data: frame.buffer, ptsMs: f.ptsMs, keyframe: f.keyframe },
+            { type: 'frame', data: frame.buffer, ptsMs: f.ptsMs, keyframe: f.keyframe,
+              stream: this.videoStream?.presentation, codec: this.videoStream?.codec },
             [frame.buffer]);
     }
 
@@ -1228,7 +1249,12 @@ class BitBangConnection {
             // attaching the SWSP parser to a channel carrying anything else
             // reads its payload as frame headers -- and reassigning
             // this.dataChannel would send SWSP out on the wrong one.
-            if (event.channel.label === 'video') {
+            // Dispatch on the protocol, falling back to the bare "video" label
+            // so a device on firmware that predates the protocol field still
+            // works. The label alone cannot classify a channel -- "cam/video"
+            // names one stream among possibly several.
+            const proto = event.channel.protocol || '';
+            if (proto.startsWith(STREAM_PROTOCOL_PREFIX) || event.channel.label === 'video') {
                 this.attachVideoChannel(event.channel);
                 return;
             }
