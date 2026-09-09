@@ -150,6 +150,12 @@ const VIDEO_FLAG_KEYFRAME = 0x0001;
 // a decoder has to be chosen before the first frame, and one element binds to
 // a presentation rather than to a component.
 const STREAM_PROTOCOL_PREFIX = 'bitbang-stream/';
+
+// How long to wait after ICE first reports 'connected' before classifying the
+// path for telemetry, when 'completed' has not arrived. Long enough for the
+// relay-to-direct migration that the device's nomination policy produces,
+// short enough that a brief session still reports.
+const PATH_SETTLE_MS = 5000;
 // How many frames may be part-assembled at once. Chunks of consecutive frames
 // interleave on an unordered channel, so this needs to be more than one -- but
 // only just, since a frame that is still short by the time two newer ones have
@@ -363,6 +369,10 @@ class BitBangConnection {
         this._turnHoldPromise = null;
         this._wasConnected = false;
         this._usingRelay = false;
+        this._relayMonitorTimer = null;
+        this._turnPrevTitle = null;
+        this._pathReported = false;
+        this._pathSettleTimer = null;
         this._turnWarnTimer = null;
         this._turnEndTimer = null;
         this._turnExpiryMs = null;
@@ -1164,6 +1174,7 @@ class BitBangConnection {
                 this._clearReassureTimer();
                 this._printDebug(STATUS.CONNECTED);
                 this.pollConnectionType(pc);
+                this._monitorRelayPath(pc);
                 if (!this._wasConnected) {
                     this._wasConnected = true;
                     this._onFirstConnected(pc);
@@ -1189,6 +1200,8 @@ class BitBangConnection {
         // connected within the same PC) and fire one connection_path
         // telemetry message per established or failed event.
         this._prevICEState = null;
+        this._pathReported = false;
+        this._clearPathSettleTimer();
 
         pc.oniceconnectionstatechange = () => {
             if (this.debug) console.log(`[Bootstrap] iceConnectionState -> ${pc.iceConnectionState}`);
@@ -1200,12 +1213,36 @@ class BitBangConnection {
             // connection_path report with the actual selected path. Each
             // transition INTO failed gets one "failed" report. Fire-and-
             // forget — never block the connection state machine on it.
-            if (now === 'connected' && prev !== 'connected') {
-                this._detectConnectionPath(pc)
-                    .then((path) => this._sendConnectionPath(path))
-                    .catch(() => {});
+            // Sample once ICE has settled, not the moment it first works.
+            // 'connected' means some pair succeeded; 'completed' means
+            // checking is done and the nomination is final. A relay pair
+            // usually wins the first race -- a TURN allocation is one
+            // deterministic round trip, a direct pair still has to
+            // hole-punch -- and the device then nominates direct, by design.
+            // Sampling at 'connected' therefore counted relay for sessions
+            // that spent their whole life direct.
+            //
+            // 'completed' is not guaranteed to arrive, and a short session may
+            // end before it does, so a settle timer bounds the wait. First one
+            // wins; _pathReported keeps it to one report per establishment.
+            if ((now === 'connected' || now === 'completed') && !this._pathReported) {
+                if (now === 'completed') {
+                    this._reportConnectionPath(pc);
+                } else if (!this._pathSettleTimer) {
+                    this._pathSettleTimer = setTimeout(
+                        () => this._reportConnectionPath(pc), PATH_SETTLE_MS);
+                }
             } else if (now === 'failed' && prev !== 'failed') {
-                this._sendConnectionPath('failed', 'ice_failed');
+                this._clearPathSettleTimer();
+                if (!this._pathReported) {
+                    this._pathReported = true;
+                    this._sendConnectionPath('failed', 'ice_failed');
+                }
+            } else if (now === 'checking' && prev && prev !== 'checking') {
+                // A restartIce re-establishment: this is a new establishment
+                // and earns its own report.
+                this._clearPathSettleTimer();
+                this._pathReported = false;
             }
 
             if (this._wasConnected && this._usingRelay
@@ -1330,15 +1367,23 @@ class BitBangConnection {
         tick();
     }
 
-    // Returns true if any transport's selected ICE candidate pair has a
-    // TURN relay on either end.
+    // Returns true if the session is *currently* carried over a TURN relay.
+    //
+    // Two conditions, and both matter. The pair has to be the one selected
+    // right now -- ICE migrates, and a relay pair usually wins the first race
+    // because a TURN allocation is a deterministic round trip while a direct
+    // pair still has to hole-punch. And the pair has to be carrying traffic:
+    // with video and data on separate transports, an idle or superseded
+    // transport should not decide what the whole session is doing.
     async _isUsingRelay(pc) {
+        if (!pc) return false;
         try {
             const stats = await pc.getStats();
             for (const [, report] of stats) {
                 if (report.type !== 'transport' || !report.selectedCandidatePairId) continue;
                 const pair = stats.get(report.selectedCandidatePairId);
                 if (!pair) continue;
+                if (((pair.bytesSent || 0) + (pair.bytesReceived || 0)) === 0) continue;
                 const local = stats.get(pair.localCandidateId);
                 const remote = stats.get(pair.remoteCandidateId);
                 if (local?.candidateType === 'relay' || remote?.candidateType === 'relay') {
@@ -1347,6 +1392,47 @@ class BitBangConnection {
             }
         } catch (e) {}
         return false;
+    }
+
+    // Keep _usingRelay honest for the life of the connection.
+    //
+    // The verdict used to be sampled once, at the first 'connected' event,
+    // which is the earliest and least representative moment: the relay pair
+    // typically succeeds first and the device (the controlling agent) then
+    // nominates a direct pair, by design. A session that spent two seconds on
+    // a relay and the next ten minutes direct was still shown the relay
+    // banner, and was still killed by the relay's expiry timer.
+    _monitorRelayPath(pc) {
+        this._clearRelayMonitor();
+        const tick = async () => {
+            if (!this.pc || this.pc !== pc || pc.connectionState !== 'connected') return;
+            const now = await this._isUsingRelay(pc);
+            if (now !== this._usingRelay) {
+                this._usingRelay = now;
+                if (this.debug) {
+                    console.log(`[Bootstrap] path changed: now ${now ? 'relayed' : 'direct'}`);
+                }
+                if (now) {
+                    if (this._turnExpiryMs && !this._turnEnded) this._armTurnEndTimers();
+                } else {
+                    // Off the relay: nothing here expires any more.
+                    this._clearTurnEndTimers();
+                    if (this._turnPrevTitle) {
+                        document.title = this._turnPrevTitle;
+                        this._turnPrevTitle = null;
+                    }
+                }
+            }
+            this._relayMonitorTimer = setTimeout(tick, 2000);
+        };
+        tick();
+    }
+
+    _clearRelayMonitor() {
+        if (this._relayMonitorTimer) {
+            clearTimeout(this._relayMonitorTimer);
+            this._relayMonitorTimer = null;
+        }
     }
 
     // Classify the established path for telemetry. Returns "direct",
@@ -1367,6 +1453,9 @@ class BitBangConnection {
                 if (report.type !== 'transport' || !report.selectedCandidatePairId) continue;
                 const pair = stats.get(report.selectedCandidatePairId);
                 if (!pair) continue;
+                // An idle or superseded transport should not classify the
+                // session; same rule as _isUsingRelay.
+                if (((pair.bytesSent || 0) + (pair.bytesReceived || 0)) === 0) continue;
                 const local = stats.get(pair.localCandidateId);
                 const remote = stats.get(pair.remoteCandidateId);
                 const relayCand =
@@ -1389,6 +1478,23 @@ class BitBangConnection {
             // as direct and move on.
         }
         return path;
+    }
+
+    // One report per ICE establishment, whichever trigger fires first.
+    _reportConnectionPath(pc) {
+        this._clearPathSettleTimer();
+        if (this._pathReported || !this.pc || this.pc !== pc) return;
+        this._pathReported = true;
+        this._detectConnectionPath(pc)
+            .then((path) => this._sendConnectionPath(path))
+            .catch(() => {});
+    }
+
+    _clearPathSettleTimer() {
+        if (this._pathSettleTimer) {
+            clearTimeout(this._pathSettleTimer);
+            this._pathSettleTimer = null;
+        }
     }
 
     // Fire-and-forget telemetry. Sends one connection_path message to
@@ -1457,21 +1563,30 @@ class BitBangConnection {
         const endAt = this._turnExpiryMs - now;
         if (warnAt > 0) {
             this._turnWarnTimer = setTimeout(() => {
-                if (!this._turnEnded) {
-                    document.title = '⚠ Relay ending soon — bitba.ng';
-                }
+                if (this._turnEnded || !this._usingRelay) return;
+                if (!this._turnPrevTitle) this._turnPrevTitle = document.title;
+                document.title = '⚠ Relay ending soon — bitba.ng';
             }, warnAt);
         }
-        if (endAt > 0) {
-            this._turnEndTimer = setTimeout(() => {
-                if (this._turnEnded) return;
-                this._turnEnded = true;
-                this.showReloadScreen(this._endedMessage());
-            }, endAt);
-        } else {
-            // Already past expiry by the time we got here — fire immediately.
+        // Re-check the live path before tearing the page down. The monitor
+        // should have caught a migration to direct already, but this timer is
+        // what actually ends the session, so it verifies rather than trusting
+        // a verdict that may be minutes old.
+        const endNow = async () => {
+            if (this._turnEnded) return;
+            if (!(await this._isUsingRelay(this.pc))) {
+                this._usingRelay = false;
+                this._clearTurnEndTimers();
+                return;
+            }
             this._turnEnded = true;
             this.showReloadScreen(this._endedMessage());
+        };
+        if (endAt > 0) {
+            this._turnEndTimer = setTimeout(endNow, endAt);
+        } else {
+            // Already past expiry by the time we got here — check and fire.
+            endNow();
         }
     }
 
@@ -1622,6 +1737,7 @@ class BitBangConnection {
         this.candidateQueue = new CandidateQueue();
         this._wasConnected = false;
         this._usingRelay = false;
+        this._clearRelayMonitor();
         this._turnHoldPromise = null;
         this._turnExpiryMs = null;
     }
