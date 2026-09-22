@@ -23,6 +23,34 @@
    Worth being explicit that this is a decode-order problem, not a transport
    one. The channel is unordered, and the reassembly above this already turns
    that back into an ordered sequence. */
+/* Painted frames per second, reported about once a second.
+ *
+ * Counted here rather than taken from the device because this is the number
+ * that describes what someone is looking at. The device's own rate is what it
+ * handed to the transport; the two part company exactly when chunks are being
+ * abandoned, which is when the figure is worth reading.
+ *
+ * Reported rather than displayed: where it goes, and whether it is wanted at
+ * all, is the page's business. Same division as bitbang-stream-start. */
+function reporter(el) {
+    let frames = 0;
+    let since = performance.now();
+    return () => {
+        frames++;
+        const now = performance.now();
+        const span = now - since;
+        if (span < 1000) {
+            return;
+        }
+        el.dispatchEvent(new CustomEvent('bitbang-stream-stats', {
+            bubbles: true,
+            detail: { fps: frames * 1000 / span },
+        }));
+        frames = 0;
+        since = now;
+    };
+}
+
 function drawer(el) {
     let issued = 0;
     let drawn = 0;
@@ -55,10 +83,15 @@ window.BitBang.streams.register({
     create(el, info) {
         const tag = el.tagName.toLowerCase();
         const draw = drawer(el);
+        const count = reporter(el);
 
         if (tag === 'canvas') {
             const ctx = el.getContext('2d');
 
+            /* Counted here because this is the one place a canvas frame
+               reaches the screen: drawing on arrival and drawing against the
+               clock both end up in paint, and tick() does its own decode
+               rather than going through drawer. */
             const paint = (b) => {
                 /* Follow the sender: a resolution change arrives as a
                    differently sized frame and nothing else. Setting width or
@@ -69,6 +102,7 @@ window.BitBang.streams.register({
                 }
                 ctx.drawImage(b, 0, 0);
                 b.close();
+                count();
             };
 
             /* Frames waiting for their moment, oldest first.
@@ -177,6 +211,7 @@ window.BitBang.streams.register({
                 el.onload = () => {
                     if (prev) URL.revokeObjectURL(prev);
                     prev = url;
+                    count();
                     if (!started) {
                         started = true;
                         el.dispatchEvent(new CustomEvent('bitbang-stream-start',
