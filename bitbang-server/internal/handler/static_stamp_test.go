@@ -19,6 +19,8 @@ func stampDir(t *testing.T) string {
 		"bootstrap.html":  "<html><!-- FRONT_PAGE --></html>",
 		"bootstrap.js":    "const BUILD = '" + buildPlaceholder + "';\n",
 		"sw.js":           "const BUILD = '" + buildPlaceholder + "';\n",
+		"sw-upload.js":    "// sw upload\n",
+		"flow-control.js": "// flow control\n",
 		"ws-shim.js":      "// ws shim\n",
 		"xhr-shim.js":     "// xhr shim\n",
 		"stream-shim.js":  "// stream shim\n",

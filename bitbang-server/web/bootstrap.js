@@ -162,6 +162,8 @@ const PATH_SETTLE_MS = 5000;
 // arrived is missing a chunk that is never coming.
 const VIDEO_FRAME_SLOTS = 3;
 const SWSP_CHUNK_SIZE = 16384;  // max payload bytes per data-channel frame
+const SWSP_VERSION = SWSPFlowControl.VERSION;
+const SWSP_BUFFER_LIMIT = 1024 * 1024;
 
 // Soft reconnect: when an established peer connection drops (e.g. a transient
 // network blip on a long-lived session), rebuild the transport under the live
@@ -353,6 +355,10 @@ class BitBangConnection {
         this.nextStreamId = 1;        // streamId 0 is reserved for control
         this.wsStreams = new Map();    // streamId -> { iframe } for WebSocket bridging
         this.benchStreams = new Map(); // streamId -> stats, for the transport benchmark
+        this.negotiatedVersion = 2;
+        this._protocolReady = false;
+        this.sendChains = new Map();
+        this.flow = new SWSPFlowControl.Controller((msg) => this._sendControl(msg));
         this.sessionId = Array.from(crypto.getRandomValues(new Uint8Array(4)), b => b.toString(16).padStart(2, '0')).join(''); // 8 hex chars
         console.log('[Bootstrap] ctor', this.sessionId);
         this.candidateQueue = new CandidateQueue();
@@ -405,32 +411,197 @@ class BitBangConnection {
 
     // SWSP frame helpers
     createFrame(streamId, flags, payload) {
-        // payload can be string or Uint8Array
-        let payloadBytes;
-        if (typeof payload === 'string') {
-            payloadBytes = new TextEncoder().encode(payload);
-        } else if (payload instanceof ArrayBuffer) {
-            payloadBytes = new Uint8Array(payload);
-        } else {
-            payloadBytes = payload;
-        }
-
-        const buffer = new ArrayBuffer(8 + payloadBytes.byteLength);
-        const view = new DataView(buffer);
-        view.setUint32(0, streamId, true);  // little-endian
-        view.setUint16(4, flags, true);
-        view.setUint16(6, payloadBytes.byteLength, true);
-        new Uint8Array(buffer).set(payloadBytes, 8);
-        return buffer;
+        return SWSPFlowControl.createFrame(streamId, flags, payload);
     }
 
     parseFrame(buffer) {
-        const view = new DataView(buffer);
-        const streamId = view.getUint32(0, true);
-        const flags = view.getUint16(4, true);
-        const length = view.getUint16(6, true);
-        const payload = buffer.slice(8, 8 + length);
-        return { streamId, flags, payload };
+        return SWSPFlowControl.parseFrame(buffer);
+    }
+
+    _sendControl(msg) {
+        if (!this.dataChannel || this.dataChannel.readyState !== 'open') return false;
+        try {
+            this.dataChannel.send(this.createFrame(0, FLAG_SYN, JSON.stringify(msg)));
+            return true;
+        } catch (e) {
+            return false;
+        }
+    }
+
+    _validStreamId(streamId) {
+        return Number.isSafeInteger(streamId) && streamId > 0 && streamId <= 0xffffffff;
+    }
+
+    _allocateStreamId() {
+        const streamId = this.nextStreamId++;
+        if (!this._validStreamId(streamId)) throw new Error('SWSP stream IDs exhausted');
+        return streamId;
+    }
+
+    _openStream(streamId) {
+        if (!this._validStreamId(streamId)) throw new Error('invalid SWSP stream ID');
+        this.flow.open(streamId);
+    }
+
+    _sendStreamSYN(streamId, flags, payload) {
+        this._openStream(streamId);
+        try {
+            this.dataChannel.send(this.createFrame(streamId, flags, payload));
+        } catch (e) {
+            this.flow.resetStream(streamId, e);
+            throw e;
+        }
+    }
+
+    _applicationBytes(frame) {
+        if (frame.streamId === 0 || (frame.flags & FLAG_SYN)) return 0;
+        return frame.payload?.byteLength || 0;
+    }
+
+    _acceptFrame(frame) {
+        if (frame.flags & FLAG_SYN) {
+            if (!this.flow.has(frame.streamId)) {
+                this._resetStream(frame.streamId, 'protocol_error', 'unexpected inbound stream', true);
+                return false;
+            }
+            if ((frame.flags & FLAG_FIN) && !this.flow.finishReceive(frame.streamId)) {
+                this._resetStream(frame.streamId, 'protocol_error', 'frame received after FIN', true);
+                return false;
+            }
+            return true;
+        }
+        const bytes = this._applicationBytes(frame);
+        if (this.flow.receive(frame.streamId, bytes, !!(frame.flags & FLAG_FIN))) return true;
+        this._resetStream(frame.streamId, 'flow_control', 'receive window exceeded', true);
+        return false;
+    }
+
+    _consumeFrame(streamId, byteLength, frames) {
+        if (!this.flow.has(streamId)) return false;
+        if (this.flow.consume(streamId, byteLength, frames)) return true;
+        this._resetStream(streamId, 'protocol_error', 'invalid receive acknowledgement', true);
+        return false;
+    }
+
+    _registerWSAck(ws, byteLength, frames, onAck) {
+        if (!ws._receiveAcks) ws._receiveAcks = new Map();
+        let token;
+        do {
+            const words = crypto.getRandomValues(new Uint32Array(4));
+            token = Array.from(words, word => word.toString(16).padStart(8, '0')).join('');
+        } while (ws._receiveAcks.has(token));
+        ws._receiveAcks.set(token, { byteLength, frames, onAck });
+        return token;
+    }
+
+    _handleWSAck(streamId, token) {
+        const ws = this.wsStreams.get(streamId);
+        const ack = ws?._receiveAcks?.get(token);
+        if (!ws || !ack) {
+            if (ws) this._resetStream(streamId, 'protocol_error', 'invalid WebSocket acknowledgement', true);
+            return;
+        }
+        ws._receiveAcks.delete(token);
+        if (ack.frames > 0 && !this._consumeFrame(streamId, ack.byteLength, ack.frames)) return;
+        if (ack.onAck) ack.onAck();
+    }
+
+    _finishRequest(streamId) {
+        const req = this.pendingRequests.get(streamId);
+        if (!req || !req.localFinished || !req.responseClosed) return;
+        clearTimeout(req.timeout);
+        if (req.cleanupTimeout) clearTimeout(req.cleanupTimeout);
+        this.pendingRequests.delete(streamId);
+        this.flow.resetStream(streamId, new Error('stream complete'));
+    }
+
+    // Once both sides have finished, the service worker owes a responseClosed.
+    // If it never comes (a response body nobody reads to the end), drop the
+    // stream after a grace period rather than holding it for the session.
+    _armRequestReaper(streamId) {
+        const req = this.pendingRequests.get(streamId);
+        if (!req || req.cleanupTimeout) return;
+        req.cleanupTimeout = setTimeout(() => {
+            if (this.pendingRequests.get(streamId) !== req) return;
+            this.pendingRequests.delete(streamId);
+            this.flow.resetStream(streamId, new Error('stream complete'));
+        }, 30000);
+    }
+
+    async _waitForDataChannel(streamId) {
+        while (this.dataChannel?.readyState === 'open'
+            && this.dataChannel.bufferedAmount > SWSP_BUFFER_LIMIT) {
+            if (!this.flow.has(streamId)) throw new Error('stream closed');
+            await new Promise(resolve => setTimeout(resolve, 10));
+        }
+        if (!this.dataChannel || this.dataChannel.readyState !== 'open') {
+            throw new Error('data channel closed');
+        }
+    }
+
+    _queueStreamFrame(streamId, flags, payload) {
+        const byteLength = (flags & FLAG_SYN) ? 0 : (payload?.byteLength || 0);
+        let wireFrame;
+        try {
+            wireFrame = this.createFrame(streamId, flags, payload);
+        } catch (e) {
+            return Promise.reject(e);
+        }
+        const previous = this.sendChains.get(streamId) || Promise.resolve();
+        const send = previous.catch(() => {}).then(async () => {
+            await this.flow.waitToSend(streamId, byteLength);
+            await this._waitForDataChannel(streamId);
+            if (!this.flow.has(streamId)) throw new Error('stream closed');
+            this.dataChannel.send(wireFrame);
+        });
+        this.sendChains.set(streamId, send);
+        const cleanup = () => {
+            if (this.sendChains.get(streamId) === send) this.sendChains.delete(streamId);
+        };
+        send.then(cleanup, cleanup);
+        return send;
+    }
+
+    _resetStream(streamId, code, message, notifyPeer) {
+        const error = new SWSPFlowControl.FlowError(code, message);
+        this.flow.resetStream(streamId, error);
+        this.sendChains.delete(streamId);
+
+        const req = this.pendingRequests.get(streamId);
+        if (req) {
+            clearTimeout(req.timeout);
+            if (req.cleanupTimeout) clearTimeout(req.cleanupTimeout);
+            this.pendingRequests.delete(streamId);
+            try { req.responsePort.postMessage({ type: 'error', message }); } catch (e) {}
+        }
+
+        const ws = this.wsStreams.get(streamId);
+        if (ws) {
+            ws._rxParts = null;
+            ws._pendingFrames = [];
+            ws._receiveAcks?.clear();
+            if (ws._closeTimeout) clearTimeout(ws._closeTimeout);
+            this.wsStreams.delete(streamId);
+            try {
+                ws.iframe.postMessage({ type: 'ws-error', streamId, message }, '*');
+                ws.iframe.postMessage({
+                    type: 'ws-closed', streamId, code: 1006, reason: message,
+                }, '*');
+            } catch (e) {}
+        }
+
+        if (notifyPeer && this.negotiatedVersion >= SWSP_VERSION) {
+            this._sendControl({
+                type: 'stream_reset', stream_id: streamId, code, message,
+            });
+        }
+
+        if (notifyPeer && this.negotiatedVersion < SWSP_VERSION
+            && this.dataChannel?.readyState === 'open') {
+            try {
+                this.dataChannel.send(this.createFrame(streamId, FLAG_FIN, new Uint8Array(0)));
+            } catch (e) {}
+        }
     }
 
     // A channel carrying frames rather than SWSP. Each message is one chunk of
@@ -683,7 +854,7 @@ class BitBangConnection {
             console.error('[bench] the video channel is not open');
             return;
         }
-        const streamId = this.nextStreamId++;
+        const streamId = this._allocateStreamId();
         // Started and finished over SWSP, counted on the video channel.
         this.benchVideo = {
             bySize: new Map(),   // payload length -> bucket
@@ -693,7 +864,14 @@ class BitBangConnection {
             seen: 0,
         };
         this.benchStreams.set(streamId, this.benchVideo);
-        this.dataChannel.send(this.createFrame(streamId, FLAG_SYN, JSON.stringify({ bench: true })));
+        try {
+            this._sendStreamSYN(streamId, FLAG_SYN, JSON.stringify({ bench: true }));
+        } catch (e) {
+            this.benchStreams.delete(streamId);
+            this.benchVideo = null;
+            console.error('[bench] could not start:', e.message || e);
+            return;
+        }
         console.log(`[bench] run started on stream ${streamId}`);
         this.pollIceDuringBench(streamId);
     }
@@ -747,6 +925,11 @@ class BitBangConnection {
     }
 
     handleBenchFrame(frame, st) {
+        // An ordinary SWSP stream, so each frame holds receive credit until
+        // it is counted -- which is right now.
+        if (!(frame.flags & FLAG_SYN)) {
+            this._consumeFrame(frame.streamId, frame.payload?.byteLength || 0);
+        }
         if (frame.flags & FLAG_FIN) {
             this.benchVideo = null;
             // The device names its own configuration in the closing frame, so
@@ -757,6 +940,7 @@ class BitBangConnection {
             }
             this.reportBench(frame.streamId, st, mode);
             this.benchStreams.delete(frame.streamId);
+            this.flow.resetStream(frame.streamId, new Error('bench complete'));
             return;
         }
 
@@ -956,9 +1140,10 @@ class BitBangConnection {
         const { method, url, headers, hasBody, contentLength } = data;
         if (this.debug) console.log(`[Bootstrap] Received proxy request: ${method} ${new URL(url).pathname}, DC state: ${this.dataChannel?.readyState}`);
 
-        if (!this.dataChannel || this.dataChannel.readyState !== 'open') {
+        if (!this.dataChannel || this.dataChannel.readyState !== 'open'
+            || !this.deviceVerified || !this._protocolReady) {
             console.warn('[Bootstrap] Data channel not open, rejecting request');
-            responsePort.postMessage({ type: 'error', message: 'Data channel not open' });
+            responsePort.postMessage({ type: 'error', message: 'Connection not ready' });
             // A live page with a dead channel should be recovering, not
             // rejecting forever — kick the reconnect if nothing else did.
             // (No-op while a reconnect is in flight or after a terminal end.)
@@ -975,30 +1160,44 @@ class BitBangConnection {
         const fullPath = pathname + parsed.search;
 
         // Use incrementing stream ID for SWSP
-        const streamId = this.nextStreamId++;
+        const streamId = this._allocateStreamId();
 
         // Initial 30s timeout to catch "device not responding". Cleared once
         // response headers arrive (SYN). After that we rely on FIN / data
         // channel close to signal end -- inactivity is normal during streaming
         // when the consumer (e.g. video player) backpressures the channel.
+        //
+        // A request with a body gets no timer of its own. Its body moves at
+        // whatever rate the peer grants credit, as the CLI's own sender does,
+        // and the response cannot come before the peer has drained what is
+        // still queued at FIN. A peer that is gone is reported by
+        // _queueStreamFrame rejecting, or by _teardownTransport resetting the
+        // stream when the reconnect loop tears down the old transport. The one
+        // exception is a body with nothing in it (a POST or DELETE without a
+        // payload): the device has the whole request once the FIN is out, so
+        // bodyEnd times it like a GET.
         let timeout;
         const resetTimeout = () => {
             clearTimeout(timeout);
             timeout = setTimeout(() => {
-                this.pendingRequests.delete(streamId);
-                responsePort.postMessage({ type: 'error', message: 'Request timeout' });
+                this._resetStream(streamId, 'timeout', 'Request timeout', true);
             }, 30000);
+            const req = this.pendingRequests.get(streamId);
+            if (req) req.timeout = timeout;
         };
-        resetTimeout();
+        if (!hasBody) resetTimeout();
 
         this.pendingRequests.set(streamId, {
             responsePort,
             timeout,
-            resetTimeout,
             bytesReceived: 0,
             startTime: Date.now(),
             nextLogMB: 50,
-            isUpload: hasBody
+            isUpload: hasBody,
+            localFinished: !hasBody,
+            remoteFinished: false,
+            responseClosed: false,
+            headersReceived: false,
         });
 
         // Build request metadata with all headers. SWSP v3 makes the
@@ -1015,11 +1214,10 @@ class BitBangConnection {
 
         if (hasBody) {
             // Send SYN frame with metadata, then stream body chunks as they arrive
-            const synFrame = this.createFrame(streamId, FLAG_SYN, JSON.stringify(requestMeta));
             try {
-                this.dataChannel.send(synFrame);
+                this._sendStreamSYN(streamId, FLAG_SYN, JSON.stringify(requestMeta));
             } catch (e) {
-                responsePort.postMessage({ type: 'error', message: 'Failed to start upload' });
+                this._resetStream(streamId, 'send_error', 'Failed to start upload', false);
                 this.progressChannel.postMessage({ type: 'uploadFailed' });
                 return;
             }
@@ -1030,14 +1228,30 @@ class BitBangConnection {
             let processingChain = Promise.resolve();
 
             const failUpload = (msg) => {
-                this.pendingRequests.delete(streamId);
-                responsePort.postMessage({ type: 'error', message: msg });
+                if (this.pendingRequests.has(streamId)) {
+                    this._resetStream(streamId, 'upload_error', msg, isOpen());
+                }
                 this.progressChannel.postMessage({ type: 'uploadFailed' });
             };
 
             const isOpen = () => this.dataChannel?.readyState === 'open';
 
             responsePort.onmessage = (event) => {
+                if (event.data.type === 'responseConsumed') {
+                    this._consumeFrame(streamId, event.data.bytes || 0, event.data.frames || 1);
+                    return;
+                }
+                if (event.data.type === 'responseClosed') {
+                    const req = this.pendingRequests.get(streamId);
+                    if (req?.cleanupTimeout) clearTimeout(req.cleanupTimeout);
+                    if (req) req.responseClosed = true;
+                    this._finishRequest(streamId);
+                    return;
+                }
+                if (event.data.type === 'cancel') {
+                    this._resetStream(streamId, 'cancelled', event.data.message || 'request cancelled', true);
+                    return;
+                }
                 processingChain = processingChain.then(async () => {
                     if (!isOpen()) return failUpload('Connection lost');
 
@@ -1045,21 +1259,23 @@ class BitBangConnection {
                         const data = event.data.data;
 
                         for (let i = 0; i < data.byteLength; i += MAX_CHUNK) {
-                            // Backpressure: wait while buffer is full
-                            while (isOpen() && this.dataChannel.bufferedAmount > 1024 * 1024) {
-                                await new Promise(r => setTimeout(r, 10));
-                            }
-                            if (!isOpen()) return failUpload('Connection lost');
-
                             const chunk = data.subarray(i, Math.min(i + MAX_CHUNK, data.byteLength));
-                            this.dataChannel.send(this.createFrame(streamId, FLAG_DAT, chunk));
+                            try {
+                                await this._queueStreamFrame(streamId, FLAG_DAT, chunk);
+                            } catch (e) {
+                                return failUpload(e.message || 'Connection lost');
+                            }
                         }
+
+                        // The service worker does not read the next request-body
+                        // chunk until this one has passed both stream credit and
+                        // the data-channel aggregate buffer.
+                        responsePort.postMessage({ type: 'bodyAck', seq: event.data.seq });
 
                         bytesSent += data.byteLength;
                         const now = Date.now();
                         if (now - lastProgress > 100) {
                             lastProgress = now;
-                            resetTimeout();
                             this.progressChannel.postMessage({
                                 type: 'uploadProgress', loaded: bytesSent, total: contentLength
                             });
@@ -1068,14 +1284,48 @@ class BitBangConnection {
                     } else if (event.data.type === 'bodyEnd') {
                         if (!isOpen()) return failUpload('Connection lost');
                         this.progressChannel.postMessage({ type: 'uploadComplete' });
-                        this.dataChannel.send(this.createFrame(streamId, FLAG_FIN, new Uint8Array(0)));
+                        try {
+                            await this._queueStreamFrame(streamId, FLAG_FIN, new Uint8Array(0));
+                            const req = this.pendingRequests.get(streamId);
+                            if (req) {
+                                req.localFinished = true;
+                                this._finishRequest(streamId);
+                                if (!this.pendingRequests.has(streamId)) return;
+                                if (req.remoteFinished) {
+                                    this._armRequestReaper(streamId);
+                                } else if (bytesSent === 0 && !req.headersReceived) {
+                                    // Nothing was queued ahead of the FIN, so the
+                                    // device has the whole request now: time it
+                                    // like a bodiless GET.
+                                    resetTimeout();
+                                }
+                            }
+                        } catch (e) {
+                            return failUpload(e.message || 'Connection lost');
+                        }
                     }
                 });
             };
         } else {
             // No body - send SYN|FIN together
-            const frame = this.createFrame(streamId, FLAG_SYN | FLAG_FIN, JSON.stringify(requestMeta));
-            this.dataChannel.send(frame);
+            try {
+                this._sendStreamSYN(streamId, FLAG_SYN | FLAG_FIN, JSON.stringify(requestMeta));
+            } catch (e) {
+                this._resetStream(streamId, 'send_error', 'Failed to start request', false);
+                return;
+            }
+            responsePort.onmessage = (event) => {
+                if (event.data.type === 'responseConsumed') {
+                    this._consumeFrame(streamId, event.data.bytes || 0, event.data.frames || 1);
+                } else if (event.data.type === 'responseClosed') {
+                    const req = this.pendingRequests.get(streamId);
+                    if (req?.cleanupTimeout) clearTimeout(req.cleanupTimeout);
+                    if (req) req.responseClosed = true;
+                    this._finishRequest(streamId);
+                } else if (event.data.type === 'cancel') {
+                    this._resetStream(streamId, 'cancelled', event.data.message || 'request cancelled', true);
+                }
+            };
         }
     }
 
@@ -1879,6 +2129,16 @@ class BitBangConnection {
         this.remoteDescriptionSet = false;
         this.deviceVerified = false;
         this.connectResolve = null;
+        for (const streamId of Array.from(this.pendingRequests.keys())) {
+            this._resetStream(streamId, 'session_closed', 'connection lost', false);
+        }
+        for (const streamId of Array.from(this.wsStreams.keys())) {
+            this._resetStream(streamId, 'session_closed', 'connection lost', false);
+        }
+        this.flow.reset(false);
+        this.sendChains.clear();
+        this.negotiatedVersion = 2;
+        this._protocolReady = false;
         this.candidateQueue = new CandidateQueue();
         this._wasConnected = false;
         this._usingRelay = false;
@@ -1923,9 +2183,22 @@ class BitBangConnection {
 
             // StreamId 0 is reserved for control messages (connect/ready/auth)
             if (frame.streamId === 0) {
-                this.handleControlMessage(frame);
+                this.handleControlMessage(frame).catch((error) => {
+                    const text = new TextDecoder().decode(frame.payload);
+                    const type = /"type"\s*:\s*"(window_update|stream_reset)"/.exec(text)?.[1];
+                    const rawId = /"stream_id"\s*:\s*(\d+)/.exec(text)?.[1];
+                    const streamId = rawId === undefined ? NaN : Number(rawId);
+                    if (type && this._validStreamId(streamId) && this.flow.has(streamId)) {
+                        this._resetStream(
+                            streamId, 'protocol_error', 'malformed stream control', true);
+                    } else {
+                        console.error('Error parsing SWSP control frame:', error);
+                    }
+                });
                 return;
             }
+
+            if (!this._acceptFrame(frame)) return;
 
             // WebSocket stream -- forward to iframe
             const ws = this.wsStreams.get(frame.streamId);
@@ -1949,9 +2222,26 @@ class BitBangConnection {
             }
 
             if (frame.flags & FLAG_SYN) {
+                if (req.headersReceived) {
+                    this._resetStream(frame.streamId, 'protocol_error', 'duplicate response SYN', true);
+                    return;
+                }
+                req.headersReceived = true;
                 // Metadata frame - send headers to SW, it will create the stream
                 const text = new TextDecoder().decode(frame.payload);
-                const metadata = JSON.parse(text);
+                let metadata;
+                try {
+                    metadata = JSON.parse(text);
+                } catch (e) {
+                    this._resetStream(
+                        frame.streamId, 'protocol_error', 'invalid HTTP response metadata', true);
+                    return;
+                }
+                if (!metadata || typeof metadata !== 'object' || Array.isArray(metadata)) {
+                    this._resetStream(
+                        frame.streamId, 'protocol_error', 'invalid HTTP response metadata', true);
+                    return;
+                }
                 const status = metadata.status || 200;
                 if (this.debug) console.log(`[Bootstrap] Response for stream ${frame.streamId}: ${status}`);
 
@@ -1980,7 +2270,11 @@ class BitBangConnection {
                 if (frame.payload.byteLength > 0 && !(frame.flags & FLAG_SYN)) {
                     req.bytesReceived += frame.payload.byteLength;
                     const data = new Uint8Array(frame.payload);
-                    req.responsePort.postMessage({ type: 'chunk', data }, [data.buffer]);
+                    req.responsePort.postMessage({
+                        type: 'chunk', data, wireBytes: frame.payload.byteLength,
+                    }, [data.buffer]);
+                } else if (!(frame.flags & FLAG_SYN)) {
+                    this._consumeFrame(frame.streamId, 0);
                 }
 
                 // Log completion for large transfers
@@ -1992,12 +2286,19 @@ class BitBangConnection {
                 }
 
                 req.responsePort.postMessage({ type: 'done' });
-                this.pendingRequests.delete(frame.streamId);
+                req.remoteFinished = true;
+                // A device may answer before it has read the whole body (a
+                // 401, a 413, a redirect). The listener keeps draining and
+                // granting credit, so the body finishes on its own and
+                // bodyEnd arms the reaper then.
+                if (req.localFinished) this._armRequestReaper(frame.streamId);
             } else if (!(frame.flags & FLAG_SYN) && frame.payload.byteLength > 0) {
                 // Data chunk - use transferable to avoid copy
                 req.bytesReceived += frame.payload.byteLength;
                 const data = new Uint8Array(frame.payload);
-                req.responsePort.postMessage({ type: 'chunk', data }, [data.buffer]);
+                req.responsePort.postMessage({
+                    type: 'chunk', data, wireBytes: frame.payload.byteLength,
+                }, [data.buffer]);
 
                 // Log progress at each 50MB milestone
                 const currentMB = req.bytesReceived / (1024 * 1024);
@@ -2007,6 +2308,10 @@ class BitBangConnection {
                     console.log(`Download: ${currentMB.toFixed(0)} MB (${speed} MB/s)`);
                     req.nextLogMB += 50;
                 }
+            } else if (!(frame.flags & FLAG_SYN)) {
+                // Empty DAT still occupies a receive-frame slot. It carries no
+                // application data, so consume it immediately.
+                this._consumeFrame(frame.streamId, 0);
             }
         } catch (e) {
             console.error('Error parsing SWSP frame:', e);
@@ -2056,7 +2361,21 @@ class BitBangConnection {
             // `server_version` tells us which SWSP version the listener
             // is speaking. v2 listeners send just {type:'ready'} —
             // serverVersion defaults to 2.
-            this.serverVersion = msg.server_version || 2;
+            if (!this._protocolReady) {
+                let versions;
+                try {
+                    versions = SWSPFlowControl.negotiateVersion(
+                        msg.server_version, msg.negotiated_version);
+                } catch (e) {
+                    this.showErrorScreen('Connection rejected: invalid protocol negotiation.');
+                    try { this.dataChannel.close(); } catch (e) {}
+                    return;
+                }
+                this.serverVersion = versions.serverVersion;
+                this.negotiatedVersion = versions.negotiatedVersion;
+                this.flow.reset(this.negotiatedVersion >= SWSP_VERSION);
+                this._protocolReady = true;
+            }
             // routing tells us how to interpret the first segment of the
             // URL fragment's device path. "target-prefix" (bitbangproxy)
             // means the first segment is a LAN target that isolates
@@ -2099,10 +2418,8 @@ class BitBangConnection {
                     if (this._lastPIN) {
                         sessionStorage.setItem('__bb_pin_' + this.uid, this._lastPIN);
                     }
-                    if (this.connectResolve) {
-                        this.connectResolve();
-                        this.connectResolve = null;
-                    }
+                    // The following ready frame completes version
+                    // negotiation and resolves the connect wait.
                 } else {
                     sessionStorage.removeItem('__bb_pin_' + this.uid);
                     this._authRetry = false;
@@ -2116,6 +2433,21 @@ class BitBangConnection {
                 const delay = msg.success ? 2000 : 3000;
                 setTimeout(handleResult, delay);
             }
+        } else if (msg.type === 'window_update') {
+            if (this.negotiatedVersion < SWSP_VERSION) return;
+            if (!this._validStreamId(msg.stream_id)) return;
+            if (this.flow.has(msg.stream_id)
+                && !this.flow.updateWindow(msg.stream_id, msg.max_bytes)) {
+                this._resetStream(msg.stream_id, 'protocol_error', 'invalid window update', true);
+            }
+        } else if (msg.type === 'stream_reset') {
+            if (this.negotiatedVersion < SWSP_VERSION || !this._validStreamId(msg.stream_id)) return;
+            this._resetStream(
+                msg.stream_id,
+                typeof msg.code === 'string' ? msg.code : 'stream_reset',
+                typeof msg.message === 'string' ? msg.message : 'stream reset',
+                false
+            );
         } else if (msg.type === 'video_offer') {
             // Secondary "video" PeerConnection: the device relays an external
             // media helper's offer over the (verified) data channel. We answer
@@ -2259,6 +2591,59 @@ class BitBangConnection {
         }
     }
 
+    _newWSState(iframe, kind) {
+        return {
+            iframe,
+            kind,
+            localClosing: false,
+            localFinished: false,
+            remoteFinished: false,
+            remoteStarted: false,
+            _deliveryPending: false,
+            _pendingFrames: [],
+            _receiveAcks: new Map(),
+        };
+    }
+
+    _finishWSStream(streamId, ws) {
+        if (!ws.localFinished || !ws.remoteFinished
+            || this.wsStreams.get(streamId) !== ws) return;
+        if (ws._closeTimeout) clearTimeout(ws._closeTimeout);
+        ws._receiveAcks.clear();
+        ws._pendingFrames.length = 0;
+        this.wsStreams.delete(streamId);
+        this.flow.resetStream(streamId, new Error('WebSocket closed'));
+    }
+
+    _closeWSOutbound(streamId, ws) {
+        if (ws.localClosing || ws.localFinished
+            || this.wsStreams.get(streamId) !== ws) return;
+        ws.localClosing = true;
+        this._queueStreamFrame(streamId, FLAG_FIN, new Uint8Array(0)).then(() => {
+            if (this.wsStreams.get(streamId) !== ws) return;
+            ws.localClosing = false;
+            ws.localFinished = true;
+            this._finishWSStream(streamId, ws);
+            if (!ws.remoteFinished) {
+                ws._closeTimeout = setTimeout(() => {
+                    this._resetStream(streamId, 'timeout', 'WebSocket close timeout', true);
+                }, 30000);
+            }
+        }).catch((e) => {
+            if (this.wsStreams.get(streamId) === ws) {
+                this._resetStream(streamId, 'send_error', e.message || 'WebSocket close failed', true);
+            }
+        });
+    }
+
+    _drainWSFrames(streamId, ws) {
+        while (!ws._deliveryPending && ws._pendingFrames.length > 0
+            && this.wsStreams.get(streamId) === ws) {
+            const frame = ws._pendingFrames.shift();
+            this.handleWSFrame(frame, ws);
+        }
+    }
+
     handleWSFrame(frame, ws) {
         // Generic /__bitbang/<type> streams use raw bytes for DAT and
         // pass the FIN payload through untouched. Per-cap framing
@@ -2270,12 +2655,31 @@ class BitBangConnection {
         }
 
         if (frame.flags & FLAG_SYN) {
+            if (ws.remoteStarted || ws._deliveryPending) {
+                this._resetStream(frame.streamId, 'protocol_error', 'duplicate WebSocket SYN', true);
+                return;
+            }
+            ws.remoteStarted = true;
             // Device acknowledged the WebSocket open
             if (this.debug) console.log(`[Bootstrap] ws SYN ack from device, streamId=${frame.streamId}`);
             ws.iframe.postMessage({ type: 'ws-opened', streamId: frame.streamId }, '*');
         }
 
+        // A native WebSocket message may be arbitrarily large, so its
+        // fragments are streamed into one Blob assembly. Once complete, hold
+        // subsequent frames inside the negotiated receive window until the
+        // iframe has synchronously dispatched that message. SYN is validated
+        // above because it is credit-exempt and must never enter this queue.
+        if (ws._deliveryPending) {
+            ws._pendingFrames.push(frame);
+            return;
+        }
+
         if (frame.flags & FLAG_FIN) {
+            if (ws._rxParts) {
+                this._resetStream(frame.streamId, 'protocol_error', 'WebSocket closed mid-message', true);
+                return;
+            }
             // Device closed the WebSocket. Parse the JSON close-info payload
             // (added in adapter.py) for the actual close code + reason from
             // the upstream WS. Fall back to 1006 if missing or malformed --
@@ -2290,55 +2694,73 @@ class BitBangConnection {
                     if (typeof info.reason === 'string') reason = info.reason;
                 } catch (e) {}
             }
+            if (!(frame.flags & FLAG_SYN)) {
+                this._consumeFrame(frame.streamId, frame.payload?.byteLength || 0);
+            }
             if (this.debug) console.log(`[Bootstrap] ws FIN from device, streamId=${frame.streamId} code=${code} reason=${JSON.stringify(reason)}`);
-            this.wsStreams.delete(frame.streamId);
-            ws.iframe.postMessage({
-                type: 'ws-closed',
-                streamId: frame.streamId,
-                code,
-                reason
-            }, '*');
+            const close = () => {
+                if (this.wsStreams.get(frame.streamId) !== ws) return;
+                ws.remoteFinished = true;
+                ws.iframe.postMessage({
+                    type: 'ws-closed', streamId: frame.streamId, code, reason,
+                }, '*');
+                this._closeWSOutbound(frame.streamId, ws);
+                this._finishWSStream(frame.streamId, ws);
+            };
+            if (ws._delivery) ws._delivery.then(close, close);
+            else close();
             return;
         }
 
-        if (frame.payload.byteLength > 0 && !(frame.flags & FLAG_SYN)) {
-            // DAT frame(s): a large WS message is split into <=SWSP_CHUNK_SIZE
-            // chunks, with FLAG_MORE on every non-final chunk. Buffer until the
-            // final chunk, then deliver the reassembled message -- preserving the
-            // WS message boundary. The type byte (0=text, 1=binary) rides in the
-            // first chunk.
+        if (!(frame.flags & FLAG_SYN)
+            && (frame.payload.byteLength > 0 || ws._rxParts)) {
+            // Keep fragments as Blob parts so large messages incur one final
+            // materialization rather than repeated whole-buffer copies. Credit
+            // is returned as each fragment enters this application-owned
+            // assembly; the WebSocket API itself still delivers one message.
             const part = new Uint8Array(frame.payload);
-            if (frame.flags & FLAG_MORE) {
-                (ws._rx || (ws._rx = [])).push(part);
-                return;
-            }
-            let full;
-            if (ws._rx) {
-                ws._rx.push(part);
-                const total = ws._rx.reduce((n, a) => n + a.byteLength, 0);
-                full = new Uint8Array(total);
-                let o = 0;
-                for (const a of ws._rx) { full.set(a, o); o += a.byteLength; }
-                ws._rx = null;
+            if (!ws._rxParts) {
+                if (part.byteLength < 1) {
+                    this._resetStream(frame.streamId, 'protocol_error', 'WebSocket message missing type', true);
+                    return;
+                }
+                if (part[0] !== 0 && part[0] !== 1) {
+                    this._resetStream(frame.streamId, 'protocol_error', 'invalid WebSocket message type', true);
+                    return;
+                }
+                ws._rxText = part[0] === 0;
+                ws._rxParts = [part.subarray(1)];
             } else {
-                full = part;
+                ws._rxParts.push(part);
             }
+            this._consumeFrame(frame.streamId, frame.payload.byteLength);
+            if (frame.flags & FLAG_MORE) return;
 
-            const isText = full[0] === 0;
-            const messageBytes = full.slice(1);
-
-            let data;
-            if (isText) {
-                data = new TextDecoder().decode(messageBytes);
-            } else {
-                data = messageBytes.buffer;
-            }
-
-            ws.iframe.postMessage({
-                type: 'ws-message',
-                streamId: frame.streamId,
-                data
-            }, '*');
+            const parts = ws._rxParts;
+            const isText = ws._rxText;
+            ws._rxParts = null;
+            ws._rxText = false;
+            ws._deliveryPending = true;
+            const delivery = (ws._delivery || Promise.resolve()).then(async () => {
+                const blob = new Blob(parts);
+                const data = isText ? await blob.text() : await blob.arrayBuffer();
+                if (this.wsStreams.get(frame.streamId) !== ws) return;
+                const ackToken = this._registerWSAck(ws, 0, 0, () => {
+                    if (this.wsStreams.get(frame.streamId) !== ws) return;
+                    ws._deliveryPending = false;
+                    this._drainWSFrames(frame.streamId, ws);
+                });
+                ws.iframe.postMessage({
+                    type: 'ws-message', streamId: frame.streamId, data, ackToken,
+                }, '*');
+            });
+            ws._delivery = delivery.catch((e) => {
+                this._resetStream(frame.streamId, 'receive_error', e.message || 'message delivery failed', true);
+            });
+            return;
+        }
+        if (!(frame.flags & (FLAG_SYN | FLAG_FIN))) {
+            this._resetStream(frame.streamId, 'protocol_error', 'WebSocket message missing type', true);
         }
     }
 
@@ -2350,6 +2772,11 @@ class BitBangConnection {
     // iframe's WebSocket shim.
     handleBitbangFrame(frame, ws) {
         if (frame.flags & FLAG_SYN) {
+            if (ws.remoteStarted) {
+                this._resetStream(frame.streamId, 'protocol_error', 'duplicate stream SYN', true);
+                return;
+            }
+            ws.remoteStarted = true;
             // A mid-stream SYN from the device is the listener's
             // chosen way to deliver an early-error payload (or any
             // other one-shot metadata). Deliver as a text WS message
@@ -2360,7 +2787,7 @@ class BitBangConnection {
             ws.iframe.postMessage({
                 type: 'ws-message', streamId: frame.streamId, data: text,
             }, '*');
-            return;
+            if (!(frame.flags & FLAG_FIN)) return;
         }
 
         if (frame.flags & FLAG_FIN) {
@@ -2373,21 +2800,31 @@ class BitBangConnection {
             if (frame.payload && frame.payload.byteLength > 0) {
                 reason = new TextDecoder().decode(frame.payload);
             }
-            this.wsStreams.delete(frame.streamId);
+            if (!(frame.flags & FLAG_SYN)) {
+                this._consumeFrame(frame.streamId, frame.payload?.byteLength || 0);
+            }
+            ws.remoteFinished = true;
             ws.iframe.postMessage({
                 type: 'ws-closed', streamId: frame.streamId, code: 1000, reason,
             }, '*');
+            this._closeWSOutbound(frame.streamId, ws);
+            this._finishWSStream(frame.streamId, ws);
             return;
         }
 
         // DAT — raw bytes through. Send as a binary ws-message; the
         // iframe is responsible for whatever tag-byte or framing
         // scheme its cap uses.
-        if (!frame.payload || frame.payload.byteLength === 0) return;
+        if (!frame.payload || frame.payload.byteLength === 0) {
+            this._consumeFrame(frame.streamId, 0);
+            return;
+        }
         const view = new Uint8Array(frame.payload);
         const ab = view.buffer.slice(view.byteOffset, view.byteOffset + view.byteLength);
+        const ackToken = this._registerWSAck(ws, frame.payload.byteLength, 1);
         ws.iframe.postMessage({
             type: 'ws-message', streamId: frame.streamId, data: ab,
+            ackToken,
         }, '*');
     }
 
@@ -2403,7 +2840,7 @@ class BitBangConnection {
         const connectMsg = JSON.stringify({
             type: 'connect',
             path: this.devicePath,
-            version: 3,
+            version: SWSP_VERSION,
         });
         this.dataChannel.send(this.createFrame(0, FLAG_SYN, connectMsg));
 
@@ -2572,7 +3009,7 @@ class BitBangConnection {
         const connectMsg = JSON.stringify({
             type: 'connect',
             path,
-            version: 3,
+            version: SWSP_VERSION,
         });
         this.dataChannel.send(this.createFrame(0, FLAG_SYN, connectMsg));
     }
@@ -2580,13 +3017,21 @@ class BitBangConnection {
     handleWSShimMessage(event) {
         const iframe = document.getElementById('device-frame');
         if (!iframe || event.source !== iframe.contentWindow) return;
-        if (!this.dataChannel || this.dataChannel.readyState !== 'open') return;
-
         const msg = event.data;
         if (!msg || !msg.type?.startsWith('ws-')) return;
+        if (!this.dataChannel || this.dataChannel.readyState !== 'open'
+            || !this.deviceVerified || !this._protocolReady) {
+            if (msg.type === 'ws-open') {
+                iframe.contentWindow.postMessage({
+                    type: 'ws-rejected', requestId: msg.requestId,
+                    message: 'Connection not ready',
+                }, '*');
+            }
+            return;
+        }
 
         if (msg.type === 'ws-open') {
-            const streamId = this.nextStreamId++;
+            const streamId = this._allocateStreamId();
             if (this.debug) console.log(`[Bootstrap] ws-open ${msg.pathname}, streamId=${streamId}, cookies.len=${(msg.cookies || '').length}`);
 
             // Magic path: /__bitbang/<type>?<params> opens a SWSP
@@ -2608,8 +3053,8 @@ class BitBangConnection {
                 const type = tail.split('/')[0];
                 if (!type) {
                     iframe.contentWindow.postMessage({
-                        type: 'ws-closed', streamId, code: 1008,
-                        reason: 'bitbang: empty type in magic path',
+                        type: 'ws-rejected', requestId: msg.requestId,
+                        message: 'bitbang: empty type in magic path',
                     }, '*');
                     return;
                 }
@@ -2625,11 +3070,17 @@ class BitBangConnection {
                     catch (e) { syn[k] = v; }
                 }
 
-                this.wsStreams.set(streamId, { iframe: iframe.contentWindow, kind: 'bitbang' });
+                this.wsStreams.set(streamId, this._newWSState(iframe.contentWindow, 'bitbang'));
                 iframe.contentWindow.postMessage({
-                    type: 'ws-assign', pathname: msg.pathname, streamId,
+                    type: 'ws-assign', requestId: msg.requestId,
+                    pathname: msg.pathname, streamId,
                 }, '*');
-                this.dataChannel.send(this.createFrame(streamId, FLAG_SYN, JSON.stringify(syn)));
+                try {
+                    this._sendStreamSYN(streamId, FLAG_SYN, JSON.stringify(syn));
+                } catch (e) {
+                    this._resetStream(streamId, 'send_error', 'Failed to open stream', false);
+                    return;
+                }
                 // Tell the iframe the WS is open now. Listener handlers
                 // typically don't send a SYN ack on the success path —
                 // the first DAT is the natural signal that things are
@@ -2639,9 +3090,10 @@ class BitBangConnection {
             }
 
             // Regular WebSocket proxy path (unchanged).
-            this.wsStreams.set(streamId, { iframe: iframe.contentWindow, kind: 'websocket' });
+            this.wsStreams.set(streamId, this._newWSState(iframe.contentWindow, 'websocket'));
             iframe.contentWindow.postMessage({
                 type: 'ws-assign',
+                requestId: msg.requestId,
                 pathname: msg.pathname,
                 streamId
             }, '*');
@@ -2650,59 +3102,59 @@ class BitBangConnection {
                 pathname: msg.pathname,
                 cookies: msg.cookies || '',
             });
-            this.dataChannel.send(this.createFrame(streamId, FLAG_SYN, synPayload));
+            try {
+                this._sendStreamSYN(streamId, FLAG_SYN, synPayload);
+            } catch (e) {
+                this._resetStream(streamId, 'send_error', 'Failed to open WebSocket', false);
+                return;
+            }
             if (this.debug) console.log(`[Bootstrap] ws SYN sent to device, streamId=${streamId}`);
 
         } else if (msg.type === 'ws-send') {
             const ws = this.wsStreams.get(msg.streamId);
-            if (!ws) return;
-
-            if (ws.kind === 'bitbang') {
-                // Generic shuttle: raw bytes go through unchanged. Text
-                // frames are UTF-8 encoded; the iframe is responsible
-                // for keeping the cap-specific framing it expects.
-                let payload;
+            if (!ws || ws.localClosing || ws.localFinished) return;
+            (async () => {
+                let raw;
                 if (msg.isText) {
-                    payload = new TextEncoder().encode(msg.data);
+                    raw = new TextEncoder().encode(msg.data);
+                } else if (msg.data instanceof Blob) {
+                    raw = new Uint8Array(await msg.data.arrayBuffer());
                 } else {
-                    payload = msg.data instanceof ArrayBuffer
-                        ? new Uint8Array(msg.data)
-                        : new Uint8Array(msg.data);
+                    raw = SWSPFlowControl.asBytes(msg.data);
                 }
-                this.dataChannel.send(this.createFrame(msg.streamId, FLAG_DAT, payload));
-                return;
-            }
 
-            // Regular WebSocket DAT framing: [1B type: 0=text 1=binary][message]
-            let payload;
-            if (msg.isText) {
-                const textBytes = new TextEncoder().encode(msg.data);
-                payload = new Uint8Array(1 + textBytes.length);
-                payload[0] = 0; // text
-                payload.set(textBytes, 1);
-            } else {
-                const binBytes = msg.data instanceof ArrayBuffer
-                    ? new Uint8Array(msg.data)
-                    : new Uint8Array(msg.data);
-                payload = new Uint8Array(1 + binBytes.length);
-                payload[0] = 1; // binary
-                payload.set(binBytes, 1);
-            }
-            // Chunk at SWSP_CHUNK_SIZE (the data-channel message limit). Non-final
-            // chunks carry FLAG_MORE so the device reassembles them into one WS
-            // message (the type byte rides in the first chunk).
-            for (let off = 0; off < payload.length; off += SWSP_CHUNK_SIZE) {
-                const end = off + SWSP_CHUNK_SIZE;
-                const flags = end >= payload.length ? FLAG_DAT : (FLAG_DAT | FLAG_MORE);
-                this.dataChannel.send(this.createFrame(
-                    msg.streamId, flags, payload.subarray(off, Math.min(end, payload.length))));
-            }
+                let payload = raw;
+                if (ws.kind === 'websocket') {
+                    // Regular WebSocket framing: [1B type][message].
+                    payload = new Uint8Array(1 + raw.length);
+                    payload[0] = msg.isText ? 0 : 1;
+                    payload.set(raw, 1);
+                }
+
+                for (let off = 0; off < payload.length; off += SWSP_CHUNK_SIZE) {
+                    const end = Math.min(off + SWSP_CHUNK_SIZE, payload.length);
+                    const flags = ws.kind === 'websocket' && end < payload.length
+                        ? (FLAG_DAT | FLAG_MORE) : FLAG_DAT;
+                    await this._queueStreamFrame(
+                        msg.streamId, flags, payload.subarray(off, end));
+                }
+                if (payload.length === 0) {
+                    await this._queueStreamFrame(msg.streamId, FLAG_DAT, payload);
+                }
+                ws.iframe.postMessage({
+                    type: 'ws-send-ack', streamId: msg.streamId,
+                    bytes: msg.bufferedBytes || raw.byteLength,
+                }, '*');
+            })().catch((e) => {
+                this._resetStream(msg.streamId, 'send_error', e.message || 'send failed', true);
+            });
 
         } else if (msg.type === 'ws-close') {
             const ws = this.wsStreams.get(msg.streamId);
             if (!ws) return;
-            this.wsStreams.delete(msg.streamId);
-            this.dataChannel.send(this.createFrame(msg.streamId, FLAG_FIN, new Uint8Array(0)));
+            this._closeWSOutbound(msg.streamId, ws);
+        } else if (msg.type === 'ws-consumed') {
+            this._handleWSAck(msg.streamId, msg.ackToken);
         }
     }
 

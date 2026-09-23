@@ -1,0 +1,34 @@
+name: Tests
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+jobs:
+  web:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+
+      # --check only parses, but that is the right budget for scripts that
+      # otherwise ship untested (bootstrap.js, sw.js, the shims): it catches
+      # the syntax error that would brick every session at page load.
+      - name: Syntax-check browser scripts
+        working-directory: bitbang-server
+        run: |
+          for f in web/*.js; do node --check "$f"; done
+
+      # An explicit glob rather than a bare directory: it pins exactly
+      # which files run instead of leaning on the runner's discovery rules.
+      - name: Run web tests
+        working-directory: bitbang-server
+        run: node --test web_test/*.test.js

@@ -51,6 +51,8 @@ var stampInputs = []string{
 	"bootstrap.html",
 	"bootstrap.js",
 	"sw.js",
+	"sw-upload.js",
+	"flow-control.js",
 	"ws-shim.js",
 	"xhr-shim.js",
 	"stream-shim.js",
@@ -108,12 +110,14 @@ func serveStamped(w http.ResponseWriter, staticDir, name, stamp string) {
 // Anything else returns 404. A new browser-runtime asset has to be added here
 // or it 404s at load time with no other symptom.
 var allowedBitbangAssets = map[string]bool{
-	"sw.js":          true,
-	"bootstrap.js":   true,
-	"ws-shim.js":     true,
-	"xhr-shim.js":    true,
-	"stream-shim.js": true, // renders whatever a device streams, in its page
-	"favicon.ico":    true, // handler internally maps this to favicon.png
+	"sw.js":           true,
+	"sw-upload.js":    true, // pulled in by sw.js with importScripts
+	"flow-control.js": true,
+	"bootstrap.js":    true,
+	"ws-shim.js":      true,
+	"xhr-shim.js":     true,
+	"stream-shim.js":  true, // renders whatever a device streams, in its page
+	"favicon.ico":     true, // handler internally maps this to favicon.png
 	// Temporary: goes away when a plugin serves its own assets.
 	"config.html":  true, // the device-settings meta-page shell
 	"console.html": true, // the device-console meta-page shell

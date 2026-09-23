@@ -16,6 +16,8 @@
 
     // Registry of active shim WebSockets by streamId
     const sockets = new Map();
+    const pendingSockets = new Map();
+    let nextRequestId = 1;
 
     // Mirror SW cookie-jar updates into document.cookie so app code that
     // reads cookies directly (CSRF tokens, etc.) sees fresh values after
@@ -59,23 +61,62 @@
     // Listen for messages from the bootstrap parent
     window.addEventListener('message', (event) => {
         if (event.source !== parent) return;
-        const { type, streamId, data, code, reason, message } = event.data || {};
+        const {
+            type, streamId, requestId, data, code, reason, message, ackToken, bytes,
+        } = event.data || {};
+
+        if (type === 'ws-rejected') {
+            const pending = pendingSockets.get(requestId);
+            if (!pending) return;
+            pendingSockets.delete(requestId);
+            window.removeEventListener('message', pending._assignHandler);
+            pending._readyState = NativeWebSocket.CLOSED;
+            const errorEvent = new Event('error');
+            try {
+                pending.dispatchEvent(errorEvent);
+                if (pending.onerror) pending.onerror(errorEvent);
+            } finally {
+                const closeEvent = new CloseEvent('close', {
+                    code: 1006, reason: message || 'Connection not ready',
+                });
+                pending.dispatchEvent(closeEvent);
+                if (pending.onclose) pending.onclose(closeEvent);
+            }
+            return;
+        }
 
         const ws = sockets.get(streamId);
         if (!ws) return;
 
         if (type === 'ws-opened') {
+            if (ws._readyState !== NativeWebSocket.CONNECTING) return;
             log('ws-opened, streamId=' + streamId);
             ws._readyState = NativeWebSocket.OPEN;
-            ws.dispatchEvent(new Event('open'));
-            if (ws.onopen) ws.onopen(new Event('open'));
-        } else if (type === 'ws-message') {
-            const evt = new MessageEvent('message', { data });
+            const evt = new Event('open');
             ws.dispatchEvent(evt);
-            if (ws.onmessage) ws.onmessage(evt);
+            if (ws.onopen) ws.onopen(evt);
+        } else if (type === 'ws-message') {
+            const messageData = data instanceof ArrayBuffer && ws.binaryType === 'blob'
+                ? new Blob([data]) : data;
+            const evt = new MessageEvent('message', { data: messageData });
+            try {
+                ws.dispatchEvent(evt);
+                if (ws.onmessage) ws.onmessage(evt);
+            } finally {
+                if (ackToken) {
+                    parent.postMessage({
+                        type: 'ws-consumed', streamId, ackToken,
+                    }, '*');
+                }
+            }
+        } else if (type === 'ws-send-ack') {
+            ws._ackSend(bytes || 0);
         } else if (type === 'ws-closed') {
             log('ws-closed, streamId=' + streamId, 'code=' + code);
             ws._readyState = NativeWebSocket.CLOSED;
+            ws._sendQueue.length = 0;
+            ws._bufferedAmount = 0;
+            ws._sendInFlight = false;
             sockets.delete(streamId);
             const evt = new CloseEvent('close', { code: code || 1000, reason: reason || '' });
             ws.dispatchEvent(evt);
@@ -104,6 +145,12 @@
             this.onerror = null;
             this.binaryType = 'blob';
             this._readyState = NativeWebSocket.CONNECTING;
+            this._sendQueue = [];
+            this._sendInFlight = false;
+            this._bufferedAmount = 0;
+            this._closePending = null;
+            this._requestId = nextRequestId++;
+            pendingSockets.set(this._requestId, this);
 
             // Parse URL to get pathname, stripping /__device__ prefix
             let pathname;
@@ -129,46 +176,84 @@
             // which can be stale after AJAX Set-Cookie responses.
             getCookiesFromSW(pathname).then((cookies) => {
                 log('ws-open posted', pathname, 'cookies.len=' + cookies.length);
-                parent.postMessage({ type: 'ws-open', pathname, protocols, cookies }, '*');
+                parent.postMessage({
+                    type: 'ws-open', requestId: this._requestId,
+                    pathname, protocols, cookies,
+                }, '*');
             });
 
             // Bootstrap will respond with ws-assign containing the streamId
             const assignHandler = (event) => {
                 if (event.source !== parent) return;
-                if (event.data?.type === 'ws-assign' && event.data.pathname === pathname) {
+                if (event.data?.type === 'ws-assign'
+                    && event.data.requestId === this._requestId) {
                     window.removeEventListener('message', assignHandler);
+                    pendingSockets.delete(this._requestId);
                     this._streamId = event.data.streamId;
                     sockets.set(this._streamId, this);
                     log('ws-assign received, streamId=' + this._streamId);
+                    this._flushSend();
                 }
             };
+            this._assignHandler = assignHandler;
             window.addEventListener('message', assignHandler);
         }
 
         get readyState() { return this._readyState; }
+        get bufferedAmount() { return this._bufferedAmount; }
 
         send(data) {
             if (this._readyState !== NativeWebSocket.OPEN) {
                 throw new DOMException('WebSocket is not open', 'InvalidStateError');
             }
             const isText = typeof data === 'string';
-            parent.postMessage({
-                type: 'ws-send',
-                streamId: this._streamId,
-                data,
-                isText
-            }, '*');
+            let bytes;
+            if (isText) bytes = new TextEncoder().encode(data).byteLength;
+            else if (data instanceof Blob) bytes = data.size;
+            else if (data instanceof ArrayBuffer) bytes = data.byteLength;
+            else if (ArrayBuffer.isView(data)) bytes = data.byteLength;
+            else throw new TypeError('WebSocket data must be a string, Blob, ArrayBuffer, or ArrayBufferView');
+            this._sendQueue.push({ data, isText, bytes });
+            this._bufferedAmount += bytes;
+            this._flushSend();
         }
 
         close(code, reason) {
             if (this._readyState === NativeWebSocket.CLOSED) return;
             this._readyState = NativeWebSocket.CLOSING;
+            this._closePending = { code: code || 1000, reason: reason || '' };
+            this._flushSend();
+        }
+
+        _flushSend() {
+            if (this._sendInFlight) return;
+            if (this._streamId === undefined) return;
+            const next = this._sendQueue[0];
+            if (next) {
+                this._sendInFlight = true;
+                parent.postMessage({
+                    type: 'ws-send', streamId: this._streamId,
+                    data: next.data, isText: next.isText,
+                    bufferedBytes: next.bytes,
+                }, '*');
+                return;
+            }
+            if (!this._closePending) return;
+            const close = this._closePending;
+            this._closePending = null;
             parent.postMessage({
                 type: 'ws-close',
                 streamId: this._streamId,
-                code: code || 1000,
-                reason: reason || ''
+                code: close.code,
+                reason: close.reason
             }, '*');
+        }
+
+        _ackSend(bytes) {
+            const sent = this._sendQueue.shift();
+            this._bufferedAmount = Math.max(0, this._bufferedAmount - (sent?.bytes || bytes));
+            this._sendInFlight = false;
+            this._flushSend();
         }
 
         // Standard WebSocket constants
