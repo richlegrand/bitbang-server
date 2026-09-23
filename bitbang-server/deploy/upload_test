@@ -44,7 +44,44 @@ ssh "${SERVER_SSH}" -i "${SERVER_SSH_KEY}" "
 "
 
 PORT=$(grep '^BITBANG_SERVER_PORT=' deploy/test.env | cut -d= -f2)
+
+# Wait for the build stamp to settle before claiming the deploy is done.
+#
+# The stamp is a hash of every browser-runtime asset, computed ONCE when the
+# Go handler is built (internal/handler/static.go, `stamp := buildStamp(...)`
+# inside Static()), and spliced into bootstrap.js and sw.js as they are
+# served. It is correct for the files the process started with -- but the
+# tarball is extracted while the old process is still running, so between the
+# extract and the restart completing there are two processes that would stamp
+# the same deploy differently.
+#
+# A browser refreshing in that window can fetch bootstrap.js from one and
+# sw.js from the other, see two stamps for one deploy, and reload -- into a
+# blank page, because it is running one deploy's bootstrap against the
+# other's worker. Reloading does not help; it lands in the same window.
+# Observed as "refresh twice after every deploy".
+#
+# This does not close the window -- that would need socket handover or
+# draining at nginx, which is real infrastructure for a two second gap. It
+# closes the part that matters: the script no longer says "Deployed" while it
+# is still open, so the person who just deployed is not the one who hits it.
+prev=""; stable=0
+for _ in $(seq 1 30); do
+    now=$(ssh "${SERVER_SSH}" -i "${SERVER_SSH_KEY}" \
+          "curl -sf http://localhost:${PORT}/__bitbang__/sw.js" 2>/dev/null \
+          | grep -m1 -oE "BUILD = '[^']*'" || true)
+    if [ -n "${now}" ] && [ "${now}" = "${prev}" ]; then stable=1; break; fi
+    prev="${now}"
+    sleep 1
+done
+
 echo
-echo "Deployed. /status:"
+if [ "${stable}" = 1 ]; then
+    echo "Deployed, ${prev} -- safe to refresh."
+else
+    echo "WARNING: build stamp never settled. The service may not have come"
+    echo "back; check 'systemctl --user status ${SERVICE}' before refreshing."
+fi
+echo "/status:"
 ssh "${SERVER_SSH}" -i "${SERVER_SSH_KEY}" "curl -s http://localhost:${PORT}/status" || true
 echo
