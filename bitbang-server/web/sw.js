@@ -755,7 +755,7 @@ function isServerEndpoint(pathname) {
 }
 
 // The canonical spelling of a meta-page, and the same one the address bar
-// shows after the access code: #<code>/*config. Declared above its use in the
+// shows after the access code: #<code>/*settings. Declared above its use in the
 // fetch handler rather than beside serveBareMetaPage below -- a const in the
 // temporal dead zone would still work there, since the listener runs long
 // after this module is evaluated, but that is a subtlety worth not having.
@@ -796,7 +796,7 @@ self.addEventListener('fetch', (event) => {
         if (m && sessions.has(m[1])) rememberClientSession(event, m[1]);
 
         // A '*' first segment names a meta-page rather than a device path:
-        // #<code>/*config. The shell is ours; only the data it renders comes
+        // #<code>/*settings. The shell is ours; only the data it renders comes
         // from the device.
         //
         // It is served *inside* /__device__/<sid>/ on purpose. The routing
@@ -814,7 +814,7 @@ self.addEventListener('fetch', (event) => {
 
         event.respondWith(proxyToDevice(event));
     } else if (BARE_META_PATH.test(url.pathname)) {
-        // A link on a device page written the natural way -- href="/*config"
+        // A link on a device page written the natural way -- href="/*settings"
         // -- arrives with no /__device__/<sid> prefix, because an
         // origin-absolute href discards the current path. The prefixed form
         // above never sees it, and without this the request is proxied to the
@@ -831,7 +831,7 @@ self.addEventListener('fetch', (event) => {
 //
 // Concrete specifically, not findSession: that falls back to fuzzy strategies
 // (single-session, most-recent), and on one of those a stray top-level visit to
-// bitba.ng/*config would render a settings shell bound to whatever session
+// bitba.ng/*settings would render a settings shell bound to whatever session
 // another tab happened to have open.
 //
 // Anything unproven falls through to proxyAbsolutePath, which is exactly what
@@ -1012,9 +1012,15 @@ async function redirectViaActiveSession(event, url) {
 //
 // An allowlist rather than a path: the name arrives from the URL.
 //
-// Temporary: the mechanism stays, but 'config' is hardcoded here only until
-// plugins can register a meta-page, at which point this set is built from them.
-const META_PAGES = new Set(['config', 'console', 'ota']);
+// The name is the filename: /*settings serves /__bitbang__/settings.html. So
+// renaming the file means renaming the entry here, and nothing checks that the
+// two agree -- config.html became settings.html while this still said 'config',
+// which left the new name unknown and the old one resolving to a file that no
+// longer exists. Neither error mentions the other half.
+//
+// Temporary: the mechanism stays, but these are hardcoded only until plugins
+// can register a meta-page, at which point this set is built from them.
+const META_PAGES = new Set(['settings', 'console', 'ota']);
 
 async function serveMetaPage(name, sessionId) {
     if (!META_PAGES.has(name)) {

@@ -2975,7 +2975,7 @@ class BitBangConnection {
     }
 
     // Re-point the iframe at a meta-page instead of reloading, so editing the
-    // fragment to /*config keeps the live session rather than building a new
+    // fragment to /*settings keeps the live session rather than building a new
     // one -- no second WebRTC connection, no re-verify, no fresh ICE.
     //
     // The reload below exists for one failure: a device page that is an SPA,
