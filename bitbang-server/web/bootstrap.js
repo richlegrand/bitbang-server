@@ -2721,10 +2721,19 @@ class BitBangConnection {
         iframe.onload = () => {
             // Constrain the iframe body to the viewport so modal height
             // calculations use the visible area, not the content height.
+            //
+            // border-box matters as much as the height does. Without it a page
+            // that puts padding on body -- which the settings page does, 2rem
+            // top and bottom -- is one viewport tall *plus* that padding, so it
+            // overflows by about 4rem and always shows a scrollbar with
+            // roughly 90% of itself visible. Only html and body are touched,
+            // so a page's own box model below that is its own business.
             try {
                 const doc = iframe.contentDocument;
                 const s = doc.createElement('style');
-                s.textContent = 'html, body { height: 100% !important; overflow: auto !important; }';
+                s.textContent = 'html, body { height: 100% !important; '
+                              + 'box-sizing: border-box !important; '
+                              + 'overflow: auto !important; }';
                 doc.head.appendChild(s);
             } catch (e) {}
 
