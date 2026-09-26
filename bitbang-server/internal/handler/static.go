@@ -54,12 +54,12 @@ var stampInputs = []string{
 	"ws-shim.js",
 	"xhr-shim.js",
 	"stream-shim.js",
-	// Temporary: leaves with config.html when the config page becomes a plugin.
-	"config.html",
+	// Temporary: leaves with settings.html when the config page becomes a plugin.
+	"settings.html",
 	"console.html",
 	"ota.html",
 	// The renderers. Temporary in the same sense: they move to a plugin of
-	// their own, which is not the one config.html goes to -- a renderer is a
+	// their own, which is not the one settings.html goes to -- a renderer is a
 	// codec adapter, and a device sending mjpeg wants the mjpeg renderer
 	// while wanting nothing to do with any particular device's firmware.
 	"pcm-ring.js",
@@ -115,7 +115,7 @@ var allowedBitbangAssets = map[string]bool{
 	"stream-shim.js": true, // renders whatever a device streams, in its page
 	"favicon.ico":    true, // handler internally maps this to favicon.png
 	// Temporary: goes away when a plugin serves its own assets.
-	"config.html":  true, // the device-settings meta-page shell
+	"settings.html":  true, // the device-settings meta-page shell
 	"console.html": true, // the device-console meta-page shell
 	"ota.html":     true, // the device-firmware meta-page shell
 	// The renderers, one per codec, fetched by the shim the first time a

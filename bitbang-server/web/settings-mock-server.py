@@ -1,14 +1,14 @@
 #!/usr/bin/env python3
 """A stand-in for a device, so the config page can be developed without one.
 
-Temporary: moves out with config.html when the config page becomes a plugin.
+Temporary: moves out with settings.html when the config page becomes a plugin.
 
-Serves the static files and answers /__bitbang/config the way the firmware
+Serves the static files and answers /__bitbang/settings the way the firmware
 does -- same declaration, same status codes, same error bodies. The page runs
 its real default URL against this, so what gets exercised is the code that
 will run for real, not a mock branch inside it.
 
-    ./config-mock-server.py        then open http://localhost:%s/config.html" % __import__("os").environ.get("PORT", 8000)
+    ./settings-mock-server.py        then open http://localhost:%s/settings.html" % __import__("os").environ.get("PORT", 8000)
 
 Device behaviors deliberately mirrored, because they are what the page has to
 render and they are awkward to provoke on hardware:
@@ -20,9 +20,9 @@ render and they are awkward to provoke on hardware:
 import json, os, re, copy
 from http.server import SimpleHTTPRequestHandler, HTTPServer
 
-PATH = "/__bitbang/config"
+PATH = "/__bitbang/settings"
 
-SETTINGS = json.load(open("config-mock.json"))["settings"]
+SETTINGS = json.load(open("settings-mock.json"))["settings"]
 
 class Handler(SimpleHTTPRequestHandler):
     def _json(self, code, obj):
@@ -106,5 +106,5 @@ class Handler(SimpleHTTPRequestHandler):
 if __name__ == "__main__":
     import os
     port = int(os.environ.get("PORT", 8000))
-    print("mock device on http://localhost:%d/config.html" % port)
+    print("mock device on http://localhost:%d/settings.html" % port)
     HTTPServer(("127.0.0.1", port), Handler).serve_forever()

@@ -9,7 +9,7 @@
   a setting to a device needs no change here; see device-config.md.
 
   Standalone, for iteration without a device:
-      python3 -m http.server   then open  config.html?src=config-mock.json
+      python3 -m http.server   then open  settings.html?src=settings-mock.json
 -->
 <style>
   :root {
@@ -77,7 +77,7 @@
 <div id="err" class="state err"></div>
 
 <script>
-const SRC = new URLSearchParams(location.search).get('src') || '/__bitbang/config';
+const SRC = new URLSearchParams(location.search).get('src') || '/__bitbang/settings';
 
 /* Absent `n`, derive from the key: underscores to spaces, first letter up. */
 const label = s => s.n || (s.k.replace(/_/g, ' ').replace(/^./, c => c.toUpperCase()));
@@ -352,7 +352,7 @@ let all = [];
     render(all);
   } catch (e) {
     document.getElementById('err').textContent =
-      String(e) + ' -- open with ?src=config-mock.json to work without a device.';
+      String(e) + ' -- open with ?src=settings-mock.json to work without a device.';
   }
 })();
 

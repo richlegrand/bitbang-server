@@ -801,7 +801,7 @@ self.addEventListener('fetch', (event) => {
         //
         // It is served *inside* /__device__/<sid>/ on purpose. The routing
         // rules below match on the requesting client's URL, so a plain
-        // fetch('/__bitbang/config') from this page is proxied to the device
+        // fetch('/__bitbang/settings') from this page is proxied to the device
         // like any device page's fetch -- which means the page itself needs
         // no knowledge of sessions, prefixes, or that it is a meta-page at
         // all. Serve the same file from the bare origin and its fetches would

@@ -22,7 +22,7 @@ func stampDir(t *testing.T) string {
 		"ws-shim.js":      "// ws shim\n",
 		"xhr-shim.js":     "// xhr shim\n",
 		"stream-shim.js":  "// stream shim\n",
-		"config.html":     "<html><!-- settings --></html>",
+		"settings.html":     "<html><!-- settings --></html>",
 		"console.html":    "<html><!-- console --></html>",
 		"ota.html":        "<html><!-- firmware --></html>",
 		"pcm-ring.js":     "// pcm ring\n",
@@ -196,20 +196,20 @@ func TestInjectedScriptsAreServable(t *testing.T) {
 	}
 }
 
-// Temporary: goes with config.html when the config page becomes a plugin.
+// Temporary: goes with settings.html when the config page becomes a plugin.
 //
-// The meta-page shell has to be reachable at /__bitbang__/config.html or the
+// The meta-page shell has to be reachable at /__bitbang__/settings.html or the
 // service worker's meta-page route returns 502 and the settings page is blank
 // with nothing in the log. allowedBitbangAssets is an explicit whitelist, so
 // forgetting an entry is the likely way that happens.
 func TestMetaPageShellIsServed(t *testing.T) {
 	dir := stampDir(t)
-	w := serveAsset(t, dir, "/__bitbang__/config.html")
+	w := serveAsset(t, dir, "/__bitbang__/settings.html")
 	if w.Code != http.StatusOK {
-		t.Fatalf("config.html: got %d, want 200", w.Code)
+		t.Fatalf("settings.html: got %d, want 200", w.Code)
 	}
 	if ct := w.Header().Get("Content-Type"); !strings.HasPrefix(ct, "text/html") {
-		t.Errorf("config.html content type = %q, want text/html", ct)
+		t.Errorf("settings.html content type = %q, want text/html", ct)
 	}
 	if w := serveAsset(t, dir, "/__bitbang__/console.html"); w.Code != http.StatusOK {
 		t.Fatalf("console.html: got %d, want 200", w.Code)
