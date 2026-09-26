@@ -168,10 +168,13 @@ function row(s, all) {
       const j = await r.json().catch(() => ({}));
       if (!r.ok) {
         /* The error string is the whole guidance -- there is no pattern in the
-           declaration a page could have checked first. */
-        let m = j.error || ('HTTP ' + r.status);
-        if (j.min !== undefined) m += ` (${j.min}-${j.max})`;
-        say(m, 'err');
+           declaration a page could have checked first.
+
+           A range used to arrive as separate min and max fields and get
+           appended here. The device writes it into the message now, because
+           the same dispatch answers callers that have no page to decorate
+           anything with. */
+        say(j.error || ('HTTP ' + r.status), 'err');
       } else {
         say(j.msg || 'applied', 'ok');
         setTimeout(() => { if (state.textContent === (j.msg || 'applied')) say(''); }, 1500);
