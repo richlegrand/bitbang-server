@@ -1010,36 +1010,39 @@ async function redirectViaActiveSession(event, url) {
 // bug would mean an OTA to every device in the field; a meta-page updates when
 // the server does. The device supplies data and no HTML at all.
 //
-// An allowlist rather than a path: the name arrives from the URL.
+// The name is the filename and it arrives from the URL: /*settings serves
+// /__bitbang__/settings.html. Nothing here knows which names are real.
 //
-// The name is the filename: /*settings serves /__bitbang__/settings.html. So
-// renaming the file means renaming the entry here, and nothing checks that the
-// two agree -- config.html became settings.html while this still said 'config',
-// which left the new name unknown and the old one resolving to a file that no
-// longer exists. Neither error mentions the other half.
+// There was a META_PAGES set of exactly {settings, console, ota}. It refused
+// nothing the server was not already refusing -- the only .html files that
+// prefix serves are those three, so two allowlists were reaching the same
+// answer independently, and this was the copy that could go stale. It did:
+// config.html became settings.html while this still said 'config', so the new
+// name read as unknown and the old one resolved to a file that no longer
+// existed, with neither error mentioning the other half.
 //
-// Temporary: the mechanism stays, but these are hardcoded only until plugins
-// can register a meta-page, at which point this set is built from them.
-const META_PAGES = new Set(['settings', 'console', 'ota']);
-
+// It could not have survived plugins either. A plugin registers with the
+// server, which is what knows what is deployed; a list kept by hand in a
+// service worker is unreachable from there and can only be wrong in one
+// direction -- refusing something real. So the refusal, and the list of what
+// does exist, belong to the server.
+//
+// What keeps this safe is the URL pattern rather than any list. The name is
+// matched as [A-Za-z0-9_-]+, so it carries no slash and no dot: it cannot climb
+// out of the prefix, and it cannot name a file that is not <name>.html.
 async function serveMetaPage(name, sessionId) {
-    if (!META_PAGES.has(name)) {
-        // Name what does exist. This is the error someone meets first --
-        // guessing a name that sounds plausible is exactly how you find out
-        // which ones are real -- and a bare refusal makes them go read source
-        // to learn there is only one.
-        const have = [...META_PAGES].sort().join(', ');
-        return new Response(`no meta-page named "${name}" (have: ${have})`, {
-            status: 404,
-            headers: { 'Content-Type': 'text/plain; charset=utf-8' },
-        });
-    }
     // A fetch issued from inside a service worker does not re-enter its own
     // fetch handler, so this reaches the network normally.
     const r = await fetch(`/__bitbang__/${name}.html`, { cache: 'no-cache' });
     if (!r.ok) {
-        return new Response(`meta-page "${name}" is not deployed`, {
-            status: 502,
+        /* The server's body names what it does have, and is passed through
+           rather than replaced: guessing a plausible name is how someone finds
+           out which pages are real, and this worker is no longer in a position
+           to tell them. 404 stays a 404 -- no such page -- while anything else
+           is the server failing to hand over a page that exists. */
+        const why = await r.text().catch(() => '');
+        return new Response(why.trim() || `no meta-page named "${name}"`, {
+            status: r.status === 404 ? 404 : 502,
             headers: { 'Content-Type': 'text/plain; charset=utf-8' },
         });
     }

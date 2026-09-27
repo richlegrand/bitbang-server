@@ -3,9 +3,11 @@ package handler
 import (
 	"crypto/sha256"
 	"encoding/hex"
+	"fmt"
 	"net/http"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
 )
 
@@ -115,9 +117,9 @@ var allowedBitbangAssets = map[string]bool{
 	"stream-shim.js": true, // renders whatever a device streams, in its page
 	"favicon.ico":    true, // handler internally maps this to favicon.png
 	// Temporary: goes away when a plugin serves its own assets.
-	"settings.html":  true, // the device-settings meta-page shell
-	"console.html": true, // the device-console meta-page shell
-	"ota.html":     true, // the device-firmware meta-page shell
+	"settings.html": true, // the device-settings meta-page shell
+	"console.html":  true, // the device-console meta-page shell
+	"ota.html":      true, // the device-firmware meta-page shell
 	// The renderers, one per codec, fetched by the shim the first time a
 	// channel announces that codec. Served here rather than embedded in a
 	// device page, because rendering is a property of the codec and not of any
@@ -130,6 +132,37 @@ var allowedBitbangAssets = map[string]bool{
 	"pcm-ring.js":     true,
 	"render-mjpeg.js": true,
 	"render-ulaw.js":  true,
+}
+
+// metaPageNames returns the meta-page names this server can serve, sorted --
+// the .html entries above, without the extension, which is the spelling
+// someone types after the '*' in /*settings.
+//
+// It is derived rather than declared so that adding a shell to the map above is
+// the only step. sw.js used to keep its own copy of these three names and gate
+// on it; that list refused nothing this one does not, and it was the copy that
+// went stale when config.html was renamed. The service worker now asks for
+// <name>.html and reports whatever comes back, so this is the only authority,
+// and it is the one a plugin registering a page would extend.
+func metaPageNames() []string {
+	var out []string
+	for name := range allowedBitbangAssets {
+		if ext := strings.TrimSuffix(name, ".html"); ext != name {
+			out = append(out, ext)
+		}
+	}
+	sort.Strings(out)
+	return out
+}
+
+// notFoundMetaPage answers a miss under /__bitbang__/<name>.html by naming what
+// does exist. Guessing a plausible name is how someone finds out which pages
+// are real, and a bare 404 sends them to read source instead.
+func notFoundMetaPage(w http.ResponseWriter, name string) {
+	w.Header().Set("Content-Type", "text/plain; charset=utf-8")
+	w.WriteHeader(http.StatusNotFound)
+	fmt.Fprintf(w, "no meta-page named %q (have: %s)\n",
+		name, strings.Join(metaPageNames(), ", "))
 }
 
 // Static returns an http.Handler that serves the signaling server's static
@@ -166,6 +199,16 @@ func Static(staticDir, frontPagePath string) http.HandlerFunc {
 			name := strings.TrimPrefix(path, "/__bitbang__/")
 			// No subpaths under __bitbang__; only flat filenames.
 			if strings.ContainsRune(name, '/') || !allowedBitbangAssets[name] {
+				// A miss on a .html here is someone asking for a meta-page
+				// that does not exist -- /*foo in the address bar, resolved
+				// by the service worker into foo.html. Worth naming the ones
+				// that do, since this is the first error they meet. Every
+				// other miss is a runtime asset and its own bug.
+				if base, ok := strings.CutSuffix(name, ".html"); ok &&
+					!strings.ContainsRune(name, '/') {
+					notFoundMetaPage(w, base)
+					return
+				}
 				http.NotFound(w, r)
 				return
 			}

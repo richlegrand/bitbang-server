@@ -214,9 +214,72 @@ func TestMetaPageShellIsServed(t *testing.T) {
 	if w := serveAsset(t, dir, "/__bitbang__/console.html"); w.Code != http.StatusOK {
 		t.Fatalf("console.html: got %d, want 200", w.Code)
 	}
-	// Not in the whitelist: a name the SW would reject too, but the server
-	// should not be the thing that lets it through.
+	// Not in the whitelist. This is now the only thing that refuses it: sw.js
+	// used to keep its own copy of the meta-page names and check first, and that
+	// copy is what went stale when config.html was renamed.
 	if w := serveAsset(t, dir, "/__bitbang__/nope.html"); w.Code != http.StatusNotFound {
 		t.Errorf("nope.html: got %d, want 404", w.Code)
+	}
+}
+
+// The 404 for an unknown meta-page names the ones that exist, because that error
+// is what someone who typed /*setings meets first, and the service worker passes
+// this body through verbatim -- it no longer knows the names itself.
+//
+// Derived from allowedBitbangAssets rather than written out, so adding a shell
+// to that map is the only step. A second list kept by hand is what this replaced.
+func TestUnknownMetaPageNamesTheRealOnes(t *testing.T) {
+	dir := stampDir(t)
+	w := serveAsset(t, dir, "/__bitbang__/setings.html")
+	if w.Code != http.StatusNotFound {
+		t.Fatalf("setings.html: got %d, want 404", w.Code)
+	}
+	body := w.Body.String()
+	if !strings.Contains(body, `"setings"`) {
+		t.Errorf("404 body does not quote the name asked for: %q", body)
+	}
+	for _, want := range metaPageNames() {
+		if !strings.Contains(body, want) {
+			t.Errorf("404 body does not mention %q, which is servable: %q", want, body)
+		}
+	}
+	// The names are the spelling that goes after the '*', so no extension.
+	if strings.Contains(body, ".html") {
+		t.Errorf("404 body offers filenames rather than meta-page names: %q", body)
+	}
+
+	// A miss that is not a meta-page stays an ordinary 404. Naming the shells
+	// there would answer a question nobody asked: a missing shim is its own bug,
+	// and TestInjectedScriptsAreServable is what catches it.
+	if w := serveAsset(t, dir, "/__bitbang__/nope.js"); w.Code != http.StatusNotFound {
+		t.Errorf("nope.js: got %d, want 404", w.Code)
+	} else if strings.Contains(w.Body.String(), "meta-page") {
+		t.Errorf("a missing .js was answered as a meta-page: %q", w.Body.String())
+	}
+}
+
+// metaPageNames has to agree with what sw.js will ask for. The worker builds the
+// filename by appending .html to the name in the URL, so every servable shell
+// must be exactly <name>.html -- anything else is a page reachable by no URL, or
+// a name in this list that resolves to nothing.
+func TestMetaPageNamesRoundTripThroughTheWorkersRule(t *testing.T) {
+	names := metaPageNames()
+	if len(names) == 0 {
+		t.Fatal("no meta-page shells in allowedBitbangAssets")
+	}
+	for _, n := range names {
+		if !allowedBitbangAssets[n+".html"] {
+			t.Errorf("metaPageNames has %q but %s.html is not servable", n, n)
+		}
+		// The URL pattern in sw.js is [A-Za-z0-9_-]+. A name outside it is
+		// unreachable however the server feels about it.
+		for _, c := range n {
+			ok := c == '-' || c == '_' ||
+				(c >= '0' && c <= '9') || (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z')
+			if !ok {
+				t.Errorf("meta-page %q contains %q, which the service worker's "+
+					"URL pattern will not match", n, c)
+			}
+		}
 	}
 }
