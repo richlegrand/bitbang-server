@@ -440,10 +440,35 @@ function row(s, all) {
     ctl.appendChild(n);
   }
 
+  /* -- the device's refine hook, applied once for every type --
+
+     `en:false` greys whatever control this row built and puts the device's
+     reason beside it. Done here rather than in each branch because the answer is
+     the same shape for a checkbox, a slider and a select, and because `why` is a
+     sentence the device wrote -- nothing here decides what it says.
+
+     Advisory, and the device knows it: the setter refuses the same write with
+     the same sentence. So a page that has not polled since the condition
+     changed shows a live control, and clicking it produces the explanation
+     rather than silence. */
+  const why = document.createElement('span');
+  why.className = 'note';
+  const gate = () => {
+    const off = s.en === false;
+    for (const el of ctl.querySelectorAll('input,select,button')) el.disabled = off;
+    why.textContent = off && s.why ? '-- ' + s.why : '';
+    /* Hidden is the stronger form and the device has to ask for it by name.
+       Greying is preferred: a control that vanishes leaves someone hunting for
+       what was there a moment ago, which is what the camera's own panel does. */
+    div.style.display = s.hide ? 'none' : '';
+  };
+  ctl.appendChild(why);
+
   ctl.appendChild(state);
   div.appendChild(ctl);
-  /* An action has no value, so it needs no sync and must still be skippable. */
-  div._sync = sync;
+  gate();
+  /* An action has no value, so its sync may be null -- but every row gates. */
+  div._sync = () => { if (sync) sync(); gate(); };
   return div;
 }
 
@@ -455,10 +480,25 @@ function row(s, all) {
    disappears as a whole element, so a change in it is structural. That means a
    value arriving as pending still rebuilds -- rare enough to accept, and
    honest about which case is handled. */
+/* What _sync can apply to nodes that already exist, so a change in one of these
+   is not structural and costs no rebuild.
+
+   `en`, `why` and `hide` come from the device's refine hook and move at runtime:
+   toggling automatic gain disables the manual one. Disabling an input and
+   putting a reason beside it are properties of a node, not a reason for a new
+   one -- and rebuilding is what swallows a click mid-press, so keeping these out
+   of the signature is what makes a conditional control cheap.
+
+   min, max and step are deliberately *not* here even though refine can move
+   them. They are attributes of a live input, but a slider's bound labels travel
+   with them, and the case that moves a range is a mode change -- a deliberate,
+   rare click where a rebuild costs nothing. */
+const SYNCED = new Set(['v', 'set', 'en', 'why', 'hide']);
+
 function sig(s) {
   const o = {};
   for (const k of Object.keys(s).sort()) {
-    if (k === 'v' || k === 'set') continue;
+    if (SYNCED.has(k)) continue;
     o[k] = s[k];
   }
   return JSON.stringify(o);
@@ -477,9 +517,15 @@ function absorb(next, group) {
   for (let i = 0; i < next.length; i++) {
     if (next[i].k !== mine[i].k || sig(next[i]) !== sig(mine[i])) return false;
   }
+  /* Every synced field, copied or removed. Removal matters as much as the copy:
+     a control that became available again sends no `en`, and leaving the old
+     false behind would keep it greyed with a reason that is no longer true. */
   for (let i = 0; i < next.length; i++) {
     mine[i].v = next[i].v;
-    if ('set' in next[i]) mine[i].set = next[i].set; else delete mine[i].set;
+    for (const k of SYNCED) {
+      if (k === 'v') continue;
+      if (k in next[i]) mine[i][k] = next[i][k]; else delete mine[i][k];
+    }
   }
   return true;
 }
