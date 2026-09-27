@@ -9,10 +9,21 @@
   The device config meta-page.
 
   Renders whatever the device declares and knows nothing about any key. Adding
-  a setting to a device needs no change here; see device-config.md.
+  a setting to a device needs no change here; see device-settings.md.
 
-  Standalone, for iteration without a device:
-      python3 -m http.server   then open  settings.html?src=settings-mock.json
+  To iterate on this page, flash the settings_demo example. It is a device with
+  no camera and no page of its own whose table declares every element of the
+  vocabulary at once, so a rendering defect appears beside the cases that
+  render correctly. It is the only device covering secret, confirm, reboot, the
+  radio hint, a readonly bool, and an int with no range.
+
+  That replaced a Python script that used to sit here answering
+  /__bitbang/settings by hand. It was a second implementation of this protocol
+  that nobody flashed, so it drifted until it declared settings the firmware
+  had renamed and tabs it no longer had. A declaration comes from a device.
+
+  ?src=<url> still reads a declaration from somewhere else -- a response saved
+  off a real device, say -- and needs nothing on this end to exist.
 -->
 <style>
   :root {
@@ -460,8 +471,13 @@ let all = [];
     all = await load(null);
     render(all);
   } catch (e) {
+    /* Names the two things that are actually wrong when this fires: no session
+       to carry the request, or a device that has settings switched off. The
+       old text sent people to a mock file, which told them nothing about
+       their device and no longer exists. */
     document.getElementById('err').textContent =
-      String(e) + ' -- open with ?src=settings-mock.json to work without a device.';
+      String(e) + ' -- no answer from the device. Check that it is connected '
+      + 'and that this build has the settings module enabled.';
   }
 })();
 
