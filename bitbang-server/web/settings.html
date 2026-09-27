@@ -64,6 +64,11 @@
 
   button.action { cursor:pointer; padding:.35rem .9rem; }
   button.action:hover { border-color:var(--accent); }
+  /* Export and import act on the whole device, so they sit with the title
+     rather than inside a tab. Restore defaults is per tab and sits with it. */
+  h1 { display:flex; align-items:baseline; gap:.75rem; flex-wrap:wrap; }
+  #top { margin-left:auto; display:flex; gap:.5rem; font-size:.85rem; font-weight:400; }
+  .foot { margin-top:1.5rem; padding-top:1rem; border-top:1px solid var(--line); }
   button.danger { border-color:var(--bad); color:var(--bad); }
 
   .unit, .bound, .note, .ro { color:var(--dim); font-size:.85rem; }
@@ -74,7 +79,11 @@
   .state.ok  { color:var(--ok); }
 </style>
 
-<h1>Settings</h1>
+<h1>Settings<span id="top">
+  <button class="action" id="export">Export</button>
+  <button class="action" id="import">Import</button>
+  <input type="file" id="importfile" accept="application/json,.json" hidden>
+</span></h1>
 <div id="tabs" role="tablist"></div>
 <div id="panel"></div>
 <div id="err" class="state err"></div>
@@ -136,6 +145,28 @@ async function render(settings) {
   for (const s of settings) {
     if ((s.g || 'Other') !== current) continue;
     panel.appendChild(row(s, settings));
+  }
+
+  /* Restore defaults belongs on the tab it applies to. A button's scope
+     should be visible from where it sits, and one above the tab bar is not --
+     which is how a demo reset that only ever touched three keys read as
+     something that would reset the device.
+
+     Offered only when this tab has something to restore: a device tab that
+     is all readonly values has no defaults, and a button that would do
+     nothing should not be there to press. */
+  if (settings.some(s => (s.g || 'Other') === current && s.d !== undefined)) {
+    const foot = document.createElement('div');
+    foot.className = 'foot';
+    const b = document.createElement('button');
+    b.className = 'action';
+    b.textContent = 'Restore defaults';
+    b.onclick = async () => {
+      if (!confirm(`Restore the ${current} settings to their defaults?`)) return;
+      await resetGroup(current);
+    };
+    foot.appendChild(b);
+    panel.appendChild(foot);
   }
 }
 
@@ -333,6 +364,78 @@ function row(s, all) {
   return div;
 }
 
+/* -- restore, export, import ------------------------------------------- */
+
+const note = (msg, cls) => {
+  const el = document.getElementById('err');
+  el.textContent = msg;
+  el.className = 'state ' + (cls || '');
+};
+
+/* The device answers a reset with the re-read declaration, because every
+   value on the tab just changed -- so this needs no follow-up fetch. */
+async function resetGroup(group) {
+  try {
+    const r = await fetch(`${SRC.split('?')[0]}?reset&g=${encodeURIComponent(group)}`,
+                          { method: 'POST' });
+    if (!r.ok) throw new Error('HTTP ' + r.status);
+    const part = await r.json();
+    const keys = new Set(part.map(s => s.k));
+    all = all.filter(s => !keys.has(s.k)).concat(part);
+    render(all);
+    note(`${group} restored to defaults`, 'ok');
+  } catch (e) {
+    note(String(e), 'err');
+  }
+}
+
+/* Readonly values are in the document on purpose -- the URL, the address, the
+   firmware it was running. Import ignores them; a person reading the file
+   later will not. */
+async function exportSettings() {
+  try {
+    const r = await fetch(`${SRC.split('?')[0]}?export`);
+    if (!r.ok) throw new Error('HTTP ' + r.status);
+    const text = JSON.stringify(await r.json(), null, 2);
+    const url = URL.createObjectURL(new Blob([text], { type: 'application/json' }));
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = 'settings.json';
+    a.click();
+    /* Revoked on a turn of the event loop rather than immediately: the click
+       is asynchronous and revoking first can race the download. */
+    setTimeout(() => URL.revokeObjectURL(url), 10000);
+    note('exported', 'ok');
+  } catch (e) {
+    note(String(e), 'err');
+  }
+}
+
+async function importSettings(file) {
+  try {
+    const text = await file.text();
+    JSON.parse(text);                 /* fail here, not on the device */
+    const r = await fetch(`${SRC.split('?')[0]}?import`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: text,
+    });
+    const j = await r.json().catch(() => ({}));
+    if (!r.ok) throw new Error(j.error || ('HTTP ' + r.status));
+    await reload(null);
+    /* Skipped is worth naming rather than hiding: a range that narrowed
+       between firmwares makes a once-valid value invalid, and that is
+       information. Readonly keys are not counted -- they were never
+       importable and the device knows it. */
+    note(j.skipped
+           ? `imported ${j.applied}, skipped ${j.skipped}`
+           : `imported ${j.applied}`,
+         j.skipped ? 'err' : 'ok');
+  } catch (e) {
+    note(String(e), 'err');
+  }
+}
+
 /* A scoped reload is an optimization, not a mechanism: fetching everything is
    always correct, which is what a first implementation and every terminal
    client should do. */
@@ -364,5 +467,16 @@ let all = [];
 
 /* Values move without us: another admin edits, an action lands late. Refetch
    when the window comes back rather than polling. */
+document.getElementById('export').onclick = exportSettings;
+document.getElementById('import').onclick = () =>
+  document.getElementById('importfile').click();
+document.getElementById('importfile').onchange = (e) => {
+  const f = e.target.files[0];
+  /* Cleared so choosing the same file twice fires change again, which is
+     what someone editing a file and re-importing expects. */
+  e.target.value = '';
+  if (f) importSettings(f);
+};
+
 addEventListener('focus', () => reload(null));
 </script>
