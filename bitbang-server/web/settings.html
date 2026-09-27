@@ -244,14 +244,31 @@ function row(s, all) {
 
   let input = null, out = null;
 
+  /* Set by each branch to push s's current value into the nodes it built.
+     render() rebuilds the panel, which replaces the element under the pointer
+     and swallows the click -- the same defect the tab bar above describes, and
+     it was fixed there and not here. A refetch that changed no declaration
+     calls this instead of rebuilding anything.
+
+     Two things it must not overwrite: an input the person is typing in, and a
+     key with a write in flight, whose reply is the authority on what the value
+     ended up as. */
+  let sync = null;
+  const syncable = (el) => el !== document.activeElement && !inflight.get(s.k);
+
   if (s.ro) {
     const span = document.createElement('span');
     span.className = 'ro';
     /* Text, not a disabled input -- a disabled box reads as broken rather
        than as deliberate. A bool reads as on/off; "false" is not a word
        anyone wants on a settings page. */
-    const shown = s.t === 'bool' ? (s.v ? 'on' : 'off') : (s.v ?? '');
-    span.textContent = shown + (s.u ? ' ' + s.u : '');
+    const shown = () =>
+      (s.t === 'bool' ? (s.v ? 'on' : 'off') : (s.v ?? '')) + (s.u ? ' ' + s.u : '');
+    span.textContent = shown();
+    /* The readonly rows are the ones that actually move on their own -- free
+       memory, uptime, the address -- so this is the case the focus refetch
+       exists for. */
+    sync = () => { span.textContent = shown(); };
     ctl.appendChild(span);
     if (typeof s.ro === 'string') {
       const why = document.createElement('span');
@@ -271,11 +288,13 @@ function row(s, all) {
     input.type = 'checkbox';
     input.checked = !!s.v;
     input.onchange = () => send({ k: s.k, v: input.checked });
+    sync = () => { if (syncable(input)) input.checked = !!s.v; };
     ctl.appendChild(input);
   } else if (s.t === 'enum' && s.r === 'radio') {
     /* Honoring the hint. A client that ignores `r` and renders the select
        below is equally correct -- which is what a terminal does. */
     const name = 'r' + Math.random().toString(36).slice(2);
+    const radios = [];
     for (const o of s.o || []) {
       const lab = document.createElement('label');
       const rb = document.createElement('input');
@@ -284,9 +303,14 @@ function row(s, all) {
       rb.value = o;
       rb.checked = o === s.v;
       rb.onchange = () => send({ k: s.k, v: o });
+      radios.push(rb);
       lab.append(rb, document.createTextNode(' ' + o));
       ctl.appendChild(lab);
     }
+    sync = () => {
+      if (inflight.get(s.k)) return;
+      for (const rb of radios) rb.checked = rb.value === s.v;
+    };
   } else if (s.t === 'enum') {
     input = document.createElement('select');
     for (const o of s.o || []) {
@@ -296,6 +320,7 @@ function row(s, all) {
     }
     input.value = s.v;
     input.onchange = () => send({ k: s.k, v: input.value });
+    sync = () => { if (syncable(input)) input.value = s.v; };
     ctl.appendChild(input);
   } else if (s.t === 'int' || s.t === 'float') {
     const slider = s.r === 'slider' && s.min !== undefined;
@@ -324,9 +349,17 @@ function row(s, all) {
       track.className = 'track';
       track.append(lo, input, hi);
       out.className = 'value';
+      /* The readout is part of the value, so it moves with it. Skipped while
+         the slider is being dragged, which is what activeElement catches. */
+      sync = () => {
+        if (!syncable(input)) return;
+        input.value = s.v;
+        out.textContent = s.v;
+      };
       ctl.append(track, out);
     } else {
       input.onchange = () => send({ k: s.k, v: Number(input.value) });
+      sync = () => { if (syncable(input)) input.value = s.v; };
       ctl.appendChild(input);
       if (s.min !== undefined) {
         const b = document.createElement('span');
@@ -339,14 +372,22 @@ function row(s, all) {
     input = document.createElement('input');
     input.type = s.secret ? 'password' : 'text';
     if (s.maxlen) input.maxLength = s.maxlen;
+    const place = () => (s.set ? 'set -- leave blank to keep' : 'not set');
     if (s.secret) {
-      input.placeholder = s.set ? 'set -- leave blank to keep' : 'not set';
+      input.placeholder = place();
     } else {
       input.value = s.v ?? '';
     }
     input.onchange = () => {
       if (s.secret && input.value === '') return;
       send({ k: s.k, v: input.value });
+    };
+    /* A secret has no value to sync, only whether one is set. Not clobbering
+       a half-typed credential is the reason syncable checks activeElement. */
+    sync = () => {
+      if (!syncable(input)) return;
+      if (s.secret) input.placeholder = place();
+      else input.value = s.v ?? '';
     };
     ctl.appendChild(input);
   }
@@ -372,7 +413,52 @@ function row(s, all) {
 
   ctl.appendChild(state);
   div.appendChild(ctl);
+  /* An action has no value, so it needs no sync and must still be skippable. */
+  div._sync = sync;
   return div;
+}
+
+/* Everything the DOM's shape depends on, which is everything but the value.
+   Two declarations with the same signature can swap values without a node
+   being replaced.
+
+   `pv` is in here rather than treated as a value: a pending marker appears and
+   disappears as a whole element, so a change in it is structural. That means a
+   value arriving as pending still rebuilds -- rare enough to accept, and
+   honest about which case is handled. */
+function sig(s) {
+  const o = {};
+  for (const k of Object.keys(s).sort()) {
+    if (k === 'v' || k === 'set') continue;
+    o[k] = s[k];
+  }
+  return JSON.stringify(o);
+}
+
+/* Fold a refetch into the declarations already on screen, keeping their object
+   identity so every row's closures stay pointed at live data. False when the
+   structure moved and the caller has to rebuild.
+
+   This is what makes the focus refetch free. Without it, returning to the
+   window destroys and recreates every row, and the click that brought focus
+   back lands on an element that no longer exists. */
+function absorb(next, group) {
+  const mine = group ? all.filter(s => (s.g || 'Other') === group) : all;
+  if (next.length !== mine.length) return false;
+  for (let i = 0; i < next.length; i++) {
+    if (next[i].k !== mine[i].k || sig(next[i]) !== sig(mine[i])) return false;
+  }
+  for (let i = 0; i < next.length; i++) {
+    mine[i].v = next[i].v;
+    if ('set' in next[i]) mine[i].set = next[i].set; else delete mine[i].set;
+  }
+  return true;
+}
+
+function syncRows() {
+  for (const el of document.getElementById('panel').children) {
+    if (el._sync) el._sync();
+  }
 }
 
 /* -- restore, export, import ------------------------------------------- */
@@ -390,10 +476,23 @@ async function resetGroup(group) {
     const r = await fetch(`${SRC.split('?')[0]}?reset&g=${encodeURIComponent(group)}`,
                           { method: 'POST' });
     if (!r.ok) throw new Error('HTTP ' + r.status);
-    const part = await r.json();
-    const keys = new Set(part.map(s => s.k));
-    all = all.filter(s => !keys.has(s.k)).concat(part);
-    render(all);
+    /* ?reset replies with a declaration for the group, which is the same
+       {settings: [...]} envelope a GET returns -- not a bare array. This read
+       the body as the array and died on part.map, because nothing exercised
+       it: the mock never implemented ?reset, and until log_level declared a
+       default the only tab with this button was one nobody pressed.
+
+       Checked rather than defaulted to []. An || [] here would turn the next
+       shape change into a no-op that still reported success. */
+    const part = (await r.json()).settings;
+    if (!Array.isArray(part)) throw new Error('reset: unexpected reply');
+    if (absorb(part, group)) {
+      syncRows();
+    } else {
+      const keys = new Set(part.map(s => s.k));
+      all = all.filter(s => !keys.has(s.k)).concat(part);
+      render(all);
+    }
     note(`${group} restored to defaults`, 'ok');
   } catch (e) {
     note(String(e), 'err');
@@ -452,12 +551,15 @@ async function importSettings(file) {
    client should do. */
 async function reload(group) {
   try {
+    const part = await load(group);
+    /* Values only, no rebuild -- which is the common case, since a refetch
+       usually finds the same firmware declaring the same things. */
+    if (absorb(part, group)) { syncRows(); return; }
     if (group) {
-      const part = await load(group);
       const keys = new Set(part.map(s => s.k));
       all = all.filter(s => !keys.has(s.k)).concat(part);
     } else {
-      all = await load(null);
+      all = part;
     }
     render(all);
   } catch (e) {
