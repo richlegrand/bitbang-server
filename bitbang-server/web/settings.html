@@ -112,11 +112,36 @@ const inflight = new Map(), pending = new Map();
 
 let current = null;          // selected tab label
 
+/* The declaration revision the device last reported. Offered back on a poll so
+   it can answer "nothing changed" without building 2 KB of JSON and calling
+   every getter to do it. Null until the first load.
+
+   `rev` and not `v` because a write's reply is flat and `v` there is the
+   setting's value. */
+let rev = null;
+
 async function load(group) {
   const url = group && SRC.startsWith('/') ? SRC + '?g=' + encodeURIComponent(group) : SRC;
   const r = await fetch(url);
   if (!r.ok) throw new Error(r.status + ' from ' + url);
-  return (await r.json()).settings || [];
+  const body = await r.json();
+  if ('rev' in body) rev = body.rev;
+  return body.settings || [];
+}
+
+/* Ask whether anything changed and fetch only if it did. Returns the new
+   settings, or null for "nothing to do".
+
+   Before the first load there is no revision to offer, so this is a plain
+   fetch. After that the usual answer is a dozen bytes. */
+async function poll() {
+  if (rev === null) return load(null);
+  const r = await fetch(`${SRC.split('?')[0]}?rev=${encodeURIComponent(rev)}`);
+  if (!r.ok) throw new Error(r.status + ' from ' + SRC);
+  const body = await r.json();
+  if ('rev' in body) rev = body.rev;
+  /* The device sends settings only when they are worth sending. */
+  return body.settings || null;
 }
 
 async function render(settings) {
@@ -225,6 +250,10 @@ function row(s, all) {
            switching tabs re-renders from that array, so a DOM-only update
            looks right until you leave the tab and come back to the old
            value. */
+        /* Our own write moved the revision. Taking it here keeps the next poll
+           from seeing a number it does not know and refetching the change we
+           just made and have already applied. */
+        if ('rev' in j) rev = j.rev;
         if ('v' in j) s.v = j.v;
         if ('set' in j) s.set = j.set;
         if ('pv' in j) s.pv = j.pv; else delete s.pv;
@@ -596,5 +625,61 @@ document.getElementById('importfile').onchange = (e) => {
   if (f) importSettings(f);
 };
 
+/* Returning to the window fetches everything, unconditionally. Always correct,
+   and the one moment where being sure costs less than being clever. */
 addEventListener('focus', () => reload(null));
+
+/* -- keeping up while the page is just sitting there -------------------- */
+
+/* Another admin writes a setting, or the device changes one itself, and this
+   page should not go on showing the old value until someone clicks on it.
+
+   Visibility rather than focus: a settings page open beside the thing it
+   configures is visible and unfocused for most of its life, which is exactly
+   when it should be keeping up. Hidden, it stops entirely -- a background tab
+   is not worth a packet on a link where the console contends with video.
+
+   Two shapes, and the tab decides which:
+
+   - a tab with a `live` value on it (uptime, free memory, the address) fetches
+     that group, because nothing bumps the revision for a value nobody wrote,
+     and a revision check would show it frozen at page load;
+   - every other tab asks whether the revision moved, and is told no in about
+     a dozen bytes.
+
+   So one request per tick either way, and on the tabs where nothing is
+   happening the device does not build a declaration to say so. */
+const POLL_MS = 4000;
+
+function tabHasLive(group) {
+  return all.some(s => (s.g || 'Other') === group && s.live);
+}
+
+async function tick() {
+  if (document.visibilityState !== 'visible') return;
+  try {
+    if (tabHasLive(current)) {
+      /* A real fetch of this tab. reload() absorbs it without replacing nodes
+         when the declaration is unchanged, which is the usual case -- so a
+         counter ticking up does not rebuild the row it sits in. */
+      await reload(current);
+      return;
+    }
+    const next = await poll();
+    if (!next) return;                       /* revision unmoved */
+    if (absorb(next, null)) { syncRows(); return; }
+    all = next;
+    render(all);
+  } catch (e) {
+    /* Quiet on purpose. A failed poll is not worth a red line in the corner of
+       a page that is otherwise fine; the next tick tries again, and a device
+       that is really gone shows up the moment someone touches a control. */
+  }
+}
+
+setInterval(tick, POLL_MS);
+/* Coming back from hidden, catch up now rather than waiting out the interval. */
+document.addEventListener('visibilitychange', () => {
+  if (document.visibilityState === 'visible') tick();
+});
 </script>
