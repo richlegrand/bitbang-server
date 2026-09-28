@@ -1375,17 +1375,22 @@ async function proxyToDevice(event) {
                                 + `<script>window.__bbSessionId=${jsonForScript(sessionId)};window.__bbJarKey=${jsonForScript(jarKey)};window.__bbDebug=${!!session?.debug};${cookieSync}</script>`
                                 + eruda
                                 + '<script src="/__bitbang__/xhr-shim.js"></script>'
-                                + '<script src="/__bitbang__/ws-shim.js"></script>'
-                                // Renders whatever the device streams, so a
-                                // device page is a <canvas> and an <audio>
-                                // rather than a decoder written in firmware.
-                                // Prepended, so its handshake listener is
-                                // installed before any of the page's own
-                                // script runs. It fetches a renderer per
-                                // codec, and only for codecs the page has an
-                                // element for, so a page that streams nothing
-                                // pays for this tag and no more.
-                                + '<script src="/__bitbang__/stream-shim.js"></script>';
+                                + '<script src="/__bitbang__/ws-shim.js"></script>';
+                            // These two and no more, because these two are the
+                            // only ones that have to precede the page's own
+                            // script: they replace window.fetch and
+                            // window.WebSocket, which page code may call on its
+                            // first line.
+                            //
+                            // stream-shim.js used to be here and is not code of
+                            // that kind -- it patches nothing, and a page loads
+                            // it with a script tag like any other library. It
+                            // was injected because it was built beside these two
+                            // and inherited their delivery. What it cost was 15
+                            // KB on every device page including the ones with no
+                            // stream element at all, and a second story for how
+                            // the library gets into a page, when
+                            // settings-panel.js already had the first one.
                             controller.enqueue(new TextEncoder().encode(shims));
                         }
                     }

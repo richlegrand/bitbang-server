@@ -1,10 +1,26 @@
 /*
  * Renders the streams a device declares, inside the device's own page.
  *
- * The service worker prepends this to every device HTML response, the same
- * way it prepends ws-shim.js, so it runs in the page and has a DOM. A service
- * worker could not do this job: no canvas, no AudioContext, nothing to draw
- * on. The worker's part is delivering the tag.
+ * A device page loads it with a script tag, like any other library:
+ *
+ *     <canvas data-bitbang-stream="cam"></canvas>
+ *     <script src="/__bitbang__/stream-shim.js"></script>
+ *
+ * It runs in the page because it needs a DOM -- a service worker could not do
+ * this job at all: no canvas, no AudioContext, nothing to draw on.
+ *
+ * The service worker used to prepend it to every device HTML response, the way
+ * it still prepends ws-shim.js and xhr-shim.js. That was wrong, and the name is
+ * the clue: those two replace window.WebSocket and window.fetch and have to be
+ * in place before the page's first line of script, so injection is the only way
+ * to deliver them. This patches nothing and has no such requirement -- it was
+ * built beside them and inherited their delivery. The bill was 15 KB on every
+ * device page including ones with no stream element, and two different stories
+ * for how the library reaches a page.
+ *
+ * The flexibility injection appeared to provide is really the attribute's: a
+ * device declares where a stream goes and what renders it can change without
+ * reflashing. That holds either way.
  *
  * What it replaces: until now each device's firmware carried its own renderer.
  * The camera page held a BroadcastChannel listener, createImageBitmap, a u-law
@@ -29,6 +45,18 @@
 
 (function () {
     'use strict';
+
+    /* Loaded twice does nothing the second time.
+     *
+     * Not hypothetical while this moves from being injected by the service
+     * worker to being a script tag in the device's own page: for one flash-and-
+     * deploy either way round, a page can carry the tag and still be served the
+     * prefix. Without this the second run installs a second handshake listener
+     * and binds every element twice. */
+    if (window.BitBang && window.BitBang.streams) {
+        return;
+    }
+
 
     /* codec -> { tags: Set, create }. Keyed by codec because the codec is what
        arrives on the wire; tag is the second key, since the same codec renders
