@@ -54,6 +54,15 @@
   .row { display:grid; grid-template-columns:12rem 1fr; gap:.35rem 1.25rem;
          align-items:baseline; padding:.55rem 0; }
   @media (max-width:34rem) { .row { grid-template-columns:1fr; } }
+  /* A heading inside a tab. Quieter than the tab labels above it and louder
+     than a row, which is the whole job: 24 rows in one column are navigable
+     because of six of these, and they must not read as a second tab bar.
+     No rule beneath it -- spacing groups the rows under it, the way spacing
+     separates the rows themselves. The first one skips its top margin so a tab
+     that opens with a heading does not start with a gap. */
+  .section { margin:1.6rem 0 .3rem; font-size:.8rem; font-weight:600;
+             letter-spacing:.06em; text-transform:uppercase; color:var(--dim); }
+  .section:first-child { margin-top:0; }
   .label { color:var(--dim); }
   .ctl { display:flex; align-items:center; gap:.6rem; flex-wrap:wrap; }
 
@@ -192,8 +201,29 @@ async function render() {
 
   const panel = document.getElementById('panel');
   panel.textContent = '';
+  /* A heading wherever `sec` changes from the row before, so the order is the
+     device's and nothing is grouped or sorted on its behalf. A row with no
+     section sits under no heading, which is how a tab declaring none at all
+     renders exactly as it used to. A table alternating between two sections gets
+     the heading twice -- the table saying something odd out loud rather than this
+     quietly tidying it.
+
+     The tab is still the unit for Restore defaults below. A button per section
+     would multiply a control whose whole point is that its scope is obvious from
+     where it sits. */
+  let shownSection = null;
   for (const s of settings) {
     if ((s.g || 'Other') !== current) continue;
+    const sec = s.sec || null;
+    if (sec !== shownSection) {
+      if (sec !== null) {
+        const h = document.createElement('div');
+        h.className = 'section';
+        h.textContent = sec;
+        panel.appendChild(h);
+      }
+      shownSection = sec;
+    }
     panel.appendChild(row(s));
   }
 
