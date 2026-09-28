@@ -561,13 +561,19 @@ async function resetGroup(group) {
        shape change into a no-op that still reported success. */
     const part = (await r.json()).settings;
     if (!Array.isArray(part)) throw new Error('reset: unexpected reply');
-    if (absorb(part, group)) {
-      syncRows();
-    } else {
-      const keys = new Set(part.map(s => s.k));
-      all = all.filter(s => !keys.has(s.k)).concat(part);
-      render(all);
-    }
+
+    /* The reply covers this tab, and a reset can move settings on others: a
+       mode returning to its default narrows or widens a range somewhere else
+       through that setting's refine hook. The device says nothing about those --
+       ?reset answers with the group it was asked about and carries no reload
+       hint -- so a page that merged only this tab kept stale rows elsewhere and
+       had no way to know.
+
+       So refetch everything. A reset is a deliberate and rare click, one full
+       fetch is always correct, and this replaces a partial merge that also got
+       the ordering wrong. `part` goes unused beyond the shape check, which is
+       worth keeping: it is what catches the reply changing shape. */
+    await reload(null);
     note(`${group} restored to defaults`, 'ok');
   } catch (e) {
     note(String(e), 'err');
@@ -631,8 +637,25 @@ async function reload(group) {
        usually finds the same firmware declaring the same things. */
     if (absorb(part, group)) { syncRows(); return; }
     if (group) {
-      const keys = new Set(part.map(s => s.k));
-      all = all.filter(s => !keys.has(s.k)).concat(part);
+      /* Replaced in place, not filtered and appended. Appending moved the
+         refetched tab to the end of `all`, so the tab bar reordered itself under
+         whoever was looking at it, and the next full fetch found `all` in a
+         different order than the device's -- which defeats absorb's
+         index-aligned compare and rebuilds every row from then on. The symptom
+         was a tab that worked until another tab had been reset.
+
+         A membership change is not expressible in place, so it falls through to
+         fetching the whole declaration, where the device's order is the
+         answer. */
+      const fresh = new Map(part.map(s => [s.k, s]));
+      const merged = all.map(s => {
+        const n = fresh.get(s.k);
+        if (n === undefined) return s;
+        fresh.delete(s.k);
+        return n;
+      });
+      if (fresh.size > 0) { all = await load(null); render(all); return; }
+      all = merged;
     } else {
       all = part;
     }
