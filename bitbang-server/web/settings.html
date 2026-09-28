@@ -144,7 +144,20 @@ async function poll() {
   return body.settings || null;
 }
 
-async function render(settings) {
+/* Reads the module-level `all` rather than taking the declarations as an
+   argument. It used to take one, and the tab buttons closed over it:
+   `render(settings)` inside b.onclick captured whichever array built the bar,
+   and the bar is only rebuilt when the set of tab *names* changes. So after
+   any `all = ...` replacement -- a range narrowing, a membership change, a
+   full refetch -- clicking a tab rendered the original array, while absorb
+   went on merging into the new one. The rows on screen were then closed over
+   objects nothing updated, so values stopped moving and a Restore defaults
+   that the device had honored changed nothing on screen.
+
+   Every caller passed `all` anyway. The parameter bought nothing and could
+   only ever disagree with it. */
+async function render() {
+  const settings = all;
   const tabs = [...new Set(settings.map(s => s.g || 'Other'))];
   if (!tabs.includes(current)) current = tabs[0];
 
@@ -167,7 +180,8 @@ async function render(settings) {
         const b = document.createElement('button');
         b.textContent = t;
         b.setAttribute('role', 'tab');
-        b.onclick = () => { current = t; render(settings); };
+        /* render() and not render(settings): a button outlives the array. */
+        b.onclick = () => { current = t; render(); };
         tabBar.appendChild(b);
       }
     }
@@ -180,7 +194,7 @@ async function render(settings) {
   panel.textContent = '';
   for (const s of settings) {
     if ((s.g || 'Other') !== current) continue;
-    panel.appendChild(row(s, settings));
+    panel.appendChild(row(s));
   }
 
   /* Restore defaults belongs on the tab it applies to. A button's scope
@@ -206,7 +220,9 @@ async function render(settings) {
   }
 }
 
-function row(s, all) {
+/* No array parameter. It had one, unused, which shadowed the module-level
+   `all` -- the same trap render() just fell into, sitting one function away. */
+function row(s) {
   const div = document.createElement('div');
   div.className = 'row';
 
@@ -654,12 +670,12 @@ async function reload(group) {
         fresh.delete(s.k);
         return n;
       });
-      if (fresh.size > 0) { all = await load(null); render(all); return; }
+      if (fresh.size > 0) { all = await load(null); render(); return; }
       all = merged;
     } else {
       all = part;
     }
-    render(all);
+    render();
   } catch (e) {
     document.getElementById('err').textContent = String(e);
   }
@@ -669,7 +685,7 @@ let all = [];
 (async () => {
   try {
     all = await load(null);
-    render(all);
+    render();
   } catch (e) {
     /* Names the two things that are actually wrong when this fires: no session
        to carry the request, or a device that has settings switched off. The
@@ -738,7 +754,7 @@ async function tick() {
     if (!next) return;                       /* revision unmoved */
     if (absorb(next, null)) { syncRows(); return; }
     all = next;
-    render(all);
+    render();
   } catch (e) {
     /* Quiet on purpose. A failed poll is not worth a red line in the corner of
        a page that is otherwise fine; the next tick tries again, and a device
