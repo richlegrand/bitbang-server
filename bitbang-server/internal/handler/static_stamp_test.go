@@ -22,6 +22,7 @@ func stampDir(t *testing.T) string {
 		"ws-shim.js":        "// ws shim\n",
 		"xhr-shim.js":       "// xhr shim\n",
 		"stream-shim.js":    "// stream shim\n",
+		"bitbang.js":        "// loader\n",
 		"settings.html":     "<html><!-- settings --></html>",
 		"settings-panel.js": "// settings panel\n",
 		"console.html":      "<html><!-- console --></html>",

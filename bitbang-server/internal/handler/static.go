@@ -56,6 +56,8 @@ var stampInputs = []string{
 	"ws-shim.js",
 	"xhr-shim.js",
 	"stream-shim.js",
+	// The loader a device page includes, which decides what else to fetch.
+	"bitbang.js",
 	// Temporary: leaves with settings.html when the config page becomes a plugin.
 	"settings.html",
 	// The panel settings.html mounts, and that a device page mounts too through
@@ -116,8 +118,11 @@ func serveStamped(w http.ResponseWriter, staticDir, name, stamp string) {
 // Anything else returns 404. A new browser-runtime asset has to be added here
 // or it 404s at load time with no other symptom.
 var allowedBitbangAssets = map[string]bool{
-	"sw.js":          true,
-	"bootstrap.js":   true,
+	"sw.js":        true,
+	"bootstrap.js": true,
+	// The one asset a device page names. Everything behind it can be renamed or
+	// split; this cannot, because it is compiled into firmware.
+	"bitbang.js":     true,
 	"ws-shim.js":     true,
 	"xhr-shim.js":    true,
 	"stream-shim.js": true, // renders whatever a device streams, in its page
