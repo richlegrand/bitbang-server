@@ -2064,6 +2064,16 @@ class BitBangConnection {
             // "direct" (bitbang-python WSGI/ASGI, or missing = safe
             // default) means the whole path belongs to the app -- no
             // target segment; all paths under this UID share cookies.
+            /* What the device says it can do, kept for the page rather than
+               used here. A cap names a reserved endpoint it answers -- settings,
+               console, ota -- so a page can offer what is actually there, which
+               the device is the only thing that knows. Nothing in bootstrap
+               renders differently because of one; it is data on its way through.
+
+               Deliberately not what decides which library a page loads: every
+               device has settings and almost no page embeds the panel. An
+               element in the page is the signal for that. */
+            this.caps = Array.isArray(msg.caps) ? msg.caps.slice() : [];
             this.routing = msg.routing || 'direct';
             if (this.routing === 'target-prefix') {
                 this.target = (this.devicePath || '/').split('/').filter(Boolean)[0] || '';
@@ -2456,6 +2466,12 @@ class BitBangConnection {
             sessionId: this.sessionId,
             uid: this.uid,
             target: this.target || 'device',
+            /* Passed through, not used for routing: the worker writes these
+               into the device page the same way it writes the session id, so a
+               page can offer what the device actually answers. Available by now
+               because this runs after the transport is ready, which is after the
+               device's `ready` message -- the same reason this.target is set. */
+            caps: this.caps || [],
             // The access code is a URL-fragment secret the SW can't see
             // by itself (fragments never reach the SW). Passing it here
             // lets the SW construct correct redirect URLs for popups from

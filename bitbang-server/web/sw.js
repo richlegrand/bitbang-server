@@ -159,6 +159,11 @@ self.addEventListener('message', async (event) => {
             clientId: event.source.id,
             uid: uid,
             target: event.data.target || 'device',
+            /* What the device says it answers. Nothing here routes on them --
+               they are written into the page below, the way the session id is,
+               because the page is what decides whether to offer a Console
+               button and the device is what knows whether there is one. */
+            caps: Array.isArray(event.data.caps) ? event.data.caps : [],
             // code is the URL-fragment access secret; used by
             // redirectViaActiveSession to build correct 302 targets for
             // popups from proxied apps.
@@ -1372,7 +1377,7 @@ async function proxyToDevice(event) {
                                 ? '<script src="https://cdn.jsdelivr.net/npm/eruda" onload="eruda.init();eruda.position({x:innerWidth-60,y:innerHeight-60})"></script>'
                                 : '';
                             const shims = '<!DOCTYPE html>'
-                                + `<script>window.__bbSessionId=${jsonForScript(sessionId)};window.__bbJarKey=${jsonForScript(jarKey)};window.__bbDebug=${!!session?.debug};${cookieSync}</script>`
+                                + `<script>window.__bbSessionId=${jsonForScript(sessionId)};window.__bbJarKey=${jsonForScript(jarKey)};window.__bbDebug=${!!session?.debug};window.__bbCaps=${jsonForScript(session?.caps || [])};${cookieSync}</script>`
                                 + eruda
                                 + '<script src="/__bitbang__/xhr-shim.js"></script>'
                                 + '<script src="/__bitbang__/ws-shim.js"></script>';
