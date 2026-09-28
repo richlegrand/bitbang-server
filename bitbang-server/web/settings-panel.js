@@ -847,3 +847,54 @@ export function mount(host, opts = {}) {
     if (document.visibilityState === 'visible') tick();
   });
 }
+
+/*
+ * Mount into every element that asked, when this module is loaded.
+ *
+ * So a sketch's page is one line of markup and one of script:
+ *
+ *     <div data-bitbang-page="settings"></div>
+ *     <script type="module" src="/__bitbang__/settings-panel.js"></script>
+ *
+ * Here rather than in an injected shim, which is where this first went. The
+ * service worker injects ws-shim and xhr-shim because those replace
+ * window.WebSocket and window.fetch and have to run before the page's own
+ * script -- there is no other way to do it. Nothing about this is like that: it
+ * is an ordinary module that talks to the device over fetch, and any script tag
+ * can load it.
+ *
+ * The stream library is injected for a different reason again, and one that does
+ * not transfer: injection means a device already in the field renders new codecs
+ * without being reflashed. A panel needs data-bitbang-page in the page's HTML,
+ * which only firmware someone reflashed has -- and the same reflash could have
+ * added this script tag. So injection would buy nothing here and would cost a
+ * request on every device page, including the ones that want no panel.
+ *
+ * Explicit mount() is still exported, for a page that wants to choose the moment
+ * or pass chrome:true. This is the convenient case, not the only one.
+ */
+function mountDeclared() {
+    for (const el of document.querySelectorAll('[data-bitbang-page]')) {
+        const name = el.getAttribute('data-bitbang-page');
+        /* One module, one panel it knows how to be. A page asking for a console
+           here is asking the wrong file, and saying so beats rendering settings
+           under the wrong heading. */
+        if (name !== 'settings') {
+            console.error(`[settings] this module renders "settings", not "${name}"`);
+            continue;
+        }
+        if (el.shadowRoot) continue;          /* already mounted */
+        /* Embedded: the sketch chose the column, so no title row and no export
+           or import -- those act on the whole device and belong on the page that
+           is only settings. */
+        mount(el, { chrome: false });
+    }
+}
+
+/* A module script is deferred, so the document is normally parsed by the time
+   this runs. The check is for a page that imports it dynamically and early. */
+if (document.readyState === 'loading') {
+    document.addEventListener('DOMContentLoaded', mountDeclared);
+} else {
+    mountDeclared();
+}
