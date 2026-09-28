@@ -343,4 +343,45 @@
        load-time scan cannot serve that case and watching the document would be
        more code, permanently running, for the same result. */
     window.BitBang.streams.rescan = bind;
+
+    /* -- meta-pages mounted into the sketch's own layout --
+     *
+     * <div data-bitbang-page="settings"></div> and the settings panel renders
+     * there, in the sketch's column, at the width the sketch chose. The
+     * attribute reads like data-bitbang-stream above and is scanned the same
+     * way, which is why this lives here: the shim is already the thing that
+     * looks at the page for places to put something.
+     *
+     * Same convention as the renderers -- <name>-panel.js -- so it becomes a
+     * lookup when plugins arrive and nothing else changes. A name with no module
+     * behind it logs that, which is the useful failure: console and ota have no
+     * panel yet, and asking for one should say so rather than do nothing.
+     *
+     * Nothing here waits on the port. A panel talks to the device over fetch,
+     * and a fetch from this page resolves against this page's own URL, so it
+     * reaches the right device with no handshake -- unlike a stream, which needs
+     * bootstrap to hand a port over first.
+     *
+     * Embedded, so chrome:false: no title row, and no export or import. Those
+     * act on the whole device and belong on the page that is only settings. */
+    async function mountPages() {
+        for (const el of document.querySelectorAll('[data-bitbang-page]')) {
+            const name = el.getAttribute('data-bitbang-page');
+            if (!name || el.shadowRoot) continue;
+            try {
+                const mod = await import(asset(name + '-panel.js'));
+                mod.mount(el, { chrome: false });
+            } catch (err) {
+                console.error(`[pages] ${name}: ${err.message}`);
+            }
+        }
+    }
+
+    /* The shim is the first script in the response, so the elements it is
+       looking for have not been parsed yet. */
+    if (document.readyState === 'loading') {
+        document.addEventListener('DOMContentLoaded', mountPages);
+    } else {
+        mountPages();
+    }
 })();

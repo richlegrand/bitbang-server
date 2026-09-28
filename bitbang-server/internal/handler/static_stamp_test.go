@@ -16,18 +16,19 @@ func stampDir(t *testing.T) string {
 	t.Helper()
 	dir := t.TempDir()
 	files := map[string]string{
-		"bootstrap.html":  "<html><!-- FRONT_PAGE --></html>",
-		"bootstrap.js":    "const BUILD = '" + buildPlaceholder + "';\n",
-		"sw.js":           "const BUILD = '" + buildPlaceholder + "';\n",
-		"ws-shim.js":      "// ws shim\n",
-		"xhr-shim.js":     "// xhr shim\n",
-		"stream-shim.js":  "// stream shim\n",
+		"bootstrap.html":    "<html><!-- FRONT_PAGE --></html>",
+		"bootstrap.js":      "const BUILD = '" + buildPlaceholder + "';\n",
+		"sw.js":             "const BUILD = '" + buildPlaceholder + "';\n",
+		"ws-shim.js":        "// ws shim\n",
+		"xhr-shim.js":       "// xhr shim\n",
+		"stream-shim.js":    "// stream shim\n",
 		"settings.html":     "<html><!-- settings --></html>",
-		"console.html":    "<html><!-- console --></html>",
-		"ota.html":        "<html><!-- firmware --></html>",
-		"pcm-ring.js":     "// pcm ring\n",
-		"render-mjpeg.js": "// mjpeg\n",
-		"render-ulaw.js":  "// ulaw\n",
+		"settings-panel.js": "// settings panel\n",
+		"console.html":      "<html><!-- console --></html>",
+		"ota.html":          "<html><!-- firmware --></html>",
+		"pcm-ring.js":       "// pcm ring\n",
+		"render-mjpeg.js":   "// mjpeg\n",
+		"render-ulaw.js":    "// ulaw\n",
 	}
 	for name, body := range files {
 		if err := os.WriteFile(filepath.Join(dir, name), []byte(body), 0o644); err != nil {
