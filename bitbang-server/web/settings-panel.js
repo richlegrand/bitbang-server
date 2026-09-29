@@ -55,13 +55,7 @@ const STYLE = `
   /* On :host too, since there is no body in here. The standalone page sets its
      own background and the host stretches to it; embedded, the sketch decides
      the width and this fills it. */
-  :host { font:15px/1.45 var(--font); padding:1.25rem 1rem; max-width:42rem;
-          /* The panel asks about its own width, not the window's. Every
-             narrow-width rule below was dead in an embedded panel without this:
-             a media query measures the viewport, so a 300px column inside a
-             1400px window kept the wide layout and squeezed the controls into
-             what the labels left over. */
-          container-type: inline-size; }
+  :host { font:15px/1.45 var(--font); padding:1.25rem 1rem; max-width:42rem; }
   /* Embedded in a sketch's own layout: it chose the column, so the padding and
      the reading-width cap are its business rather than ours. */
   :host([data-bb-embedded]) { padding:0; max-width:none; }
@@ -76,24 +70,32 @@ const STYLE = `
 
   /* No rules between rows -- spacing separates them, and a settings page that
      is merely calm reads as deliberate. */
-  /* em, not rem. rem is the document's font size, which a host page sets and
-     this cannot see: the camera page picks 12px for the panel and the label
-     column stayed 176px of a 280px column -- 63% for labels, about 100px for
-     the control. em tracks whatever size the host chose. */
-  .row { display:grid; grid-template-columns:11em 1fr; gap:.1rem 1rem;
-         align-items:baseline; padding:.28rem 0; }
-  /* Stacked below this, which is what a 300px column gets: label on its own
-     line, control with the full width under it. px because a container query's
-     em resolves against the container's own font size, and a threshold that
-     moves when the host restyles the panel is a threshold nobody can reason
-     about. */
-  @container (max-width: 420px) {
-    .row { grid-template-columns:1fr; gap:0; padding:.35rem 0; }
-    /* Label and control belong together, so the space between a pair has to be
-       smaller than the space between rows -- otherwise every label reads as a
-       heading for the row under it. */
-    .label { margin-bottom:.05rem; }
-  }
+  /* A wrapping line, not a grid with a breakpoint.
+     
+     Each control takes a second line only when it does not fit on the first, and
+     the ones that do fit all start at the same x because the label's basis is
+     fixed -- so a column of checkboxes and selects lines up while the sliders
+     beside them wrap. A breakpoint cannot do that: it moves every row at once,
+     at a width somebody guessed.
+     
+     em and not rem throughout. rem is the document's font size, which a host
+     page sets and this cannot see: the camera page picks 12px for the panel, and
+     an 11rem label column stayed 176px of a 280px column -- 63% of it, leaving
+     about 100px for the control. em tracks whatever size the host chose. */
+  .row { display:flex; flex-wrap:wrap; align-items:baseline;
+         column-gap:1em; row-gap:.1rem; padding:.28rem 0; }
+  .label { flex:0 1 11em; min-width:6em; }
+  .ctl   { flex:1 1 auto; }
+
+  /* What each kind of control asks for before it would rather have its own line.
+     Set here and chosen in row(), where the type is already known, rather than
+     inferred back out of the DOM by a selector.
+     
+     A checkbox and a button ask for nothing and so never wrap. A select or a
+     number fits beside an 11em label in a 300px column. A slider with its value,
+     or a text field, does not. */
+  .ctl.narrow { min-width:7em; }
+  .ctl.wide   { min-width:13em; flex-wrap:nowrap; }
   /* A heading inside a tab. Quieter than the tab labels above it and louder
      than a row, which is the whole job: 24 rows in one column are navigable
      because of six of these, and they must not read as a second tab bar.
@@ -136,10 +138,21 @@ const STYLE = `
   .foot { margin-top:1rem; padding-top:.7rem; border-top:1px solid var(--line); }
   button.danger { border-color:var(--bad); color:var(--bad); }
 
-  .unit, .bound, .note, .ro { color:var(--dim); font-size:.85rem; }
+  .unit, .bound, .note, .ro { color:var(--dim); font-size:.85em; }
+  /* A device URL is 55 characters with no space in it, so it overflows a 280px
+     column and takes the layout with it. Broken anywhere rather than truncated,
+     because the reason this row exists is to be copied, and you cannot select
+     what an ellipsis hid. */
+  .ro { overflow-wrap:anywhere; }
   .track { display:inline-flex; align-items:center; gap:.5rem; }
   .value { font-variant-numeric:tabular-nums; margin-left:.4rem; }
-  .state { font-size:.85rem; color:var(--dim); min-height:1.2em; }
+  /* The reserved line stops the row jumping when a write answers. Reserved only
+     on rows that can be written: a readonly row never has a message, and paying
+     a line each for the six on the Device tab is most of a screen in a narrow
+     column -- which is where the gap under the URL came from, the empty box
+     wrapping onto its own line because the URL had filled the first. */
+  .state { font-size:.85em; color:var(--dim); min-height:1.2em; }
+  .row.readonly .state { min-height:0; }
   .state.err { color:var(--bad); }
   .state.ok  { color:var(--ok); }`;
 
@@ -419,6 +432,9 @@ export function mount(host, opts = {}) {
     const syncable = (el) => el !== root.activeElement && !inflight.get(s.k);
 
     if (s.ro) {
+      /* No message can appear on a row that cannot be written, so it reserves
+         no line for one. */
+      div.classList.add('readonly');
       const span = document.createElement('span');
       span.className = 'ro';
       /* Text, not a disabled input -- a disabled box reads as broken rather
@@ -449,6 +465,7 @@ export function mount(host, opts = {}) {
       input = document.createElement('input');
       input.type = 'checkbox';
       input.checked = !!s.v;
+      /* No class: a checkbox is 1em wide and never wants a line of its own. */
       input.onchange = () => send({ k: s.k, v: input.checked });
       sync = () => { if (syncable(input)) input.checked = !!s.v; };
       ctl.appendChild(input);
@@ -483,6 +500,7 @@ export function mount(host, opts = {}) {
       input.value = s.v;
       input.onchange = () => send({ k: s.k, v: input.value });
       sync = () => { if (syncable(input)) input.value = s.v; };
+      ctl.classList.add('narrow');
       ctl.appendChild(input);
     } else if (s.t === 'int' || s.t === 'float') {
       const slider = s.r === 'slider' && s.min !== undefined;
@@ -511,6 +529,9 @@ export function mount(host, opts = {}) {
         track.className = 'track';
         track.append(lo, input, hi);
         out.className = 'value';
+        /* The track and its value are one thing: the row wraps around them
+           rather than the number dropping below the slider. */
+        ctl.classList.add('wide');
         /* The readout is part of the value, so it moves with it. Skipped while
            the slider is being dragged, which is what activeElement catches. */
         sync = () => {
@@ -522,6 +543,7 @@ export function mount(host, opts = {}) {
       } else {
         input.onchange = () => send({ k: s.k, v: Number(input.value) });
         sync = () => { if (syncable(input)) input.value = s.v; };
+        ctl.classList.add('narrow');
         ctl.appendChild(input);
         if (s.min !== undefined) {
           const b = document.createElement('span');
@@ -551,6 +573,7 @@ export function mount(host, opts = {}) {
         if (s.secret) input.placeholder = place();
         else input.value = s.v ?? '';
       };
+      ctl.classList.add('wide');
       ctl.appendChild(input);
     }
 
