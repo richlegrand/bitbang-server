@@ -149,17 +149,13 @@ const STYLE = `
   :host([data-bb-collapsed]) #top > .action:not(#fold) { display:none; }
   :host([data-bb-collapsed]) #top { margin-bottom:0; }
 
-  /* 1fr to 0fr, which interpolates to the content's own height with nothing
-     measured and no number guessed. The inner element carries overflow:hidden,
-     because a grid row of zero height still shows what overflows it. */
-  #fold-wrap { display:grid; grid-template-rows:1fr;
-               transition:grid-template-rows .22s ease; }
-  #fold-inner { overflow:hidden; min-height:0; }
-  :host([data-bb-collapsed]) #fold-wrap { grid-template-rows:0fr; }
-  /* Someone who asked for less motion gets the same outcome without it. */
-  @media (prefers-reduced-motion: reduce) {
-    #fold-wrap { transition:none; }
-  }
+  /* Out of flow the moment it is folded, in the same rule that the page's own
+     collapsed width keys off. That matters: while the settings are in flow they
+     have a width, so a host sized to its content would size itself to the
+     widest row -- wider than the column it was -- for as long as the two were
+     out of step. Nothing here animates; the animation is the column's, in
+     apply() below. */
+  :host([data-bb-collapsed]) #fold-wrap { display:none; }
   .foot { margin-top:1rem; padding-top:.7rem; border-top:1px solid var(--line); }
   button.danger { border-color:var(--bad); color:var(--bad); }
 
@@ -205,17 +201,14 @@ const ACTIONS = `
    the actions beside it are omitted. */
 const TOGGLE = `<button class="action" id="fold" aria-expanded="true">Hide</button>`;
 
-/* Everything that folds lives in one wrapper, because the animation works by
-   taking a grid row from 1fr to 0fr: the row has to contain the content for the
-   browser to interpolate its height without anyone measuring it. max-height
-   with a guessed number is the usual alternative and eases wrong -- fast then
-   stalling, or stalling then snapping, depending on how far off the guess was. */
+/* Everything but the toggle row lives in one wrapper, so folding is one rule
+   about one element rather than three about three. */
 const PANEL = `
-<div id="fold-wrap"><div id="fold-inner">
+<div id="fold-wrap">
   <div id="tabs" role="tablist"></div>
   <div id="panel"></div>
   <div id="err" class="state err"></div>
-</div></div>`;
+</div>`;
 
 /*
  * Render into `host`.
@@ -225,9 +218,10 @@ const PANEL = `
  *   opts.actions  export and import. Default true everywhere, embedded
  *                 included -- see ACTIONS above for why that changed.
  *   opts.collapsible
- *                 a toggle that folds everything below it away, leaving the
+ *                 a toggle that puts everything below it away, leaving the
  *                 toggle. Default false. The host gets data-bb-collapsed while
- *                 folded, which is how a page shrinks the column around it.
+ *                 folded; the page says what that is worth in width, and this
+ *                 animates the host between the two.
  *
  * Everything below lives in this function rather than at module scope, so two
  * panels on one page would not share `all`, `rev` or the in-flight map. Nothing
@@ -926,7 +920,10 @@ export function mount(host, opts = {}) {
     const KEY = 'bb-settings-folded:' + location.pathname;
     try { folded = localStorage.getItem(KEY) === '1'; } catch (e) { /* fine */ }
 
-    const apply = (next) => {
+    /* The state, and only the state. Applying it is one change of one attribute
+       and the stylesheet does the rest, so there is never a moment where the
+       panel is half in one state and half in the other. */
+    const setState = (next) => {
       folded = next;
       host.toggleAttribute('data-bb-collapsed', folded);
       fold.textContent = folded ? 'Settings' : 'Hide';
@@ -934,15 +931,66 @@ export function mount(host, opts = {}) {
       try { localStorage.setItem(KEY, folded ? '1' : '0'); } catch (e) { /* fine */ }
     };
 
-    /* The restored state is applied with the transition off, so a panel left
-       folded does not open and animate shut in front of you on every load. */
-    wrap.style.transition = 'none';
-    apply(folded);
-    requestAnimationFrame(() => { wrap.style.transition = ''; });
+    const DUR = 220;
+    const stillness = matchMedia('(prefers-reduced-motion: reduce)');
+    let anim = null;
+
+    /*
+     * What moves is the column, not the rows inside it.
+     *
+     * The first version folded the rows away over 220ms and left the width to
+     * the page, and it flashed: the attribute that starts the fold is the one
+     * the page's collapsed width keys off, so for the length of the animation
+     * the column was shrink-to-fit around settings that were still in flow. It
+     * sized to the widest row, which is wider than the 300px it had been, and
+     * the video was squeezed before it was given anything back.
+     *
+     * Measure, then animate. The width the column has now, the width it has in
+     * the new state -- both read from a layout that is settled and correct --
+     * and the host moved between the two. The intermediate layout that flashed
+     * does not exist any more: the settings leave flow in the same style rule
+     * that narrows the column, so there is no frame where one has happened and
+     * the other has not. Nothing in between is painted; `to` is measured and
+     * the animation starts before the frame ends.
+     *
+     * Reading `from` off the current rect rather than remembering where the
+     * column started is what makes a click during an animation behave: it
+     * carries on from wherever it had reached.
+     */
+    const apply = (next) => {
+      const from = host.getBoundingClientRect().width;
+      setState(next);
+      const to = host.getBoundingClientRect().width;
+      if (stillness.matches || Math.abs(to - from) < 1) return;
+
+      /* Opening, the settings are back in flow and would lay out to each
+         intermediate width in turn, so the rows rewrap all the way out. Pinned
+         to the width they have when open and clipped by the host, they sit
+         still and the column uncovers them. Closing needs neither: they are
+         already out of flow. */
+      if (!folded) wrap.style.width = wrap.getBoundingClientRect().width + 'px';
+      host.style.overflow = 'hidden';
+
+      anim?.cancel();
+      anim = host.animate([{ width: from + 'px' }, { width: to + 'px' }],
+                          { duration: DUR, easing: 'ease' });
+      /* No fill, so the width goes back to the stylesheet's when it ends --
+         which is the width just animated to. A cancelled animation leaves the
+         cleanup to whichever call cancelled it, since that one is mid-flight
+         and still needs the pin and the clipping. */
+      anim.finished.then(() => {
+        wrap.style.width = '';
+        host.style.overflow = '';
+      }, () => {});
+    };
+
+    /* The remembered state, put on directly. apply() is for a change someone
+       is watching; this one was decided on a previous visit. */
+    setState(folded);
 
     fold.onclick = () => {
       apply(!folded);
-      /* Unfolding is when the values are most likely stale, since the poll has
+      /* Opening is when the values are most likely stale, since the poll has
          been off for as long as it was shut. */
       if (!folded) tick();
     };
