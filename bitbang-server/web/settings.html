@@ -43,7 +43,8 @@
 <script type="module">
 import { mount } from '/__bitbang__/settings-panel.js';
 
-/* Standalone, so the chrome stays: the title, and export and import, which act
-   on the whole device and read as page-level actions. */
-mount(document.getElementById('app'), { chrome: true });
+/* Standalone: both defaults, so nothing to pass. The title is wanted here --
+   nothing else on this page says what it is -- and the actions are on
+   everywhere. */
+mount(document.getElementById('app'));
 </script>

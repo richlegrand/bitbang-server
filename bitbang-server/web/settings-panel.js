@@ -55,12 +55,18 @@ const STYLE = `
   /* On :host too, since there is no body in here. The standalone page sets its
      own background and the host stretches to it; embedded, the sketch decides
      the width and this fills it. */
-  :host { font:15px/1.45 var(--font); padding:1.25rem 1rem; max-width:42rem; }
+  :host { font:15px/1.45 var(--font); padding:1.25rem 1rem; max-width:42rem;
+          /* The panel asks about its own width, not the window's. Every
+             narrow-width rule below was dead in an embedded panel without this:
+             a media query measures the viewport, so a 300px column inside a
+             1400px window kept the wide layout and squeezed the controls into
+             what the labels left over. */
+          container-type: inline-size; }
   /* Embedded in a sketch's own layout: it chose the column, so the padding and
      the reading-width cap are its business rather than ours. */
   :host([data-bb-embedded]) { padding:0; max-width:none; }
   h1 { font-size:.8rem; font-weight:600; letter-spacing:.08em; text-transform:uppercase;
-       color:var(--dim); margin:0 0 .8rem; }
+       color:var(--dim); margin:0 0 .5rem; }
 
   #tabs { display:flex; gap:1rem; flex-wrap:wrap; margin-bottom:.9rem; }
   #tabs button { font:inherit; background:none; border:0; padding:0 0 .4rem; cursor:pointer;
@@ -70,9 +76,24 @@ const STYLE = `
 
   /* No rules between rows -- spacing separates them, and a settings page that
      is merely calm reads as deliberate. */
-  .row { display:grid; grid-template-columns:11rem 1fr; gap:.1rem 1rem;
+  /* em, not rem. rem is the document's font size, which a host page sets and
+     this cannot see: the camera page picks 12px for the panel and the label
+     column stayed 176px of a 280px column -- 63% for labels, about 100px for
+     the control. em tracks whatever size the host chose. */
+  .row { display:grid; grid-template-columns:11em 1fr; gap:.1rem 1rem;
          align-items:baseline; padding:.28rem 0; }
-  @media (max-width:34rem) { .row { grid-template-columns:1fr; } }
+  /* Stacked below this, which is what a 300px column gets: label on its own
+     line, control with the full width under it. px because a container query's
+     em resolves against the container's own font size, and a threshold that
+     moves when the host restyles the panel is a threshold nobody can reason
+     about. */
+  @container (max-width: 420px) {
+    .row { grid-template-columns:1fr; gap:0; padding:.35rem 0; }
+    /* Label and control belong together, so the space between a pair has to be
+       smaller than the space between rows -- otherwise every label reads as a
+       heading for the row under it. */
+    .label { margin-bottom:.05rem; }
+  }
   /* A heading inside a tab. Quieter than the tab labels above it and louder
      than a row, which is the whole job: 24 rows in one column are navigable
      because of six of these, and they must not read as a second tab bar.
@@ -97,7 +118,9 @@ const STYLE = `
   /* Size the control to the value: a port number does not get a full-width box. */
   input[type=number] { width:7rem; text-align:right; }
   input[type=text], input[type=password] { width:100%; max-width:20rem; }
-  input[type=range] { width:100%; max-width:11rem; border:0; padding:0; }
+  /* Fills what it is given, up to a comfortable length. The max was 11rem and
+     so unrelated to the panel's own scale. */
+  input[type=range] { width:100%; max-width:14em; border:0; padding:0; }
   input[type=checkbox], input[type=radio] { width:auto; border:0; padding:0; }
   label { display:inline-flex; align-items:center; gap:.3rem; }
 
@@ -105,8 +128,11 @@ const STYLE = `
   button.action:hover { border-color:var(--accent); }
   /* Export and import act on the whole device, so they sit with the title
      rather than inside a tab. Restore defaults is per tab and sits with it. */
-  h1 { display:flex; align-items:baseline; gap:.75rem; flex-wrap:wrap; }
-  #top { margin-left:auto; display:flex; gap:.5rem; font-size:.85rem; font-weight:400; }
+  /* Its own row now, since the actions outlive the title. Right-aligned so it
+     reads as a toolbar rather than as the first setting, and it wraps rather
+     than widening the column. */
+  #top { display:flex; justify-content:flex-end; gap:.5rem; flex-wrap:wrap;
+         font-size:.85em; margin:0 0 .7rem; }
   .foot { margin-top:1rem; padding-top:.7rem; border-top:1px solid var(--line); }
   button.danger { border-color:var(--bad); color:var(--bad); }
 
@@ -117,15 +143,25 @@ const STYLE = `
   .state.err { color:var(--bad); }
   .state.ok  { color:var(--ok); }`;
 
-/* The chrome is the title row and the whole-device actions. An embedded panel
-   drops both: in a narrow column the header is most of what you see, and export
-   and import are page-level operations rather than column-level ones. */
-const CHROME = `
-<h1>Settings<span id="top">
+/* Two separable pieces, not one "chrome".
+ *
+ * The title goes when embedded, because the page has already said what this is:
+ * a 300px column headed SETTINGS does not want a second Settings inside it.
+ *
+ * The actions stay. They were dropped alongside the title at first, reasoning
+ * that whole-device operations belong on a whole-device page -- which sounded
+ * right and was wrong in practice, because the embedded panel is where the work
+ * happens, so export and import ended up reachable only by constructing a URL.
+ * Two small buttons cost less than that. */
+const TITLE = `<h1>Settings</h1>`;
+
+/* Their own row rather than inside the title, since they now outlive it. */
+const ACTIONS = `
+<div id="top">
   <button class="action" id="export">Export</button>
   <button class="action" id="import">Import</button>
   <input type="file" id="importfile" accept="application/json,.json" hidden>
-</span></h1>`;
+</div>`;
 
 const PANEL = `
 <div id="tabs" role="tablist"></div>
@@ -133,16 +169,23 @@ const PANEL = `
 <div id="err" class="state err"></div>`;
 
 /*
- * Render into `host`. `opts.chrome` false drops the title and the export and
- * import buttons, which is what an embedded panel wants.
+ * Render into `host`.
+ *
+ *   opts.title    the "Settings" heading. Default true; the embedded mount
+ *                 passes false, because the page supplies its own label.
+ *   opts.actions  export and import. Default true everywhere, embedded
+ *                 included -- see ACTIONS above for why that changed.
  *
  * Everything below lives in this function rather than at module scope, so two
  * panels on one page would not share `all`, `rev` or the in-flight map. Nothing
  * mounts two today; it costs a closure to not have to remember that.
  */
 export function mount(host, opts = {}) {
-  const chrome = opts.chrome !== false;
-  if (!chrome) host.setAttribute('data-bb-embedded', '');
+  const title = opts.title !== false;
+  const actions = opts.actions !== false;
+  /* Marks the host so the stylesheet can drop the page padding and the reading
+     width cap: embedded, the sketch chose the column. */
+  if (!title) host.setAttribute('data-bb-embedded', '');
 
   const root = host.attachShadow({ mode: 'open' });
   const style = document.createElement('style');
@@ -150,7 +193,7 @@ export function mount(host, opts = {}) {
   root.appendChild(style);
 
   const frag = document.createElement('div');
-  frag.innerHTML = (chrome ? CHROME : '') + PANEL;
+  frag.innerHTML = (title ? TITLE : '') + (actions ? ACTIONS : '') + PANEL;
   while (frag.firstChild) root.appendChild(frag.firstChild);
 
   const SRC = new URLSearchParams(location.search).get('src') || '/__bitbang/settings';
@@ -773,10 +816,8 @@ export function mount(host, opts = {}) {
 
   /* Values move without us: another admin edits, an action lands late. Refetch
      when the window comes back rather than polling. */
-  /* Only present when the chrome is. Export and import act on the whole device,
-     which reads as a page-level action and not as something belonging in a 300px
-     column beside a video, so an embedded panel does not carry them. */
-  if (chrome) {
+  /* Present unless the caller said otherwise. */
+  if (actions) {
     root.getElementById('export').onclick = exportSettings;
     root.getElementById('import').onclick = () =>
       root.getElementById('importfile').click();
@@ -871,7 +912,7 @@ export function mount(host, opts = {}) {
  * request on every device page, including the ones that want no panel.
  *
  * Explicit mount() is still exported, for a page that wants to choose the moment
- * or pass chrome:true. This is the convenient case, not the only one.
+ * or pass title:true. This is the convenient case, not the only one.
  */
 function mountDeclared() {
     for (const el of document.querySelectorAll('[data-bitbang-page]')) {
@@ -884,10 +925,13 @@ function mountDeclared() {
             continue;
         }
         if (el.shadowRoot) continue;          /* already mounted */
-        /* Embedded: the sketch chose the column, so no title row and no export
-           or import -- those act on the whole device and belong on the page that
-           is only settings. */
-        mount(el, { chrome: false });
+        /* No title: the page has already labelled the column. Actions stay,
+           which is the default -- this is where the work happens, so making
+           export and import need a hand-built URL was the wrong call.
+           data-bitbang-omit="actions" turns them off for a page that wants the
+           column bare. */
+        const omit = (el.getAttribute('data-bitbang-omit') || '').split(/\s+/);
+        mount(el, { title: false, actions: omit.indexOf('actions') < 0 });
     }
 }
 
