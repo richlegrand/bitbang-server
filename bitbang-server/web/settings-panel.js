@@ -85,6 +85,12 @@ const STYLE = `
   .row { display:flex; flex-wrap:wrap; align-items:baseline;
          column-gap:1em; row-gap:.1rem; padding:.28rem 0; }
   .label { flex:0 1 11em; min-width:6em; }
+  /* A label with a hint says so. Nobody hovers something that looks inert, and
+     a dotted underline is the one convention for "there is an explanation
+     here" that costs no vertical space -- which matters when the alternative
+     was two extra lines on every row. */
+  .label.hinted { text-decoration:underline dotted; text-underline-offset:.2em;
+                  cursor:help; }
   .ctl   { flex:1 1 auto; }
 
   /* What each kind of control asks for before it would rather have its own line.
@@ -359,6 +365,20 @@ export function mount(host, opts = {}) {
     const l = document.createElement('div');
     l.className = 'label';
     l.textContent = label(s);
+    /* The browser's own tooltip. No layout, no positioning inside a 300px
+       column, and no background color to match against the host -- which the
+       styled version would need, and which would be a seventh custom property
+       in the contract.
+     
+       On the row rather than the label, so hovering anywhere across it works,
+       including the control. What it does not do is touch: there is no hover
+       there, and a tap reveals nothing. That is the known gap, and the fix if
+       this proves worth keeping is :focus-within with the hint positioned
+       absolutely so it does not shove the rows below it down the column. */
+    if (s.hint) {
+      div.title = s.hint;
+      l.classList.add('hinted');
+    }
     div.appendChild(l);
 
     const ctl = document.createElement('div');
