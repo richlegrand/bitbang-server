@@ -140,7 +140,26 @@ const STYLE = `
      reads as a toolbar rather than as the first setting, and it wraps rather
      than widening the column. */
   #top { display:flex; justify-content:flex-end; gap:.5rem; flex-wrap:wrap;
-         font-size:.85em; margin:0 0 .7rem; }
+         align-items:center; font-size:.85em; margin:0 0 .7rem; }
+  /* The toggle to the left of the actions, so omitting them does not move it. */
+  #fold { margin-right:auto; }
+  /* Folded, the row is the whole panel, and export and import are not what a
+     strip is for -- they would widen it and act on settings nobody can see.
+     They are one click away, which is the click that already happened. */
+  :host([data-bb-collapsed]) #top > .action:not(#fold) { display:none; }
+  :host([data-bb-collapsed]) #top { margin-bottom:0; }
+
+  /* 1fr to 0fr, which interpolates to the content's own height with nothing
+     measured and no number guessed. The inner element carries overflow:hidden,
+     because a grid row of zero height still shows what overflows it. */
+  #fold-wrap { display:grid; grid-template-rows:1fr;
+               transition:grid-template-rows .22s ease; }
+  #fold-inner { overflow:hidden; min-height:0; }
+  :host([data-bb-collapsed]) #fold-wrap { grid-template-rows:0fr; }
+  /* Someone who asked for less motion gets the same outcome without it. */
+  @media (prefers-reduced-motion: reduce) {
+    #fold-wrap { transition:none; }
+  }
   .foot { margin-top:1rem; padding-top:.7rem; border-top:1px solid var(--line); }
   button.danger { border-color:var(--bad); color:var(--bad); }
 
@@ -176,16 +195,27 @@ const TITLE = `<h1>Settings</h1>`;
 
 /* Their own row rather than inside the title, since they now outlive it. */
 const ACTIONS = `
-<div id="top">
   <button class="action" id="export">Export</button>
   <button class="action" id="import">Import</button>
-  <input type="file" id="importfile" accept="application/json,.json" hidden>
-</div>`;
+  <input type="file" id="importfile" accept="application/json,.json" hidden>`;
 
+/* The toggle sits in that same row, which is the one part that does not
+   collapse -- put it inside the folding region and it folds away with
+   everything else, leaving nothing to press. Left, so it keeps its place when
+   the actions beside it are omitted. */
+const TOGGLE = `<button class="action" id="fold" aria-expanded="true">Hide</button>`;
+
+/* Everything that folds lives in one wrapper, because the animation works by
+   taking a grid row from 1fr to 0fr: the row has to contain the content for the
+   browser to interpolate its height without anyone measuring it. max-height
+   with a guessed number is the usual alternative and eases wrong -- fast then
+   stalling, or stalling then snapping, depending on how far off the guess was. */
 const PANEL = `
-<div id="tabs" role="tablist"></div>
-<div id="panel"></div>
-<div id="err" class="state err"></div>`;
+<div id="fold-wrap"><div id="fold-inner">
+  <div id="tabs" role="tablist"></div>
+  <div id="panel"></div>
+  <div id="err" class="state err"></div>
+</div></div>`;
 
 /*
  * Render into `host`.
@@ -194,6 +224,10 @@ const PANEL = `
  *                 passes false, because the page supplies its own label.
  *   opts.actions  export and import. Default true everywhere, embedded
  *                 included -- see ACTIONS above for why that changed.
+ *   opts.collapsible
+ *                 a toggle that folds everything below it away, leaving the
+ *                 toggle. Default false. The host gets data-bb-collapsed while
+ *                 folded, which is how a page shrinks the column around it.
  *
  * Everything below lives in this function rather than at module scope, so two
  * panels on one page would not share `all`, `rev` or the in-flight map. Nothing
@@ -202,6 +236,7 @@ const PANEL = `
 export function mount(host, opts = {}) {
   const title = opts.title !== false;
   const actions = opts.actions !== false;
+  const collapsible = opts.collapsible === true;
   /* Marks the host so the stylesheet can drop the page padding and the reading
      width cap: embedded, the sketch chose the column. */
   if (!title) host.setAttribute('data-bb-embedded', '');
@@ -212,7 +247,11 @@ export function mount(host, opts = {}) {
   root.appendChild(style);
 
   const frag = document.createElement('div');
-  frag.innerHTML = (title ? TITLE : '') + (actions ? ACTIONS : '') + PANEL;
+  /* One row holds the toggle and the actions, and exists if either does. */
+  const top = (collapsible ? TOGGLE : '') + (actions ? ACTIONS : '');
+  frag.innerHTML = (title ? TITLE : '')
+                 + (top ? `<div id="top">${top}</div>` : '')
+                 + PANEL;
   while (frag.firstChild) root.appendChild(frag.firstChild);
 
   const SRC = new URLSearchParams(location.search).get('src') || '/__bitbang/settings';
@@ -226,6 +265,7 @@ export function mount(host, opts = {}) {
   const inflight = new Map(), pending = new Map();
 
   let current = null;          // selected tab label
+  let folded = false;          // only ever true when opts.collapsible
 
   /* The declaration revision the device last reported. Offered back on a poll so
      it can answer "nothing changed" without building 2 KB of JSON and calling
@@ -857,8 +897,6 @@ export function mount(host, opts = {}) {
     }
   })();
 
-  /* Values move without us: another admin edits, an action lands late. Refetch
-     when the window comes back rather than polling. */
   /* Present unless the caller said otherwise. */
   if (actions) {
     root.getElementById('export').onclick = exportSettings;
@@ -873,7 +911,47 @@ export function mount(host, opts = {}) {
     };
   }
 
-  /* Returning to the window fetches everything, unconditionally. Always correct,
+  /* Folded state lives on the host, so the page can say what a folded panel does
+     to its own layout -- #side[data-bb-collapsed]{width:auto}, and the video
+     beside it widens -- without this knowing that there is a video.
+
+     Remembered per viewer and per device, because whether the column is in the
+     way is a fact about this screen rather than about the device. The read is
+     wrapped because storage throws in a private window and comes back empty
+     after a clear, and a panel that will not render is worse than one that
+     forgets which way it was left. */
+  if (collapsible) {
+    const fold = root.getElementById('fold');
+    const wrap = root.getElementById('fold-wrap');
+    const KEY = 'bb-settings-folded:' + location.pathname;
+    try { folded = localStorage.getItem(KEY) === '1'; } catch (e) { /* fine */ }
+
+    const apply = (next) => {
+      folded = next;
+      host.toggleAttribute('data-bb-collapsed', folded);
+      fold.textContent = folded ? 'Settings' : 'Hide';
+      fold.setAttribute('aria-expanded', String(!folded));
+      try { localStorage.setItem(KEY, folded ? '1' : '0'); } catch (e) { /* fine */ }
+    };
+
+    /* The restored state is applied with the transition off, so a panel left
+       folded does not open and animate shut in front of you on every load. */
+    wrap.style.transition = 'none';
+    apply(folded);
+    requestAnimationFrame(() => { wrap.style.transition = ''; });
+
+    fold.onclick = () => {
+      apply(!folded);
+      /* Unfolding is when the values are most likely stale, since the poll has
+         been off for as long as it was shut. */
+      if (!folded) tick();
+    };
+  }
+
+  /* Values move without us: another admin edits, an action lands late. Refetch
+     when the window comes back rather than polling.
+
+     Returning to the window fetches everything, unconditionally. Always correct,
      and the one moment where being sure costs less than being clever. */
   addEventListener('focus', () => reload(null));
 
@@ -905,6 +983,11 @@ export function mount(host, opts = {}) {
 
   async function tick() {
     if (document.visibilityState !== 'visible') return;
+    /* Folded is not merely invisible, it is uninteresting: polling the device
+       every four seconds to refresh rows nobody can see spends link the video is
+       competing for. visibilityState cannot see this -- that is the tab's, and
+       the tab is perfectly visible. */
+    if (folded) return;
     try {
       if (tabHasLive(current)) {
         /* A real fetch of this tab. reload() absorbs it without replacing nodes
@@ -974,7 +1057,15 @@ function mountDeclared() {
            data-bitbang-omit="actions" turns them off for a page that wants the
            column bare. */
         const omit = (el.getAttribute('data-bitbang-omit') || '').split(/\s+/);
-        mount(el, { title: false, actions: omit.indexOf('actions') < 0 });
+        /* Opt in, because folding is a claim about the page's layout that this
+           cannot check: it is right when the panel is a column beside something
+           worth seeing, and silly when the panel is the page. The element that
+           asks is the one that knows, and it costs the page one attribute. */
+        mount(el, {
+            title:       false,
+            actions:     omit.indexOf('actions') < 0,
+            collapsible: el.hasAttribute('data-bitbang-collapsible'),
+        });
     }
 }
 
