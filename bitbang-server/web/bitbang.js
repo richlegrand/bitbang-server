@@ -40,21 +40,6 @@
 
     const ASSETS = '/__bitbang__/';
 
-    /* What the device says it answers, delivered by the service worker in the
-     * same inline script that carries the session id.
-     *
-     * Published tidily because __bbCaps is a delivery detail and a launcher
-     * should not read one. `has` is the only question anyone asks of it: is
-     * there a console on this device, so should there be a way to open one.
-     *
-     * A cap names a reserved endpoint, never what to load. Every device has
-     * settings and almost no page embeds the panel, so loading is decided by the
-     * elements below; this decides what to *offer*. */
-    const caps = Array.isArray(window.__bbCaps) ? window.__bbCaps.slice() : [];
-    window.BitBang = window.BitBang || {};
-    window.BitBang.caps = caps;
-    window.BitBang.has = (cap) => caps.indexOf(cap) >= 0;
-
     /* A script element rather than import(), because what it loads is not all
        modules: stream-shim.js is a classic script that publishes window.BitBang,
        settings-panel.js is a module with an export. Appending an element handles
