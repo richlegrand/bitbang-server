@@ -33,28 +33,81 @@ function askServiceWorkerBuild(worker) {
     });
 }
 
-// reloadIfStale compares our build stamp against the worker's and
-// reloads when they differ. No cosmetic/breaking distinction: any deploy
-// reloads, because a reload costs a second and running mismatched halves
-// of the same release costs a support thread.
+// offerReload puts a bar across the top of the page saying a new version
+// is available, with a button that reloads.
 //
-// A stamp is reloaded for at most once per tab. If a deploy somehow left
-// the two files disagreeing, the guard turns an endless reload loop into
-// one wasted refresh. A worker that predates the stamp reports null and
-// is left alone.
-async function reloadIfStale(worker) {
+// It used to reload on its own, with no warning, on the reasoning that a
+// second of lost state beats running two halves of the same release. The
+// trade was fair; the presentation was not. A page that reloads itself
+// while you are reading it is indistinguishable from a crash, and a page
+// that does it in the middle of a shell command has thrown away work to
+// explain nothing. Saying so instead makes the same event feedback rather
+// than a glitch, and leaves the choice of moment with the person who
+// knows what they were doing.
+//
+// What that costs is honest: a page which declines stays mismatched with
+// its worker for as long as it likes. That is survivable because the two
+// halves only disagree about code, not about a protocol -- for now. The
+// day the worker's framing changes is the day this needs a second stamp
+// beside BUILD, one that moves only when the contract between them does,
+// so a breaking mismatch can insist where a cosmetic one asks.
+function offerReload(theirs) {
+    let el = document.getElementById('bb-update-banner');
+    if (el) return;                        // already offered, nothing new to say
+
+    /* Nobody awaits the caller, so a throw in here would be an unhandled
+       rejection and the offer would just never appear. The stale check can
+       finish before the body exists, so wait for it rather than find out. */
+    if (!document.body) {
+        document.addEventListener('DOMContentLoaded', () => offerReload(theirs),
+                                  { once: true });
+        return;
+    }
+
+    el = document.createElement('div');
+    el.id = 'bb-update-banner';
+    el.style.cssText = 'position:fixed;top:0;left:0;right:0;z-index:2147483646;' +
+        'background:#1f4e79;color:#fff;font:13px/1.6 sans-serif;text-align:center;' +
+        'padding:5px;opacity:0.96;';
+
+    /* One z-index below the reconnect banner, so a session in trouble is
+       never hidden behind news about a release. */
+    el.append(document.createTextNode('A new version is available. '));
+
+    const b = document.createElement('button');
+    b.textContent = 'Reload';
+    b.style.cssText = 'font:inherit;color:inherit;background:none;' +
+        'border:1px solid currentColor;border-radius:3px;padding:0 .6em;' +
+        'margin-left:.3em;cursor:pointer;';
+    b.onclick = () => {
+        /* Remembered before reloading, not after: if a deploy left the two
+           files disagreeing for good, the page comes back still stale and
+           would be offered the same reload forever. One click per stamp. */
+        try { sessionStorage.setItem('bb-reloaded-for', theirs); } catch { /* private mode */ }
+        window.location.reload();
+    };
+    el.appendChild(b);
+    document.body.appendChild(el);
+}
+
+// offerReloadIfStale compares our build stamp against the worker's and
+// offers a reload when they differ.
+//
+// Offered at most once per stamp per tab: a page that has already come
+// back once for this build and still disagrees is in a broken deploy, and
+// asking again would mean clicking forever. A worker that predates the
+// stamp reports null and is left alone.
+async function offerReloadIfStale(worker) {
     const theirs = await askServiceWorkerBuild(worker);
     if (!theirs || theirs === BUILD) return;
-    const key = 'bb-reloaded-for';
     try {
-        if (sessionStorage.getItem(key) === theirs) {
+        if (sessionStorage.getItem('bb-reloaded-for') === theirs) {
             console.warn('[Bootstrap] build still', BUILD, 'after reloading for', theirs);
             return;
         }
-        sessionStorage.setItem(key, theirs);
-    } catch { /* private mode: fall through and reload once */ }
-    console.log('[Bootstrap] stale page', BUILD, '-> reloading for', theirs);
-    window.location.reload();
+    } catch { /* private mode: offer it */ }
+    console.log('[Bootstrap] stale page', BUILD, '-> offering reload for', theirs);
+    offerReload(theirs);
 }
 
 const STATUS = {
@@ -883,30 +936,25 @@ class BitBangConnection {
         // Force check for SW update on every page load.
         reg.update();
 
-        // When a new SW takes over an existing controller, reload if the
-        // build stamps disagree. skipWaiting() in sw.js's install handler
-        // is what makes the takeover happen without prompting, which is
-        // also what creates the window this closes: the new worker claims
-        // the page immediately, while the page itself may still be running
-        // the previous deploy's bootstrap.js.
-        //
-        // The reload does cost a mid-session refresh -- shell scrollback,
-        // half-typed proxied-app input. That is the accepted trade: a
-        // second of lost state beats two halves of different releases
-        // talking to each other.
+        // When a new SW takes over an existing controller, offer a reload if
+        // the build stamps disagree. skipWaiting() in sw.js's install handler
+        // is what makes the takeover happen without prompting, which is also
+        // what creates the window this closes: the new worker claims the page
+        // immediately, while the page itself may still be running the previous
+        // deploy's bootstrap.js.
         navigator.serviceWorker.addEventListener('controllerchange', () => {
             if (!hadController) return;             // first install, not an update
-            // Only a page that is actually behind gets reloaded. The
-            // common case after a deploy is a fresh navigation that
-            // already has the new bootstrap.js and merely watched the
-            // worker turn over underneath it -- nothing to do there.
-            reloadIfStale(navigator.serviceWorker.controller);
+            // Only a page that is actually behind is asked. The common case
+            // after a deploy is a fresh navigation that already has the new
+            // bootstrap.js and merely watched the worker turn over underneath
+            // it -- nothing to say there.
+            offerReloadIfStale(navigator.serviceWorker.controller);
         });
 
         // Covers the tab that was already open and never saw a
         // controllerchange, e.g. a deploy that reached the worker before
         // this listener was attached.
-        reloadIfStale(reg.active || navigator.serviceWorker.controller);
+        offerReloadIfStale(reg.active || navigator.serviceWorker.controller);
 
         // Long-lived sessions (a shell sitting open for hours) won't navigate
         // and so won't trigger the browser's default update check. Poll every
