@@ -8,6 +8,7 @@ import (
 	"regexp"
 	"strings"
 	"testing"
+	"time"
 )
 
 // stampDir writes a minimal web/ whose stamped assets carry the
@@ -283,5 +284,86 @@ func TestMetaPageNamesRoundTripThroughTheWorkersRule(t *testing.T) {
 					"URL pattern will not match", n, c)
 			}
 		}
+	}
+}
+
+// -- a web/ that changes under a running server ----------------------------
+
+// recheckEveryTime retires the stamp on every request for the duration of
+// one test, so a test about what happens after the window does not have to
+// sleep through the window.
+func recheckEveryTime(t *testing.T) {
+	t.Helper()
+	was := stampMaxAge
+	stampMaxAge = 0
+	t.Cleanup(func() { stampMaxAge = was })
+}
+
+// stampOf serves sw.js through one handler and returns the spliced value,
+// so a test can ask the same handler twice and see whether it moved.
+func stampOf(t *testing.T, h http.HandlerFunc) string {
+	t.Helper()
+	r := httptest.NewRequest(http.MethodGet, "/__bitbang__/sw.js", nil)
+	w := httptest.NewRecorder()
+	h(w, r)
+	m := regexp.MustCompile(`BUILD = '([^']*)'`).FindStringSubmatch(w.Body.String())
+	if m == nil {
+		t.Fatalf("no stamp in sw.js: %q", w.Body.String())
+	}
+	return m[1]
+}
+
+// The defect this exists for, and it is worth stating plainly because
+// nothing else in the system would have noticed it.
+//
+// The stamp used to be taken once, when the handler was built. Asset bytes
+// are read per request. So a web/ that changed without the process
+// restarting served the new bootstrap.js carrying the old stamp, and an
+// sw.js byte-identical to the one the browser already had -- no worker
+// installed, nothing turned over, and the page ran new code against an old
+// worker with both halves agreeing on the build. reloadIfStale compared
+// them, found them equal, and did nothing.
+func TestStampFollowsAChangeUnderARunningHandler(t *testing.T) {
+	recheckEveryTime(t)
+	dir := stampDir(t)
+	h := Static(dir, "")
+
+	before := stampOf(t, h)
+
+	// A shim changes, which is the case that carries no stamp of its own
+	// and so relies entirely on this.
+	if err := os.WriteFile(filepath.Join(dir, "xhr-shim.js"),
+		[]byte("// xhr shim, revised\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	if after := stampOf(t, h); after == before {
+		t.Fatalf("stamp stayed %s after web/ changed", before)
+	}
+}
+
+// And the other half of the same decision: metadata says when to look at
+// the contents, never what the stamp is. A deploy that copies an unchanged
+// file still bumps its mtime, and a stamp built from mtimes would reload
+// every open tab over bytes that did not move.
+func TestStampIgnoresATouchThatChangedNothing(t *testing.T) {
+	recheckEveryTime(t)
+	dir := stampDir(t)
+	h := Static(dir, "")
+
+	before := stampOf(t, h)
+
+	// Moved by an hour rather than rewritten, so the mtime definitely
+	// differs and the contents definitely do not -- which forces the path
+	// where the sweep decides to rehash and the hash says nothing changed.
+	path := filepath.Join(dir, "xhr-shim.js")
+	later := time.Now().Add(time.Hour)
+	if err := os.Chtimes(path, later, later); err != nil {
+		t.Fatal(err)
+	}
+
+	if after := stampOf(t, h); after != before {
+		t.Fatalf("stamp moved %s -> %s over a touch that changed no bytes",
+			before, after)
 	}
 }
