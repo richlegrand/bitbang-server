@@ -253,9 +253,24 @@ export function mount(host, opts = {}) {
   while (frag.firstChild) root.appendChild(frag.firstChild);
 
   const SRC = new URLSearchParams(location.search).get('src') || '/__bitbang/settings';
+  /* SRC without any query it arrived with, which is what everything but load()
+     wants: a POST body, ?rev, ?reset, ?export and ?import all put their own
+     query on. Written out as SRC.split('?')[0] at five call sites, where it read
+     as five separate small decisions rather than one. */
+  const BASE = SRC.split('?')[0];
 
   /* Absent `n`, derive from the key: underscores to spaces, first letter up. */
   const label = s => s.n || (s.k.replace(/_/g, ' ').replace(/^./, c => c.toUpperCase()));
+
+  /* An aside beside a control: why it is disabled, why it is readonly, that it
+     needs a restart, what is pending. Four of these were built a line at a time
+     in four places, which is three more places than a span needs. */
+  const note = (text) => {
+    const el = document.createElement('span');
+    el.className = 'note';
+    el.textContent = text;
+    return el;
+  };
 
   /* One request in flight per key. A timer alone still allows two POSTs for the
      same setting to be outstanding, and the older landing last leaves the device
@@ -289,7 +304,7 @@ export function mount(host, opts = {}) {
      fetch. After that the usual answer is a dozen bytes. */
   async function poll() {
     if (rev === null) return load(null);
-    const r = await fetch(`${SRC.split('?')[0]}?rev=${encodeURIComponent(rev)}`);
+    const r = await fetch(`${BASE}?rev=${encodeURIComponent(rev)}`);
     if (!r.ok) throw new Error(r.status + ' from ' + SRC);
     const body = await r.json();
     if ('rev' in body) rev = body.rev;
@@ -431,7 +446,7 @@ export function mount(host, opts = {}) {
       inflight.set(s.k, true);
       say('...');
       try {
-        const r = await fetch(SRC.split('?')[0], {
+        const r = await fetch(BASE, {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify(body),
@@ -461,9 +476,13 @@ export function mount(host, opts = {}) {
           if ('v' in j) s.v = j.v;
           if ('set' in j) s.set = j.set;
           if ('pv' in j) s.pv = j.pv; else delete s.pv;
-          if ('v' in j && input && input.type !== 'checkbox') input.value = j.v;
-          if ('v' in j && input && input.type === 'checkbox') input.checked = !!j.v;
-          if (out) out.textContent = j.v;
+          /* show() rather than reaching for the control, which is what this did
+             -- three lines that asked whether input.type was a checkbox and
+             wrote .value or .checked accordingly. It had no answer for a radio
+             group or for a secret's placeholder, so those two never showed a
+             value the device had quantized. The branch that built the nodes
+             knows how to put a value on them; nothing else needs to guess. */
+          if (show !== null) show();
           if (j.reload) reload(typeof j.reload === 'string' ? j.reload : null);
         }
       } catch (e) {
@@ -477,17 +496,30 @@ export function mount(host, opts = {}) {
 
     let input = null, out = null;
 
-    /* Set by each branch to push s's current value into the nodes it built.
-       render() rebuilds the panel, which replaces the element under the pointer
-       and swallows the click -- the same defect the tab bar above describes, and
-       it was fixed there and not here. A refetch that changed no declaration
-       calls this instead of rebuilding anything.
+    /* Puts s's value on the nodes this row built. Set by whichever branch below
+       builds them, because only that branch knows whether the value means
+       `.value`, `.checked`, one of three radios, or a placeholder.
 
-       Two things it must not overwrite: an input the person is typing in, and a
-       key with a write in flight, whose reply is the authority on what the value
-       ended up as. */
-    let sync = null;
-    const syncable = (el) => el !== root.activeElement && !inflight.get(s.k);
+       Unconditional on purpose. Whether to overwrite is a different question
+       with a different answer depending on who is asking -- a poll must not
+       tread on a half-typed field, a write's own reply must -- and the two were
+       tangled together in every branch, with the reply path re-deciding it by
+       sniffing input.type. */
+    let show = null;
+
+    /* Which a poll asks. render() rebuilds the panel, and that replaces the
+       element under the pointer and swallows the click -- the defect the tab bar
+       above describes -- so a refetch that changed no declaration calls this
+       instead of rebuilding anything.
+
+       Two things it must not overwrite: an input somebody is typing in, and a
+       key with a write in flight, whose reply is the authority on where the
+       value ended up. */
+    const sync = () => {
+      if (show === null || inflight.get(s.k)) return;
+      if (input !== null && input === root.activeElement) return;
+      show();
+    };
 
     if (s.ro) {
       /* No message can appear on a row that cannot be written, so it reserves
@@ -504,13 +536,10 @@ export function mount(host, opts = {}) {
       /* The readonly rows are the ones that actually move on their own -- free
          memory, uptime, the address -- so this is the case the focus refetch
          exists for. */
-      sync = () => { span.textContent = shown(); };
+      show = () => { span.textContent = shown(); };
       ctl.appendChild(span);
       if (typeof s.ro === 'string') {
-        const why = document.createElement('span');
-        why.className = 'note';
-        why.textContent = s.ro;
-        ctl.appendChild(why);
+        ctl.appendChild(note(s.ro));
       }
     } else if (s.t === 'action') {
       const b = document.createElement('button');
@@ -525,7 +554,7 @@ export function mount(host, opts = {}) {
       input.checked = !!s.v;
       /* No class: a checkbox is 1em wide and never wants a line of its own. */
       input.onchange = () => send({ k: s.k, v: input.checked });
-      sync = () => { if (syncable(input)) input.checked = !!s.v; };
+      show = () => { input.checked = !!s.v; };
       ctl.appendChild(input);
     } else if (s.t === 'enum' && s.r === 'radio') {
       /* Honoring the hint. A client that ignores `r` and renders the select
@@ -544,10 +573,7 @@ export function mount(host, opts = {}) {
         lab.append(rb, document.createTextNode(' ' + o));
         ctl.appendChild(lab);
       }
-      sync = () => {
-        if (inflight.get(s.k)) return;
-        for (const rb of radios) rb.checked = rb.value === s.v;
-      };
+      show = () => { for (const rb of radios) rb.checked = rb.value === s.v; };
     } else if (s.t === 'enum') {
       input = document.createElement('select');
       for (const o of s.o || []) {
@@ -557,7 +583,7 @@ export function mount(host, opts = {}) {
       }
       input.value = s.v;
       input.onchange = () => send({ k: s.k, v: input.value });
-      sync = () => { if (syncable(input)) input.value = s.v; };
+      show = () => { input.value = s.v; };
       ctl.classList.add('narrow');
       ctl.appendChild(input);
     } else if (s.t === 'int' || s.t === 'float') {
@@ -592,15 +618,14 @@ export function mount(host, opts = {}) {
         ctl.classList.add('wide');
         /* The readout is part of the value, so it moves with it. Skipped while
            the slider is being dragged, which is what activeElement catches. */
-        sync = () => {
-          if (!syncable(input)) return;
+        show = () => {
           input.value = s.v;
           out.textContent = s.v;
         };
         ctl.append(track, out);
       } else {
         input.onchange = () => send({ k: s.k, v: Number(input.value) });
-        sync = () => { if (syncable(input)) input.value = s.v; };
+        show = () => { input.value = s.v; };
         ctl.classList.add('narrow');
         ctl.appendChild(input);
         if (s.min !== undefined) {
@@ -624,10 +649,9 @@ export function mount(host, opts = {}) {
         if (s.secret && input.value === '') return;
         send({ k: s.k, v: input.value });
       };
-      /* A secret has no value to sync, only whether one is set. Not clobbering
-         a half-typed credential is the reason syncable checks activeElement. */
-      sync = () => {
-        if (!syncable(input)) return;
+      /* A secret has no value to show, only whether one is set. Not clobbering
+         a half-typed credential is why sync() checks activeElement. */
+      show = () => {
         if (s.secret) input.placeholder = place();
         else input.value = s.v ?? '';
       };
@@ -641,18 +665,9 @@ export function mount(host, opts = {}) {
       u.textContent = s.u;                      /* beside the value, not in the label */
       ctl.appendChild(u);
     }
-    if (s.rb) {
-      const n = document.createElement('span');
-      n.className = 'note';
-      n.textContent = 'after restart';      /* at the row, not in a banner */
-      ctl.appendChild(n);
-    }
-    if (s.pv !== undefined) {
-      const n = document.createElement('span');
-      n.className = 'note';
-      n.textContent = `${s.pv} pending`;
-      ctl.appendChild(n);
-    }
+    /* At the row, not in a banner. */
+    if (s.rb) ctl.appendChild(note('after restart'));
+    if (s.pv !== undefined) ctl.appendChild(note(`${s.pv} pending`));
 
     /* -- the device's refine hook, applied once for every type --
 
@@ -665,8 +680,7 @@ export function mount(host, opts = {}) {
        the same sentence. So a page that has not polled since the condition
        changed shows a live control, and clicking it produces the explanation
        rather than silence. */
-    const why = document.createElement('span');
-    why.className = 'note';
+    const why = note('');
     const gate = () => {
       const off = s.en === false;
       for (const el of ctl.querySelectorAll('input,select,button')) el.disabled = off;
@@ -681,21 +695,19 @@ export function mount(host, opts = {}) {
     ctl.appendChild(state);
     div.appendChild(ctl);
     gate();
-    /* An action has no value, so its sync may be null -- but every row gates. */
-    div._sync = () => { if (sync) sync(); gate(); };
+    /* An action has no value to show, so show stays null -- but every row gates. */
+    div._sync = () => { sync(); gate(); };
     return div;
   }
 
-  /* Everything the DOM's shape depends on, which is everything but the value.
-     Two declarations with the same signature can swap values without a node
-     being replaced.
+  /* What _sync can apply to nodes that already exist, so a change in one of
+     these is not structural and costs no rebuild. Everything else is the DOM's
+     shape: two declarations agreeing on all of it can swap values without a
+     node being replaced, which is what sig() below compares.
 
-     `pv` is in here rather than treated as a value: a pending marker appears and
-     disappears as a whole element, so a change in it is structural. That means a
-     value arriving as pending still rebuilds -- rare enough to accept, and
-     honest about which case is handled. */
-  /* What _sync can apply to nodes that already exist, so a change in one of these
-     is not structural and costs no rebuild.
+     `pv` is deliberately outside this set, so a value arriving as pending does
+     rebuild: a pending marker appears and disappears as a whole element, which
+     is structural however small it looks.
 
      `en`, `why` and `hide` come from the device's refine hook and move at runtime:
      toggling automatic gain disables the manual one. Disabling an input and
@@ -752,7 +764,11 @@ export function mount(host, opts = {}) {
 
   /* -- restore, export, import ------------------------------------------- */
 
-  const note = (msg, cls) => {
+  /* The one line under the panel, for what a whole-panel action did. Called
+     banner and not note because note() above builds the asides beside a
+     control, and two different things under one name in one file is one name
+     too few. */
+  const banner = (msg, cls) => {
     const el = root.getElementById('err');
     el.textContent = msg;
     el.className = 'state ' + (cls || '');
@@ -762,7 +778,7 @@ export function mount(host, opts = {}) {
      value on the tab just changed -- so this needs no follow-up fetch. */
   async function resetGroup(group) {
     try {
-      const r = await fetch(`${SRC.split('?')[0]}?reset&g=${encodeURIComponent(group)}`,
+      const r = await fetch(`${BASE}?reset&g=${encodeURIComponent(group)}`,
                             { method: 'POST' });
       if (!r.ok) throw new Error('HTTP ' + r.status);
       /* ?reset replies with a declaration for the group, which is the same
@@ -788,9 +804,9 @@ export function mount(host, opts = {}) {
          the ordering wrong. `part` goes unused beyond the shape check, which is
          worth keeping: it is what catches the reply changing shape. */
       await reload(null);
-      note(`${group} restored to defaults`, 'ok');
+      banner(`${group} restored to defaults`, 'ok');
     } catch (e) {
-      note(String(e), 'err');
+      banner(String(e), 'err');
     }
   }
 
@@ -799,7 +815,7 @@ export function mount(host, opts = {}) {
      later will not. */
   async function exportSettings() {
     try {
-      const r = await fetch(`${SRC.split('?')[0]}?export`);
+      const r = await fetch(`${BASE}?export`);
       if (!r.ok) throw new Error('HTTP ' + r.status);
       const text = JSON.stringify(await r.json(), null, 2);
       const url = URL.createObjectURL(new Blob([text], { type: 'application/json' }));
@@ -810,9 +826,9 @@ export function mount(host, opts = {}) {
       /* Revoked on a turn of the event loop rather than immediately: the click
          is asynchronous and revoking first can race the download. */
       setTimeout(() => URL.revokeObjectURL(url), 10000);
-      note('exported', 'ok');
+      banner('exported', 'ok');
     } catch (e) {
-      note(String(e), 'err');
+      banner(String(e), 'err');
     }
   }
 
@@ -820,7 +836,7 @@ export function mount(host, opts = {}) {
     try {
       const text = await file.text();
       JSON.parse(text);                 /* fail here, not on the device */
-      const r = await fetch(`${SRC.split('?')[0]}?import`, {
+      const r = await fetch(`${BASE}?import`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: text,
@@ -832,12 +848,12 @@ export function mount(host, opts = {}) {
          between firmwares makes a once-valid value invalid, and that is
          information. Readonly keys are not counted -- they were never
          importable and the device knows it. */
-      note(j.skipped
+      banner(j.skipped
              ? `imported ${j.applied}, skipped ${j.skipped}`
              : `imported ${j.applied}`,
            j.skipped ? 'err' : 'ok');
     } catch (e) {
-      note(String(e), 'err');
+      banner(String(e), 'err');
     }
   }
 
