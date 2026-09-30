@@ -89,9 +89,9 @@ var stampInputs = []string{
 // the stamp still changes if it later appears, and a server that boots is
 // worth more than one that refuses over a shim.
 //
-// Reached through a stampCache rather than called per request: reading
+// Reached through a StampCache rather than called per request: reading
 // 400 KB to answer every asset request would be absurd, and calling it
-// once at startup was wrong in a way nothing detected. See stampCache.
+// once at startup was wrong in a way nothing detected. See StampCache.
 func buildStamp(staticDir string) string {
 	h := sha256.New()
 	for _, name := range stampInputs {
@@ -115,7 +115,7 @@ func buildStamp(staticDir string) string {
 // A var so a test can retire a stamp without sleeping through it.
 var stampMaxAge = 5 * time.Second
 
-// stampCache answers "what is the current build" cheaply and correctly.
+// StampCache answers "what is the current build" cheaply and correctly.
 //
 // The stamp used to be computed once, when the handler was built, on the
 // reasoning that a deploy ships web/ and restarts the service so process
@@ -142,7 +142,7 @@ var stampMaxAge = 5 * time.Second
 // from mtimes would reload every open tab over a file whose bytes are the
 // same. Contents decide the stamp; metadata only decides when to read
 // them.
-type stampCache struct {
+type StampCache struct {
 	dir string
 
 	mu      sync.Mutex
@@ -151,8 +151,12 @@ type stampCache struct {
 	checked time.Time // when that sweep happened
 }
 
-func newStampCache(dir string) *stampCache {
-	c := &stampCache{dir: dir}
+// NewStampCache is shared by the static handler, which splices the stamp into
+// what it serves, and the client socket, which tells an open tab when the
+// stamp has moved -- one cache, so the two can never disagree about which
+// build is current.
+func NewStampCache(dir string) *StampCache {
+	c := &StampCache{dir: dir}
 	c.stamp = buildStamp(dir)
 	c.meta = c.readMeta()
 	c.checked = time.Now()
@@ -162,7 +166,7 @@ func newStampCache(dir string) *stampCache {
 // readMeta is the cheap half: one stat per input, formatted so that any
 // change to a size, an mtime, or the set of readable files changes the
 // string. Measured at 39us for the fourteen inputs.
-func (c *stampCache) readMeta() string {
+func (c *StampCache) readMeta() string {
 	var b strings.Builder
 	for _, name := range stampInputs {
 		fi, err := os.Stat(filepath.Join(c.dir, name))
@@ -175,7 +179,7 @@ func (c *stampCache) readMeta() string {
 	return b.String()
 }
 
-func (c *stampCache) current() string {
+func (c *StampCache) Current() string {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
@@ -296,8 +300,11 @@ func notFoundMetaPage(w http.ResponseWriter, name string) {
 // frontPagePlaceholder. Empty disables the splice; the placeholder is
 // always replaced (with empty string if no snippet) so the marker never
 // leaks to the browser.
-func Static(staticDir, frontPagePath string) http.HandlerFunc {
-	stamps := newStampCache(staticDir)
+//
+// The stamp cache is passed in rather than built here so the client socket can
+// share it; see NewStampCache. The directory served is the cache's own.
+func Static(stamps *StampCache, frontPagePath string) http.HandlerFunc {
+	staticDir := stamps.dir
 	return func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodGet && r.Method != http.MethodHead {
 			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
@@ -337,7 +344,7 @@ func Static(staticDir, frontPagePath string) http.HandlerFunc {
 				w.Header().Set("Service-Worker-Allowed", "/")
 			}
 			if stampedAssets[name] {
-				serveStamped(w, staticDir, name, stamps.current())
+				serveStamped(w, staticDir, name, stamps.Current())
 				return
 			}
 			serveFile(w, r, staticDir, name, "", true)
@@ -360,7 +367,7 @@ func Static(staticDir, frontPagePath string) http.HandlerFunc {
 			// cacheable until now, which meant the same asset had a stale
 			// and a fresh spelling depending on which URL you asked for.
 			if stampedAssets[first] {
-				serveStamped(w, staticDir, first, stamps.current())
+				serveStamped(w, staticDir, first, stamps.Current())
 				return
 			}
 			serveFile(w, r, staticDir, first, "", true)

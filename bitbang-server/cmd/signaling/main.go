@@ -147,6 +147,10 @@ func main() {
 		logger.Info("TURN: no TURN server configured — devices must provide their own ICE servers")
 	}
 
+	// One stamp cache for the files and the sockets, so what a client is told
+	// is current is always what the files it would reload are carrying.
+	stamps := handler.NewStampCache(cfg.StaticDir)
+
 	deps := &handler.Deps{
 		Devices:           devices,
 		Clients:           clients,
@@ -161,6 +165,7 @@ func main() {
 		TrustProxyHeaders: cfg.TrustProxyHeaders,
 		StatusToken:       cfg.StatusToken,
 		Releases:          tracker,
+		Stamps:            stamps,
 	}
 
 	mux := http.NewServeMux()
@@ -187,7 +192,7 @@ func main() {
 		http.Redirect(w, r, cfg.InstallURL, http.StatusFound)
 	})
 
-	mux.Handle("/", handler.Static(cfg.StaticDir, cfg.FrontPagePath))
+	mux.Handle("/", handler.Static(stamps, cfg.FrontPagePath))
 
 	srv := &http.Server{
 		Addr:    cfg.Bind,

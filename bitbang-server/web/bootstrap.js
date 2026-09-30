@@ -33,8 +33,8 @@ function askServiceWorkerBuild(worker) {
     });
 }
 
-// offerReload puts a bar across the top of the page saying a new version
-// is available, with a button that reloads.
+// offerReload puts a bar across the top of the page saying a new browser
+// runtime is available, with a button that reloads.
 //
 // It used to reload on its own, with no warning, on the reasoning that a
 // second of lost state beats running two halves of the same release. The
@@ -72,7 +72,10 @@ function offerReload(theirs) {
 
     /* One z-index below the reconnect banner, so a session in trouble is
        never hidden behind news about a release. */
-    el.append(document.createTextNode('A new version is available. '));
+    /* "Browser runtime" rather than "version": what changed is the code this
+       page runs, not the device's firmware or the app behind it, and on a page
+       that is showing a device "new version" reads as news about the device. */
+    el.append(document.createTextNode('New browser runtime available '));
 
     const b = document.createElement('button');
     b.textContent = 'Reload';
@@ -92,13 +95,20 @@ function offerReload(theirs) {
 
 // offerReloadIfStale compares our build stamp against the worker's and
 // offers a reload when they differ.
-//
-// Offered at most once per stamp per tab: a page that has already come
-// back once for this build and still disagrees is in a broken deploy, and
-// asking again would mean clicking forever. A worker that predates the
-// stamp reports null and is left alone.
 async function offerReloadIfStale(worker) {
-    const theirs = await askServiceWorkerBuild(worker);
+    offerReloadFor(await askServiceWorkerBuild(worker));
+}
+
+// offerReloadFor offers a reload when `theirs` -- a build stamp learned from
+// the service worker, or pushed by the server as a build_stamp -- is not the
+// one this page was loaded with. Both routes end here so the guard is written
+// once.
+//
+// Offered at most once per stamp per tab: a page that has already come back
+// once for this build and still disagrees is in a broken deploy, and asking
+// again would mean clicking forever. A worker that predates the stamp reports
+// null and is left alone.
+function offerReloadFor(theirs) {
     if (!theirs || theirs === BUILD) return;
     try {
         if (sessionStorage.getItem('bb-reloaded-for') === theirs) {
@@ -235,6 +245,23 @@ const RECONNECT_WINDOW_MS = 5 * 60 * 1000;  // give up after this much failed ef
 const RECONNECT_MAX_BACKOFF_MS = 10000;     // cap on the delay between attempts
 const RECONNECT_TIMEOUT_MS = 20000;  // per attempt: WS + offer + DC verify + ready
 const RECONNECT_SETTLE_MS = 2000;    // after offline→online, let the network settle
+
+// What the top strip says when the device has reset and the page is reloading
+// because of it. Shown before the reload and again on the reloaded page until
+// it has a connection, so it is one message that stays up across the reload
+// rather than two -- and it has to be the same words both times.
+const DEVICE_RESET_TEXT = 'Device reset, reloading...';
+// Carries that across the reload. Read and cleared by the page that arrives.
+const DEVICE_RESET_KEY = 'bb-device-reset';
+
+// Redialing the signaling socket after it drops under a live session. The
+// first attempt waits a second, because the usual cause is the server
+// restarting and that takes a moment; after that it backs off, since each
+// attempt against a device that is not back yet costs the server's slow
+// refusal. Reset by hearing a build stamp, which only a socket the server let
+// in receives.
+const SIGNAL_REDIAL_MIN_MS = 1000;
+const SIGNAL_REDIAL_MAX_MS = 30000;
 
 // --- Bidirectional verify helpers ----------------------------------------
 //
@@ -454,6 +481,23 @@ class BitBangConnection {
         this._reconnectResolve = null;  // resolves the in-flight attempt on ready
         this._reconnectReject = null;
         this._reconnectTimeout = null;
+        this._wake = null;              // cuts a backoff short, see _sleep
+
+        // What the server has told us about the device, as opposed to what
+        // our own transport has worked out. The two are independent: a device
+        // can leave the server with the peer connection still up, and the peer
+        // connection can fail with the device still registered. Keeping them
+        // apart is what lets a page say which one happened.
+        // Which run of the device's firmware we have been talking to, or null
+        // before we have been told. In memory on purpose: a reloaded page
+        // learns the current identity fresh, so a reload loop is impossible
+        // rather than guarded against.
+        this._deviceBoot = null;
+
+        // Keeping the signaling socket up after the session is established.
+        // See _keepSignaling.
+        this._signalBackoff = SIGNAL_REDIAL_MIN_MS;
+        this._signalTimer = null;
     }
 
     // SWSP frame helpers
@@ -956,10 +1000,12 @@ class BitBangConnection {
         // this listener was attached.
         offerReloadIfStale(reg.active || navigator.serviceWorker.controller);
 
-        // Long-lived sessions (a shell sitting open for hours) won't navigate
-        // and so won't trigger the browser's default update check. Poll every
-        // 30 min so a deploy reaches them within the window. A single fetch
-        // of sw.js per half hour is negligible bandwidth.
+        // The fallback. An open tab normally hears about a deploy from the
+        // server, as a build_stamp on its signaling socket, which is kept up
+        // and redialed when the server restarts; the server sends the stamp on
+        // every connect and again whenever it moves. This covers what that
+        // misses -- a tab that couldn't get a socket back, or a server too old
+        // to send one. A fetch of sw.js per half hour.
         setInterval(() => reg.update().catch(() => {}), 30 * 60 * 1000);
 
         // Handle proxy requests from SW
@@ -1130,7 +1176,8 @@ class BitBangConnection {
     connectWebSocket() {
         return new Promise((resolve, reject) => {
             const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
-            this.ws = new WebSocket(`${protocol}//${window.location.host}/ws/client/${this.uid}`);
+            const ws = new WebSocket(`${protocol}//${window.location.host}/ws/client/${this.uid}`);
+            this.ws = ws;
 
             const offerTimeout = setTimeout(() => {
                 reject(new Error('offer_timeout'));
@@ -1178,13 +1225,18 @@ class BitBangConnection {
                     resolve();
                 } else if (msg.type === 'candidate') {
                     this.handleRemoteCandidate(msg.candidate);
+                } else if (msg.type === 'device_up') {
+                    this._onDeviceBoot(msg.boot);
+                } else if (msg.type === 'build_stamp') {
+                    this._onBuildStamp(msg.build);
                 } else if (msg.type === 'error') {
                     clearTimeout(offerTimeout);
                     if (msg.message === 'device_preempted') {
-                        // Server kicked us because a new device instance
-                        // registered with the same UID. App state on the old
-                        // device is gone -- a reload gives a clean session.
-                        this.showReloadScreen('Device reconnected. Reload to continue.');
+                        // A server that predates boot identities, still
+                        // booting clients when a device re-registers. It was
+                        // right that a reload is needed and could not tell
+                        // whether it was: do what it asks.
+                        this._reloadForRestart();
                     } else {
                         // Other error events. reject() is a no-op once the
                         // connect promise has resolved, but harmless then.
@@ -1200,15 +1252,27 @@ class BitBangConnection {
 
             this.ws.onclose = () => {
                 // A clean close (e.g. the signaling server restarting) fires
-                // no 'error' event — without this, a setup in progress would
+                // no 'error' event -- without this, a setup in progress would
                 // ride out its full timeout instead of failing fast. Once
-                // setup has resolved, reject is a no-op: the signaling WS is
-                // setup-only by design, the session runs P2P, and recovery
-                // redials on demand — so a post-setup close is expected and
-                // harmless (it also fires on our own teardown's close()).
+                // setup has resolved, reject is a no-op.
                 clearTimeout(offerTimeout);
                 if (this.debug) console.log('[Bootstrap] signaling WS closed');
                 reject(new Error('WebSocket closed'));
+
+                // After setup this socket used to be let go, on the grounds
+                // that the session runs peer to peer and nothing needs it. Two
+                // things do now: it is where a new build is announced, and
+                // where a returning device is. And the usual reason it closes
+                // is the server restarting for a deploy -- the moment the page
+                // most needs to hear from it.
+                //
+                // Only if this is still the current socket. Our own teardown
+                // clears this.ws before its close lands, and a reconnect
+                // replaces it; either way that close is not news.
+                if (ws === this.ws) {
+                    this.ws = null;
+                    this._keepSignaling();
+                }
             };
         });
     }
@@ -1227,6 +1291,12 @@ class BitBangConnection {
             throw new Error(`pubkey/UID mismatch (server gave key for ${computedUid}, expected ${this.uid})`);
         }
         this.devicePubkey = key;
+
+        // Checked before any WebRTC work: if the device restarted, this
+        // session is about to be built on a page that cannot use it, and the
+        // sooner that is settled the less there is to throw away.
+        this._onDeviceBoot(msg.device_boot);
+        if (this._turnEnded) return;      // reloading; do not negotiate
 
         this._printDebug(STATUS.CONNECTING_WEBRTC);
         this.streamNameMap = msg.streams || {};
@@ -1414,7 +1484,14 @@ class BitBangConnection {
                 // its relay candidate. See bitbang/CONVENTIONS.md "Favoring
                 // direct on slow & embedded devices".
                 const msg = { type: 'candidate', uid: this.uid, candidate: event.candidate };
-                if (this.ws?.readyState === WebSocket.OPEN && this.remoteDescriptionSet) {
+                // Not on a control socket (see _redialSignaling). A candidate
+                // belongs to the session's client id, and a control socket has
+                // a different one, so the device would get it for a client it
+                // has never heard of. Queued instead, which for a session whose
+                // own socket is gone means dropped at the next teardown -- the
+                // only honest thing to do with it.
+                if (this.ws?.readyState === WebSocket.OPEN && !this.ws.bbControl
+                        && this.remoteDescriptionSet) {
                     this.ws.send(JSON.stringify(msg));
                 } else {
                     this.candidateQueue.pushLocal(msg);
@@ -1848,7 +1925,7 @@ class BitBangConnection {
             } catch (e) {
                 console.warn(`[Bootstrap] reconnect attempt ${attempt} failed:`, e?.message || e);
                 if (Date.now() + backoff >= deadline) break;
-                await new Promise(r => setTimeout(r, backoff));
+                await this._sleep(backoff);
                 backoff = Math.min(backoff * 2, RECONNECT_MAX_BACKOFF_MS);
             }
         }
@@ -1911,11 +1988,164 @@ class BitBangConnection {
         }
     }
 
+    // A sleep the device coming back can cut short.
+    //
+    // The reconnect loop's backoff reaches ten seconds, and a device that has
+    // finished rebooting should not be waited out for the rest of it -- the
+    // moment it registers is the one moment an attempt is certain to find
+    // something. Resolving early is all this does; the loop re-decides
+    // everything else for itself.
+    _sleep(ms) {
+        return new Promise((resolve) => {
+            let t = null;
+            const done = () => { clearTimeout(t); this._wake = null; resolve(); };
+            t = setTimeout(done, ms);
+            this._wake = done;
+        });
+    }
+
+    // A device registered for our UID, and this is which run of its firmware.
+    //
+    // The whole decision is one comparison, and it is here rather than on the
+    // server because the server would have to remember which boot each client
+    // had been talking to, and the client already knows.
+    //
+    // Nothing to compare against means this is the first identity we have
+    // seen: store it and carry on, which is every fresh page load.
+    //
+    // The same identity means the device never stopped -- its signaling
+    // reconnected, or this server redeployed -- so the iframe, the worker's
+    // session table, the bound stream elements and the settings table are all
+    // still describing something real. Nothing to do; if the transport
+    // happens to be down the reconnect loop is already working on it, and
+    // waking it is the only thing worth doing here.
+    //
+    // A different identity means the device restarted, and nothing the page
+    // is holding survives that. Not a renegotiation -- a reload. The page is
+    // showing an app served by firmware that no longer exists, and if the
+    // firmware changed, every assumption in it is worse rather than better.
+    _onDeviceBoot(boot) {
+        if (!boot) {
+            // Firmware too old to say. Treat it as unknown rather than as
+            // unchanged: a device that cannot be identified is one whose
+            // freshness cannot be vouched for.
+            console.warn('[Bootstrap] device sent no boot identity');
+            return;
+        }
+        if (this._deviceBoot === null) {
+            this._deviceBoot = boot;
+            return;
+        }
+        if (this._deviceBoot === boot) {
+            this._wake?.();               // shortens a backoff, nothing more
+            return;
+        }
+
+        console.log('[Bootstrap] device restarted:', this._deviceBoot, '->', boot);
+        this._deviceBoot = boot;
+        this._reloadForRestart();
+    }
+
+    // Automatic, and said while it happens.
+    //
+    // A reload is the only correct answer to a restart, and it used to wait
+    // for a click -- which for someone watching a device on another continent
+    // meant a dead page until they came back to it.
+    //
+    // One message, kept up across the reload. There used to be a second one,
+    // different words in a different color on the page after the reload, and
+    // in use it was just another strip appearing unexplained a moment after
+    // the first -- the thing it existed to prevent. So now it is the same strip
+    // with the same words on both sides of the reload.
+    _reloadForRestart() {
+        this._turnEnded = true;           // stop the reconnect loop competing
+        this._showReconnecting(DEVICE_RESET_TEXT);
+        // Not a delay: the reload is not held for the message. The page that
+        // comes back puts the same strip up again and takes it down once it
+        // is connected, so it stays up for as long as it is true instead of
+        // for the hundred milliseconds this page has left.
+        try { sessionStorage.setItem(DEVICE_RESET_KEY, '1'); } catch { /* private mode */ }
+        window.location.reload();
+    }
+
+    // The server says which build it is serving. Different from ours means this
+    // page is running code the server no longer serves, so offer a reload --
+    // the same offer a worker turning over produces, with the same guard.
+    _onBuildStamp(build) {
+        // Heard from a live server, so whatever redial got us here worked.
+        this._signalBackoff = SIGNAL_REDIAL_MIN_MS;
+        if (!build || build === BUILD) return;
+        // Fetch the new worker now, so it is installed by the time anyone
+        // clicks. The reload would fetch it anyway; this gets it out of the way
+        // while the person is still reading the banner.
+        navigator.serviceWorker?.getRegistration('/')
+            .then(r => r?.update()).catch(() => {});
+        offerReloadFor(build);
+    }
+
+    // Keep a signaling socket up for as long as the session is.
+    //
+    // Only while the session is established and nothing else is managing the
+    // socket: before setup the connect path owns it, and during a reconnect the
+    // loop opens and closes its own. And only when there is no socket already --
+    // which is what stops a redial scheduled earlier from opening a second one
+    // after the reconnect loop has put its own in place.
+    _shouldHoldSignaling() {
+        return this._transportReady && !this._reconnecting && !this._turnEnded
+            && !this.ws;
+    }
+
+    _keepSignaling() {
+        if (!this._shouldHoldSignaling() || this._signalTimer) return;
+        const delay = this._signalBackoff;
+        this._signalBackoff = Math.min(this._signalBackoff * 2, SIGNAL_REDIAL_MAX_MS);
+        this._signalTimer = setTimeout(() => {
+            this._signalTimer = null;
+            this._redialSignaling();
+        }, delay);
+    }
+
+    // A control socket, not a session. It never sends `request`, so the device
+    // is not asked for an offer and nothing about the running session changes.
+    // It is there to be told things: a new build, a device coming back.
+    //
+    // A refusal needs no case of its own. While the device is still coming back,
+    // the server answers "Device not found" after its deliberate delay and
+    // closes, and the close schedules the next attempt with a longer wait. The
+    // backoff only resets on a build stamp, which the server sends after it has
+    // let the socket in -- so a refused socket, which also opens before it is
+    // refused, cannot reset it and turn the backoff into a retry every few
+    // seconds.
+    _redialSignaling() {
+        if (!this._shouldHoldSignaling()) return;
+        const proto = location.protocol === 'https:' ? 'wss:' : 'ws:';
+        const ws = new WebSocket(`${proto}//${location.host}/ws/client/${this.uid}`);
+        ws.bbControl = true;                  // carries no session; see the trickle
+        this.ws = ws;
+        if (this.debug) console.log('[Bootstrap] redialing signaling');
+
+        ws.onmessage = (event) => {
+            let msg;
+            try { msg = JSON.parse(event.data); } catch { return; }
+            if (msg.type === 'device_up') this._onDeviceBoot(msg.boot);
+            else if (msg.type === 'build_stamp') this._onBuildStamp(msg.build);
+        };
+        ws.onclose = () => {
+            if (ws !== this.ws) return;       // torn down or replaced
+            this.ws = null;
+            this._keepSignaling();
+        };
+    }
+
     // Tear down the dead transport and reset per-connection state so the next
     // attempt re-runs _onFirstConnected (re-detects relay, re-arms TURN
     // timers). The sessionId, iframe, SW registration, and window listener are
     // deliberately left intact — they survive the transport swap.
     _teardownTransport() {
+        // A redial waiting to fire would open a socket the reconnect loop does
+        // not know about. The loop owns the socket from here.
+        clearTimeout(this._signalTimer);
+        this._signalTimer = null;
         this._clearTurnEndTimers();
         this._clearReassureTimer();
         try { if (this.dataChannel) this.dataChannel.close(); } catch (e) {}
@@ -1935,19 +2165,24 @@ class BitBangConnection {
         this._turnExpiryMs = null;
     }
 
-    _showReconnecting() {
+    // The text is a parameter because this strip says two things: that the
+    // connection is being worked on, and that the device reset and the page is
+    // reloading. They follow each other -- the second usually replaces the first
+    // -- so one strip that changes its words beats two competing for the same
+    // place at the top of the page.
+    _showReconnecting(text = 'Reconnecting…') {
         let el = document.getElementById('bb-reconnect-banner');
         if (!el) {
             this._prevTitle = document.title;   // restored in _hideReconnecting
-            document.title = 'Reconnecting… — bitba.ng';
             el = document.createElement('div');
             el.id = 'bb-reconnect-banner';
-            el.textContent = 'Reconnecting…';
             el.style.cssText = 'position:fixed;top:0;left:0;right:0;z-index:2147483647;' +
                 'background:#333;color:#fff;font:13px/1.6 sans-serif;text-align:center;' +
                 'padding:4px;opacity:0.92;';
             document.body.appendChild(el);
         }
+        el.textContent = text;
+        document.title = text + ' - bitba.ng';
     }
 
     _hideReconnecting() {
@@ -2468,16 +2703,31 @@ class BitBangConnection {
 
         await this._sendConnectAndAwaitReady();
 
-        // Reconnect path: the transport was rebuilt under a live page. The
-        // iframe, SW registration, and window message listener all persist
-        // across the swap, so skip the one-time setup below — just resolve
-        // the in-flight attempt and let the proxied app retry over the new
-        // channel.
-        if (this._transportReady) {
-            this._onReconnected();
-            return;
-        }
+        // Two separate questions, which used to be one `if`.
+        //
+        // Is a reconnect attempt waiting to hear that it worked? Answer it
+        // first and unconditionally -- it is a no-op when nothing is waiting.
+        // It used to be answered only on the branch where the one-time setup
+        // had already been done, and a reconnect loop can start before the
+        // first connection ever gets here: anything that fails after DTLS is
+        // up but before ready -- a verify that doesn't match, a device
+        // resetting mid-handshake -- starts one. Its attempt then succeeded
+        // down the first-connection branch, nothing told it, and it waited out
+        // RECONNECT_TIMEOUT_MS over a working connection before tearing that
+        // connection down to try again. Twenty seconds of "Reconnecting..."
+        // and then a real disconnect, with nothing actually wrong.
+        this._onReconnected();
+
+        // Does the one-time setup still need doing? The iframe, SW
+        // registration, and window message listener all persist across a
+        // transport swap, so a page that has done it once never does it again.
+        if (this._transportReady) return;
         this._transportReady = true;
+
+        // The first connection is up, so anything the top strip was saying
+        // about getting here -- a device reset carried across the reload, for
+        // one -- has stopped being true.
+        this._hideReconnecting();
 
         // Register this tab's session with the SW. Deferred until here so
         // the device's routing declaration (received on 'ready') has been
@@ -3709,6 +3959,16 @@ window.addEventListener('hashchange', () => {
         return;
     }
 
+    // Read and cleared here, inside the top-level guard, and before any early
+    // return: sessionStorage is shared with a same-origin iframe, so outside
+    // the guard two copies of this file could race to consume it, and after an
+    // early return it would linger into whatever page came next.
+    let deviceReset = false;
+    try {
+        deviceReset = sessionStorage.getItem(DEVICE_RESET_KEY) === '1';
+        sessionStorage.removeItem(DEVICE_RESET_KEY);
+    } catch { /* private mode: nothing was stored */ }
+
     const pathParts = window.location.pathname.split('/').filter(Boolean);
 
     // Post-pairing bookmark nudge: shown once on the direct-flow load we just
@@ -3755,5 +4015,7 @@ window.addEventListener('hashchange', () => {
     const { uid, devicePath, deviceSearch, deviceHash, code } = parseDeviceURL();
     const connection = new BitBangConnection(uid, devicePath, code, deviceSearch, deviceHash);
     window.__bitbangConnection = connection;
+    // Taken down in onDataChannelReady once the first connection is up.
+    if (deviceReset) connection._showReconnecting(DEVICE_RESET_TEXT);
     await connection.connect();
 })();

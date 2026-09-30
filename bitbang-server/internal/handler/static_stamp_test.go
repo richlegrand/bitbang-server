@@ -42,7 +42,7 @@ func stampDir(t *testing.T) string {
 
 func serveAsset(t *testing.T, dir, path string) *httptest.ResponseRecorder {
 	t.Helper()
-	h := Static(dir, "")
+	h := Static(NewStampCache(dir), "")
 	r := httptest.NewRequest(http.MethodGet, path, nil)
 	w := httptest.NewRecorder()
 	h(w, r)
@@ -326,7 +326,7 @@ func stampOf(t *testing.T, h http.HandlerFunc) string {
 func TestStampFollowsAChangeUnderARunningHandler(t *testing.T) {
 	recheckEveryTime(t)
 	dir := stampDir(t)
-	h := Static(dir, "")
+	h := Static(NewStampCache(dir), "")
 
 	before := stampOf(t, h)
 
@@ -349,7 +349,7 @@ func TestStampFollowsAChangeUnderARunningHandler(t *testing.T) {
 func TestStampIgnoresATouchThatChangedNothing(t *testing.T) {
 	recheckEveryTime(t)
 	dir := stampDir(t)
-	h := Static(dir, "")
+	h := Static(NewStampCache(dir), "")
 
 	before := stampOf(t, h)
 

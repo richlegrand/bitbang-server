@@ -68,6 +68,12 @@ type Deps struct {
 	// registered reply. nil when nothing is tracked; its Latest() is
 	// nil-safe, so no call site needs to check.
 	Releases *releases.Tracker
+
+	// Stamps is the build stamp cache the static handler serves from. Shared
+	// so a client socket can tell an open tab the moment the stamp moves,
+	// from the same value the files carry. nil skips the announcement, which
+	// is what a test that never serves files wants.
+	Stamps *StampCache
 }
 
 // DeviceWS handles /ws/device/<uid>.
@@ -104,6 +110,7 @@ func (d *Deps) DeviceWS(w http.ResponseWriter, r *http.Request, uid string) {
 		return
 	}
 	conn.PublicKey = regMsg.PublicKey
+	conn.Boot = regMsg.Boot
 
 	// Preempt any existing connection for this UID. The newcomer satisfies the
 	// same UID-binding check as the incumbent, so it takes precedence
@@ -114,15 +121,26 @@ func (d *Deps) DeviceWS(w http.ResponseWriter, r *http.Request, uid string) {
 		d.Log.Warn("device preempted", "uid", uid)
 		_ = old.SendJSON(wire.Error{Type: "error", Message: "preempted"})
 		old.Close(websocket.CloseNormalClosure, "preempted")
+	}
 
-		// Boot any clients connected to the old device. Their existing
-		// WebRTC peer connections were negotiated with the previous
-		// device instance and won't carry over.
-		for _, c := range d.Clients.ForTarget(uid) {
-			_ = c.SendJSON(wire.Error{Type: "error", Message: "device_preempted"})
-			c.Close(websocket.CloseNormalClosure, "device_preempted")
-			d.Log.Info("booted client (device preempted)", "client_id", c.ClientID)
-		}
+	// Tell every client attached to this UID that a device registered, and
+	// which run of the firmware it is.
+	//
+	// This used to boot them -- close the socket and send device_preempted,
+	// on the reasoning that a peer connection negotiated with the previous
+	// instance will not carry over. Which is true when the device restarted
+	// and false when its signaling merely reconnected, and this could not
+	// tell the difference, so it assumed the worse of the two and threw away
+	// working sessions to be safe.
+	//
+	// The boot identity tells the difference, and the client is the one that
+	// knows which boot it was talking to, so the decision belongs there.
+	// Closing the socket would only take away the channel the answer arrives
+	// on.
+	for _, c := range d.Clients.ForTarget(uid) {
+		_ = c.SendJSON(wire.DeviceUp{Type: "device_up", Boot: conn.Boot})
+		d.Log.Info("told client a device registered",
+			"client_id", c.ClientID, "boot", conn.Boot)
 	}
 
 	// Apply device-supplied ICE override, if any.
@@ -154,6 +172,7 @@ func (d *Deps) DeviceWS(w http.ResponseWriter, r *http.Request, uid string) {
 		d.Log.Info("device disconnected",
 			"uid", uid,
 			"duration_s", int(time.Since(connectAt).Seconds()))
+
 	}()
 
 	d.deviceRelay(conn)
@@ -281,6 +300,10 @@ func (d *Deps) deviceRelay(conn *registry.DeviceConn) {
 			// can verify hash(pubkey) == uid and encrypt the
 			// bidirectional-verify payload without a separate round trip.
 			offer.DevicePubkey = conn.PublicKey
+			// And the boot identity, so a browser that missed the
+			// device_up notice still learns it here -- every session that
+			// comes up comes up through an offer.
+			offer.DeviceBoot = conn.Boot
 			_ = client.SendJSON(offer)
 			d.Log.Info("forwarded offer",
 				"from", conn.UID, "to", env.ClientID, "streams", offer.Streams)

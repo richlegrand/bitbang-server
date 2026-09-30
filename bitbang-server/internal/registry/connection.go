@@ -37,6 +37,11 @@ type DeviceConn struct {
 	// hash(decoded) == UID is enforced before this is stored.
 	PublicKey string
 
+	// Boot is the device's boot identity from its register message, kept so
+	// it can be stamped on every offer this connection relays. See
+	// wire.Register.Boot for what it is for; nothing here interprets it.
+	Boot string
+
 	writeMu sync.Mutex
 	closed  bool
 	closeMu sync.Mutex

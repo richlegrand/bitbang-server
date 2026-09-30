@@ -46,6 +46,31 @@ type Register struct {
 	PublicKey  string      `json:"public_key"`
 	ICEServers []ICEServer `json:"ice_servers,omitempty"` // device-supplied override
 	WantCode   bool        `json:"want_code,omitempty"`
+
+	// Boot identifies this run of the firmware: generated once at startup
+	// and the same for every reconnection until the device restarts.
+	//
+	// It is what tells a browser whether its own state is still worth
+	// anything. A device that reboots cannot pick up where the last one
+	// left off -- the page is holding an iframe rendered by the old
+	// firmware, a service worker's session table, stream elements bound to
+	// presentations that instance declared, a settings declaration and its
+	// revision -- and if the firmware changed, every one of those
+	// assumptions is worse rather than better. So a new boot means the page
+	// has to reload, and the same boot means it does not.
+	//
+	// Which is a distinction nothing else here can make. A new device
+	// connection does not imply a restart: a wss blip or this server
+	// restarting produces one with the firmware still running and every bit
+	// of that state still valid. And "I had to renegotiate" does not imply
+	// it either -- a relay expiry or a NAT change forces a whole new offer
+	// and answer with the device none the wiser.
+	//
+	// Minted by the device because only the device knows when it booted.
+	// Opaque and compared only for equality, so its length and alphabet are
+	// the device's business. Omitted by firmware that predates this, which
+	// reads as "cannot say" rather than as a change.
+	Boot string `json:"boot,omitempty"`
 }
 
 // RenewCode is sent by a device asking for a pairing code when the one it
@@ -135,6 +160,14 @@ type Offer struct {
 	TURNUnavailable bool              `json:"turn_unavailable,omitempty"`
 	DeviceName      string            `json:"device_name,omitempty"`
 	DevicePubkey    string            `json:"device_pubkey,omitempty"`
+
+	// DeviceBoot is the boot identity from Register, stamped here as well as
+	// announced in DeviceUp. Two routes for one fact, and this is the one
+	// that cannot go missing: a notification needs a client attached at the
+	// moment it is sent, while every session that comes up at all comes up
+	// through an offer. So a missed DeviceUp costs latency and the check
+	// still happens.
+	DeviceBoot string `json:"device_boot,omitempty"`
 }
 
 // PairInit is sent by a connector to a pairing endpoint with a 6-digit
@@ -181,6 +214,55 @@ type PairRequest struct {
 	ClientID   string      `json:"client_id"`
 	RemoteIP   string      `json:"remote_ip,omitempty"`
 	ICEServers []ICEServer `json:"ice_servers,omitempty"`
+}
+
+// DeviceUp tells an attached client that a device has registered for its
+// UID, and which run of the firmware that is.
+//
+// Sent on every registration, including the one that replaces a connection
+// the server still held. Whether anything should happen about it is the
+// browser's to decide by comparing Boot against the one it has been talking
+// to: different means the device restarted and the page's state is stale,
+// the same means signaling reconnected under a device that never stopped
+// running.
+//
+// There is deliberately no matching "device_down". The server could only
+// work out that a device had gone by missing keepalives, which for a device
+// halted by a programming tool means waiting out a read deadline -- and it
+// would be telling the browser something its own transport is about to
+// discover anyway. What the browser cannot work out for itself is whether
+// the thing that came back is the thing it was talking to, and that is all
+// this says.
+type DeviceUp struct {
+	Type string `json:"type"` // "device_up"
+
+	// Boot is the registering device's boot identity, or empty from firmware
+	// that does not send one -- in which case a browser has nothing to
+	// compare and should assume the worst, since a device it cannot identify
+	// is one it cannot vouch for the freshness of.
+	Boot string `json:"boot,omitempty"`
+}
+
+// BuildStamp tells a client which build of the browser runtime this server
+// is serving: the same value spliced into bootstrap.js and sw.js as they are
+// served.
+//
+// Sent when a client socket connects and again whenever the value moves. A
+// page compares it with the stamp it was loaded with, and a difference means
+// the page is running code the server no longer serves -- so it offers a
+// reload. Without this an open tab only found out on its next load, or when a
+// thirty-minute poll next fetched sw.js.
+//
+// Connecting counts, not just changing, because of how deploys usually
+// happen: the server restarts, every client socket drops, and the browser
+// redials. Its first message on the new socket is then the new stamp.
+//
+// "build_stamp" and not "build" because "build" is already the reply on the
+// page/worker postMessage channel, and the same word meaning two things on two
+// channels is the confusion the rest of this protocol is trying to get out of.
+type BuildStamp struct {
+	Type  string `json:"type"` // "build_stamp"
+	Build string `json:"build"`
 }
 
 // Envelope is used to peek at the "type" field before fully deserializing.
