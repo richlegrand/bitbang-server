@@ -1316,6 +1316,14 @@ async function proxyToDevice(event) {
                     // jar) receive the update. Sessions are per-tab and
                     // never match across tabs — filtering on sessionId
                     // silently dropped every cross-tab broadcast.
+                    //
+                    // It reaches the tab that made this request as well, and
+                    // carries the whole jar rather than what just changed.
+                    // Both are harmless only because the page writes what it
+                    // receives straight to the native cookie setter, never
+                    // through the one that forwards to this jar -- see the
+                    // cookie section of xhr-shim.js. When it went through that
+                    // one, every cookie here came back without its expiry.
                     const bc = new BroadcastChannel('bitbang-cookies');
                     bc.postMessage({
                         jarKey,
@@ -1363,7 +1371,15 @@ async function proxyToDevice(event) {
                                         if (c.expires !== null && c.expires <= now) continue;
                                         // HttpOnly stays jar-only (see invariant).
                                         if (!isMirrorable(c)) continue;
-                                        cookieSync += `document.cookie=${jsonForScript(c.name + '=' + c.value + ';path=' + c.path)};`;
+                                        // Expiry included, as the other two
+                                        // mirror sources in xhr-shim.js now
+                                        // do. This one runs before that file
+                                        // installs the forwarding setter, so
+                                        // it never echoed -- it just made
+                                        // every mirrored cookie a session one.
+                                        const exp = c.expires !== null
+                                            ? ';expires=' + new Date(c.expires).toUTCString() : '';
+                                        cookieSync += `document.cookie=${jsonForScript(c.name + '=' + c.value + ';path=' + c.path + exp)};`;
                                     }
                                 }
                             }

@@ -73,32 +73,86 @@
 
     // -- Cookie sync ---------------------------------------------------------
     //
-    // The SW renames device-set Set-Cookie headers to X-BB-Set-Cookie so
-    // they don't leak onto bitba.ng's own paths. We mirror them into
-    // document.cookie *synchronously in the same .then chain / event-loop
-    // tick* as the response arrives -- guaranteeing app code that reads
-    // document.cookie immediately after a fetch/XHR sees the fresh value.
+    // The service worker's jar is the truth about cookies: it is what goes out
+    // on requests to the device, and it is persisted. document.cookie is a
+    // mirror, kept so app code that reads cookies directly -- a CSRF token, a
+    // preference -- sees current values. Three things write the mirror: the
+    // preamble the service worker injects ahead of this file, X-BB-Set-Cookie on
+    // each fetch or XHR response, and a broadcast from the service worker
+    // whenever the jar changes, which is what keeps other tabs current.
+    //
+    // One rule makes that safe: a mirror never writes back. The setter further
+    // down forwards writes to the jar, because the app writing document.cookie
+    // is a real change the jar has to hear about -- but mirror writes go round
+    // it, to the native setter.
+    //
+    // They used not to. The broadcast wrote each cookie as name=value;path=...
+    // with no expiry, that went through the forwarding setter, and the service
+    // worker stored it -- so after any Set-Cookie, every cookie in the jar, not
+    // only the one just set, came back without an expiry and never expired
+    // again. A device that logged someone out by letting a session cookie lapse
+    // went on receiving it.
 
+    var nativeCookie = Object.getOwnPropertyDescriptor(Document.prototype, 'cookie');
+
+    // Write the mirror without forwarding. Where the forwarding setter could
+    // not be installed, document.cookie is native anyway, so either path is
+    // right.
+    function mirrorCookie(str) {
+        if (nativeCookie && nativeCookie.set) nativeCookie.set.call(document, str);
+        else document.cookie = str;
+    }
+
+    // The SW renames device-set Set-Cookie headers to X-BB-Set-Cookie so they
+    // don't leak onto bitba.ng's own paths. We mirror them into document.cookie
+    // *synchronously in the same .then chain / event-loop tick* as the response
+    // arrives -- guaranteeing app code that reads document.cookie immediately
+    // after a fetch/XHR sees the fresh value.
     function applyCookieHeader(headerValue) {
         if (!headerValue) return;
         try {
             var list = JSON.parse(headerValue);
             for (var i = 0; i < list.length; i++) {
-                document.cookie = list[i];
+                mirrorCookie(list[i]);
             }
         } catch (e) {}
     }
 
-    // Forward writes back to the SW so the jar mirrors app-side mutations
-    // (preferences, JS-set tokens). Setter-only wrap leaves reads native --
-    // less invasive than a full getter override that some browsers reject.
+    // The broadcast. It lived in ws-shim.js, which it has nothing to do with --
+    // that was just the shim injected into every page -- and being here, beside
+    // the rest of the mirror, is what puts it on the right side of the native
+    // setter.
+    //
+    // Filtered on jarKey (uid:target), not sessionId: sessionId is per tab, and
+    // the point of the broadcast is to hear what other tabs changed. Expiry is
+    // carried through, so the mirror is faithful as well as harmless.
     try {
-        var cookieDesc = Object.getOwnPropertyDescriptor(Document.prototype, 'cookie');
-        if (cookieDesc && cookieDesc.configurable && cookieDesc.set && cookieDesc.get) {
+        var cookieChannel = new BroadcastChannel('bitbang-cookies');
+        cookieChannel.onmessage = function(event) {
+            var d = event.data || {};
+            if (d.jarKey !== window.__bbJarKey) return;
+            var cookies = d.cookies || [];
+            for (var i = 0; i < cookies.length; i++) {
+                var c = cookies[i];
+                var s = c.name + '=' + c.value + ';path=' + c.path;
+                if (typeof c.expires === 'number') {
+                    s += ';expires=' + new Date(c.expires).toUTCString();
+                }
+                mirrorCookie(s);
+            }
+        };
+    } catch (e) {}
+
+    // Forward the app's own writes to the SW so the jar hears app-side
+    // changes (preferences, JS-set tokens). Setter-only wrap leaves reads
+    // native -- less invasive than a full getter override that some browsers
+    // reject.
+    try {
+        if (nativeCookie && nativeCookie.configurable && nativeCookie.set && nativeCookie.get) {
             Object.defineProperty(document, 'cookie', {
-                get: function() { return cookieDesc.get.call(document); },
+                get: function() { return nativeCookie.get.call(document); },
                 set: function(value) {
-                    cookieDesc.set.call(document, value);
+                    nativeCookie.set.call(document, value);
                     var sw = navigator.serviceWorker && navigator.serviceWorker.controller;
                     if (sw && window.__bbSessionId) {
                         sw.postMessage({

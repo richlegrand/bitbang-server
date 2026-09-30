@@ -17,24 +17,11 @@
     // Registry of active shim WebSockets by streamId
     const sockets = new Map();
 
-    // Mirror SW cookie-jar updates into document.cookie so app code that
-    // reads cookies directly (CSRF tokens, etc.) sees fresh values after
-    // AJAX responses with Set-Cookie. The SW strips Set-Cookie from the
-    // raw response, so without this mirror document.cookie goes stale.
-    try {
-        // Filter on jarKey (uid:target) so broadcasts from any tab on
-        // the same device reach us. sessionId is per-tab and never
-        // matches across tabs -- filtering on it silently dropped
-        // every cross-tab cookie update.
-        const cookieChannel = new BroadcastChannel('bitbang-cookies');
-        cookieChannel.onmessage = (event) => {
-            if (event.data?.jarKey !== window.__bbJarKey) return;
-            const cookies = event.data.cookies || [];
-            for (const c of cookies) {
-                document.cookie = `${c.name}=${c.value};path=${c.path}`;
-            }
-        };
-    } catch (e) {}
+    // The cookie mirror that used to be here -- a BroadcastChannel listener
+    // writing jar updates into document.cookie -- is in xhr-shim.js now, with
+    // the rest of the mirror. See the note there for why it had to move: from
+    // here its writes went through the setter that forwards to the jar, and
+    // came back without their expiry.
 
     // Ask the SW for the current cookie header for a given path. The SW
     // jar is the source of truth; document.cookie is a best-effort mirror.
