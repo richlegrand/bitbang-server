@@ -159,6 +159,10 @@ const STYLE = `
   .foot { margin-top:1rem; padding-top:.7rem; border-top:1px solid var(--line); }
   button.danger { border-color:var(--bad); color:var(--bad); }
 
+  /* A note used to lead with "-- ", which was punctuation doing a job the
+     layout was already doing: .ctl's gap separates it and the dim smaller type
+     says it is an aside. Two separators is one too many, and the dash read as
+     part of the sentence the device wrote. */
   .unit, .bound, .note, .ro { color:var(--dim); font-size:.85em; }
   /* A device URL is 55 characters with no space in it, so it overflows a 280px
      column and takes the layout with it. Broken anywhere rather than truncated,
@@ -505,7 +509,7 @@ export function mount(host, opts = {}) {
       if (typeof s.ro === 'string') {
         const why = document.createElement('span');
         why.className = 'note';
-        why.textContent = '-- ' + s.ro;
+        why.textContent = s.ro;
         ctl.appendChild(why);
       }
     } else if (s.t === 'action') {
@@ -640,13 +644,13 @@ export function mount(host, opts = {}) {
     if (s.rb) {
       const n = document.createElement('span');
       n.className = 'note';
-      n.textContent = '-- after restart';   /* at the row, not in a banner */
+      n.textContent = 'after restart';      /* at the row, not in a banner */
       ctl.appendChild(n);
     }
     if (s.pv !== undefined) {
       const n = document.createElement('span');
       n.className = 'note';
-      n.textContent = `-- ${s.pv} pending`;
+      n.textContent = `${s.pv} pending`;
       ctl.appendChild(n);
     }
 
@@ -666,7 +670,7 @@ export function mount(host, opts = {}) {
     const gate = () => {
       const off = s.en === false;
       for (const el of ctl.querySelectorAll('input,select,button')) el.disabled = off;
-      why.textContent = off && s.why ? '-- ' + s.why : '';
+      why.textContent = off && s.why ? s.why : '';
       /* Hidden is the stronger form and the device has to ask for it by name.
          Greying is preferred: a control that vanishes leaves someone hunting for
          what was there a moment ago, which is what the camera's own panel does. */
