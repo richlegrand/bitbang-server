@@ -7,15 +7,22 @@
  *
  * Communication with the bootstrap parent uses postMessage:
  *   iframe -> parent: ws-open, ws-send, ws-close
- *   parent -> iframe: ws-opened, ws-message, ws-closed, ws-error
+ *   parent -> iframe: ws-assign, ws-opened, ws-message, ws-closed, ws-error
  */
 
 (function() {
     const NativeWebSocket = window.WebSocket;
     const parent = window.parent;
 
-    // Registry of active shim WebSockets by streamId
+    // Sockets the bootstrap has given a stream, by streamId.
     const sockets = new Map();
+
+    // Sockets waiting for their stream, by an id this file mints. ws-open
+    // carries the id and ws-assign echoes it, so each assignment finds the
+    // socket that asked for it. They used to be matched on pathname, and two
+    // sockets opened to one path before the first assignment both took it.
+    const opening = new Map();
+    let nextOpenId = 1;
 
     // The cookie mirror that used to be here -- a BroadcastChannel listener
     // writing jar updates into document.cookie -- is in xhr-shim.js now, with
@@ -46,7 +53,23 @@
     // Listen for messages from the bootstrap parent
     window.addEventListener('message', (event) => {
         if (event.source !== parent) return;
-        const { type, streamId, data, code, reason, message } = event.data || {};
+        const { type, openId, streamId, data, code, reason } = event.data || {};
+
+        if (type === 'ws-assign') {
+            const ws = opening.get(openId);
+            if (!ws) return;
+            opening.delete(openId);
+            log('ws-assign received, streamId=' + streamId);
+            // Closed while it waited: the app has already had its close
+            // event, so all that's left is to give the stream back.
+            if (ws._readyState === NativeWebSocket.CLOSED) {
+                parent.postMessage({ type: 'ws-close', streamId, code: 1000, reason: '' }, '*');
+                return;
+            }
+            ws._streamId = streamId;
+            sockets.set(streamId, ws);
+            return;
+        }
 
         const ws = sockets.get(streamId);
         if (!ws) return;
@@ -54,26 +77,36 @@
         if (type === 'ws-opened') {
             log('ws-opened, streamId=' + streamId);
             ws._readyState = NativeWebSocket.OPEN;
-            ws.dispatchEvent(new Event('open'));
-            if (ws.onopen) ws.onopen(new Event('open'));
+            fire(ws, new Event('open'));
         } else if (type === 'ws-message') {
-            const evt = new MessageEvent('message', { data });
-            ws.dispatchEvent(evt);
-            if (ws.onmessage) ws.onmessage(evt);
+            fire(ws, new MessageEvent('message', { data }));
         } else if (type === 'ws-closed') {
             log('ws-closed, streamId=' + streamId, 'code=' + code);
-            ws._readyState = NativeWebSocket.CLOSED;
             sockets.delete(streamId);
-            const evt = new CloseEvent('close', { code: code || 1000, reason: reason || '' });
-            ws.dispatchEvent(evt);
-            if (ws.onclose) ws.onclose(evt);
+            ws._readyState = NativeWebSocket.CLOSED;
+            fire(ws, new CloseEvent('close', { code: code || 1000, reason: reason || '', wasClean: true }));
         } else if (type === 'ws-error') {
             log('ws-error, streamId=' + streamId);
-            const evt = new Event('error');
-            ws.dispatchEvent(evt);
-            if (ws.onerror) ws.onerror(evt);
+            fire(ws, new Event('error'));
         }
     });
+
+    function fire(ws, evt) {
+        ws.dispatchEvent(evt);
+        const handler = ws['on' + evt.type];
+        if (handler) handler.call(ws, evt);
+    }
+
+    // A socket closed before it opened fails, as a real one does: error,
+    // then close with 1006. Fired a tick later, since close() never runs
+    // the app's handlers from inside itself.
+    function failLater(ws) {
+        ws._readyState = NativeWebSocket.CLOSED;
+        setTimeout(() => {
+            fire(ws, new Event('error'));
+            fire(ws, new CloseEvent('close', { code: 1006, reason: '', wasClean: false }));
+        }, 0);
+    }
 
     function log(msg, ...args) {
         if (!window.__bbDebug) return;
@@ -111,25 +144,17 @@
             this.url = url;
             this._protocols = protocols;
 
-            // Request a streamId from the bootstrap and open the WS stream.
+            // Ask the bootstrap for a stream; ws-assign answers with its id.
             // Cookies come from the SW jar (canonical) instead of document.cookie,
-            // which can be stale after AJAX Set-Cookie responses.
+            // which can be stale after AJAX Set-Cookie responses. A socket
+            // closed during that wait never asks at all.
+            const openId = nextOpenId++;
             getCookiesFromSW(pathname).then((cookies) => {
+                if (this._readyState === NativeWebSocket.CLOSED) return;
+                opening.set(openId, this);
                 log('ws-open posted', pathname, 'cookies.len=' + cookies.length);
-                parent.postMessage({ type: 'ws-open', pathname, protocols, cookies }, '*');
+                parent.postMessage({ type: 'ws-open', openId, pathname, protocols, cookies }, '*');
             });
-
-            // Bootstrap will respond with ws-assign containing the streamId
-            const assignHandler = (event) => {
-                if (event.source !== parent) return;
-                if (event.data?.type === 'ws-assign' && event.data.pathname === pathname) {
-                    window.removeEventListener('message', assignHandler);
-                    this._streamId = event.data.streamId;
-                    sockets.set(this._streamId, this);
-                    log('ws-assign received, streamId=' + this._streamId);
-                }
-            };
-            window.addEventListener('message', assignHandler);
         }
 
         get readyState() { return this._readyState; }
@@ -148,7 +173,21 @@
         }
 
         close(code, reason) {
-            if (this._readyState === NativeWebSocket.CLOSED) return;
+            if (this._readyState === NativeWebSocket.CLOSING ||
+                this._readyState === NativeWebSocket.CLOSED) return;
+            if (this._readyState === NativeWebSocket.CONNECTING) {
+                // A stream already assigned is given back now. One not yet
+                // assigned is given back by ws-assign, which finds the
+                // socket CLOSED.
+                if (this._streamId !== undefined) {
+                    sockets.delete(this._streamId);
+                    parent.postMessage({ type: 'ws-close', streamId: this._streamId,
+                                         code: 1000, reason: '' }, '*');
+                }
+                failLater(this);
+                return;
+            }
+            // Open: the bootstrap answers with ws-closed, and that fires close.
             this._readyState = NativeWebSocket.CLOSING;
             parent.postMessage({
                 type: 'ws-close',

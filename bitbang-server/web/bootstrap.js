@@ -2925,7 +2925,7 @@ class BitBangConnection {
 
                 this.wsStreams.set(streamId, { iframe: iframe.contentWindow, kind: 'bitbang' });
                 iframe.contentWindow.postMessage({
-                    type: 'ws-assign', pathname: msg.pathname, streamId,
+                    type: 'ws-assign', openId: msg.openId, streamId,
                 }, '*');
                 this.dataChannel.send(this.createFrame(streamId, FLAG_SYN, JSON.stringify(syn)));
                 // Tell the iframe the WS is open now. Listener handlers
@@ -2940,7 +2940,7 @@ class BitBangConnection {
             this.wsStreams.set(streamId, { iframe: iframe.contentWindow, kind: 'websocket' });
             iframe.contentWindow.postMessage({
                 type: 'ws-assign',
-                pathname: msg.pathname,
+                openId: msg.openId,
                 streamId
             }, '*');
             const synPayload = JSON.stringify({
@@ -3001,6 +3001,14 @@ class BitBangConnection {
             if (!ws) return;
             this.wsStreams.delete(msg.streamId);
             this.dataChannel.send(this.createFrame(msg.streamId, FLAG_FIN, new Uint8Array(0)));
+            // The stream is forgotten, so whatever the device answers is
+            // dropped. The app's close event comes from here, carrying the
+            // code it asked to close with; without it the socket sat in
+            // CLOSING and onclose never ran.
+            ws.iframe.postMessage({
+                type: 'ws-closed', streamId: msg.streamId,
+                code: msg.code || 1000, reason: msg.reason || '',
+            }, '*');
         }
     }
 
