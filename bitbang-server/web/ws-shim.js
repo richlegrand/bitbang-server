@@ -79,7 +79,12 @@
             ws._readyState = NativeWebSocket.OPEN;
             fire(ws, new Event('open'));
         } else if (type === 'ws-message') {
-            fire(ws, new MessageEvent('message', { data }));
+            // Binary comes from the bootstrap as an ArrayBuffer. A real
+            // WebSocket hands it over as a Blob unless binaryType says
+            // otherwise.
+            const msg = data instanceof ArrayBuffer && ws.binaryType !== 'arraybuffer'
+                ? new Blob([data]) : data;
+            fire(ws, new MessageEvent('message', { data: msg }));
         } else if (type === 'ws-closed') {
             log('ws-closed, streamId=' + streamId, 'code=' + code);
             sockets.delete(streamId);
@@ -197,11 +202,25 @@
             }, '*');
         }
 
+        // Sends are posted to the bootstrap, not queued here, so nothing is
+        // ever buffered. No subprotocol or extension is negotiated with the
+        // device, and '' is what a real WebSocket reports when none is.
+        get bufferedAmount() { return 0; }
+        get protocol() { return ''; }
+        get extensions() { return ''; }
+
         // Standard WebSocket constants
         static get CONNECTING() { return 0; }
         static get OPEN() { return 1; }
         static get CLOSING() { return 2; }
         static get CLOSED() { return 3; }
+    }
+
+    // A real WebSocket has the constants on instances too, and
+    // `ws.readyState === ws.OPEN` is how a lot of code checks.
+    for (const name of ['CONNECTING', 'OPEN', 'CLOSING', 'CLOSED']) {
+        Object.defineProperty(BitBangWebSocket.prototype, name,
+            { value: BitBangWebSocket[name], enumerable: true });
     }
 
     // Replace the global WebSocket

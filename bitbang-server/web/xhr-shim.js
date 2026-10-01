@@ -210,10 +210,28 @@
     // BitBang's SW, breaking the data channel. Intercept the registration
     // and return a no-op so the app thinks it succeeded.
     if (navigator.serviceWorker) {
-        var origRegister = navigator.serviceWorker.register.bind(navigator.serviceWorker);
         navigator.serviceWorker.register = function(scriptURL, options) {
             console.log('[BitBang] Blocked SW registration from proxied app:', scriptURL);
             return Promise.resolve(navigator.serviceWorker.ready);
+        };
+    }
+
+    // The other way an app removes BitBang's SW: unregistering it. "Clear out
+    // stale workers at startup" is routine, by getRegistrations() or by
+    // ready.then(r => r.unregister()) -- and ready, like register above,
+    // hands the app BitBang's registration. Guarding unregister itself
+    // covers every way of getting hold of it. The app is told it worked,
+    // as with register.
+    var Registration = window.ServiceWorkerRegistration;
+    if (Registration && Registration.prototype.unregister) {
+        var origUnregister = Registration.prototype.unregister;
+        Registration.prototype.unregister = function() {
+            var w = this.active || this.waiting || this.installing;
+            if (w && new URL(w.scriptURL).pathname === '/__bitbang__/sw.js') {
+                console.log('[BitBang] Blocked unregistering the BitBang SW from proxied app');
+                return Promise.resolve(true);
+            }
+            return origUnregister.apply(this, arguments);
         };
     }
 
