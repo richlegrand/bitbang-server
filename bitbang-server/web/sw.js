@@ -17,13 +17,76 @@ console.log('[SW] booted', BUILD);
 self.addEventListener('install', () => self.skipWaiting());
 self.addEventListener('activate', (event) => event.waitUntil(self.clients.claim()));
 
+// -- Persisted maps ----------------------------------------------------------
+//
+// A Map kept in the Cache API, so SW idle-termination (Chrome ~30s) doesn't
+// lose it. Three of them -- sessions, client bindings, the cookie jar -- and
+// this is the only code that reads or writes one, so what one gets right they
+// all get right. They used to be written out three times, and the ordering
+// fix below had reached two of the three.
+//
+// Every save writes a FULL snapshot, so two saves landing out of order would
+// revert the whole table, not just lose one entry. So the writes are chained,
+// each taking its snapshot when its turn comes: the last write is of the
+// latest table, never an older one.
+//
+// The chain starts behind the load. Nothing stops a save while the map is
+// still loading -- rememberClientSession doesn't wait, and on a cold start it
+// is often first -- and a snapshot taken then would write a table missing
+// everything persisted. For the same reason the load doesn't overwrite an
+// entry set while it ran: that entry is newer than the persisted one.
+//
+// revive and forSave are per entry, and return undefined to drop it. Pruning
+// stays with the callers: what to evict is a judgment about what entries
+// mean, and it differs in kind between the three.
+//
+// save returns the write, for keepAlive() -- an unawaited cache.put is dropped
+// outright if the SW is terminated first.
+function persistedMap(cacheName, key, { revive = (v) => v, forSave = (v) => v } = {}) {
+    const map = new Map();
+    const ready = (async () => {
+        try {
+            const cache = await caches.open(cacheName);
+            const resp = await cache.match(key);
+            if (!resp) return;
+            const data = await resp.json();
+            if (!data || typeof data !== 'object') return;
+            for (const [k, v] of Object.entries(data)) {
+                if (map.has(k)) continue;
+                const entry = revive(v);
+                if (entry !== undefined) map.set(k, entry);
+            }
+        } catch (e) {}
+    })();
+    function snapshot() {
+        const data = {};
+        for (const [k, v] of map) {
+            const entry = forSave(v);
+            if (entry !== undefined) data[k] = entry;
+        }
+        return JSON.stringify(data);
+    }
+    let chain = ready;
+    function save() {
+        chain = chain
+            .then(() => caches.open(cacheName))
+            .then(cache => cache.put(key, new Response(snapshot(), {
+                headers: { 'Content-Type': 'application/json' },
+            })))
+            .catch(() => {});
+        return chain;
+    }
+    return { map, ready, save };
+}
+
 // -- Session tracking --------------------------------------------------------
 
-// Map of sessionId -> { clientId, uid, target }.
-// Persisted to Cache API so SW idle-termination (Chrome ~30s) doesn't drop
-// session records while the bootstrap window is still alive.
-const sessions = new Map();
-const SESSIONS_CACHE_KEY = '/__bitbang__/sessions';
+// Map of sessionId -> { clientId, uid, target, code, lastActive, ... }.
+// Persisted so a session survives the SW being terminated while the
+// bootstrap window is still alive.
+const {
+    map: sessions, ready: sessionsReady, save: saveSessions,
+} = persistedMap('bitbang-sessions', '/__bitbang__/sessions');
 
 // -- Client -> session binding (fix 1c) --------------------------------------
 //
@@ -47,49 +110,13 @@ const SESSIONS_CACHE_KEY = '/__bitbang__/sessions';
 // Persisted alongside sessions because SW idle-termination (~30s) is easily
 // reached while a user types a password; an in-memory-only binding would be
 // gone by the time the login POST completes.
-const clientSessions = new Map();
-const CLIENT_SESSIONS_CACHE_KEY = '/__bitbang__/client-sessions';
+const {
+    map: clientSessions, ready: clientSessionsReady, save: saveClientSessions,
+} = persistedMap('bitbang-sessions', '/__bitbang__/client-sessions');
 
-async function loadSessions() {
-    try {
-        const cache = await caches.open('bitbang-sessions');
-        const resp = await cache.match(SESSIONS_CACHE_KEY);
-        if (resp) {
-            const data = await resp.json();
-            const entries = Object.entries(data);
-            for (const [sid, sess] of entries) {
-                sessions.set(sid, sess);
-            }
-            if (entries.length > 0) {
-                console.log(`[SW] Restored ${entries.length} session(s) from cache`);
-            }
-        }
-        const cresp = await cache.match(CLIENT_SESSIONS_CACHE_KEY);
-        if (cresp) {
-            const cdata = await cresp.json();
-            for (const [cid, sid] of Object.entries(cdata)) {
-                clientSessions.set(cid, sid);
-            }
-        }
-    } catch (e) {}
-}
-
-// Serialized like the cookie jar: full-snapshot writes that land out of
-// order would revert the whole binding table, not just lose one entry.
-let clientSessionsSaveChain = Promise.resolve();
-
-function saveClientSessions() {
-    const data = {};
-    for (const [cid, sid] of clientSessions) data[cid] = sid;
-    const body = JSON.stringify(data);
-    clientSessionsSaveChain = clientSessionsSaveChain
-        .then(() => caches.open('bitbang-sessions'))
-        .then(cache => cache.put(CLIENT_SESSIONS_CACHE_KEY,
-            new Response(body, { headers: { 'Content-Type': 'application/json' } })
-        ))
-        .catch(() => {});
-    return clientSessionsSaveChain;
-}
+sessionsReady.then(() => {
+    if (sessions.size > 0) console.log(`[SW] Restored ${sessions.size} session(s) from cache`);
+});
 
 // Drop bindings whose session is gone, then bound the table. Each navigation
 // within a session mints a new clientId, so without a cap a long-lived
@@ -116,20 +143,6 @@ function rememberClientSession(event, sessionId) {
     pruneClientSessions();
     keepAlive(event, saveClientSessions());
 }
-
-function saveSessions() {
-    const data = {};
-    for (const [sid, sess] of sessions) data[sid] = sess;
-    caches.open('bitbang-sessions').then(cache => {
-        cache.put(SESSIONS_CACHE_KEY,
-            new Response(JSON.stringify(data), {
-                headers: { 'Content-Type': 'application/json' }
-            })
-        );
-    }).catch(() => {});
-}
-
-const sessionsReady = loadSessions();
 
 self.addEventListener('message', async (event) => {
     // Answered on the port the page supplied, so it works before we
@@ -346,6 +359,7 @@ const SESSION_STRATEGIES = [
 // can't is a miss, and the next strategy gets its turn.
 async function findSession(event, { concreteOnly = false, accept = () => true } = {}) {
     await sessionsReady;
+    await clientSessionsReady;
 
     // Top-level navigations to /<uid>/... are bootstrap-page loads — they
     // must always reach the signaling server (which serves bootstrap.html),
@@ -435,8 +449,14 @@ function isShortTopPath(pathname) {
 
 // -- Cookie jar (persisted to Cache API) -------------------------------------
 
-const cookieJar = new Map();
-const COOKIE_CACHE_KEY = '/__bitbang__/cookie-jar';
+// jarKey (uid:target) -> [cookie]. Loaded on SW startup; cookieJarReady is
+// awaited before a request is sent, so the first one carries its cookies.
+const {
+    map: cookieJar, ready: cookieJarReady, save: saveCookieJar,
+} = persistedMap('bitbang-cookies', '/__bitbang__/cookie-jar', {
+    revive: reviveCookies,
+    forSave: unexpiredCookies,
+});
 
 // Bounds on the jar. Without them it only ever grew: entries leave when a
 // cookie's own expiry passes, and a session cookie (expires === null) has
@@ -497,76 +517,37 @@ function dropSessionCookiesForDeadDevices() {
     return changed;
 }
 
-async function loadCookieJar() {
-    try {
-        const cache = await caches.open('bitbang-cookies');
-        const resp = await cache.match(COOKIE_CACHE_KEY);
-        if (!resp) return;
-        const data = await resp.json();
-        if (!data || typeof data !== 'object') return;
-
-        const now = Date.now();
-        for (const [key, cookies] of Object.entries(data)) {
-            // Normalize on the way in rather than trusting the cache.
-            //
-            // The persisted shape has already changed once (httpOnly was
-            // added), and a partial or corrupt write is possible. Without
-            // this, a non-array value here makes every later
-            // jar.filter/findIndex throw -- inside the response handler,
-            // where an uncaught throw can leave the request promise
-            // unsettled and hang the fetch. One bad entry would break
-            // cookies permanently until the user cleared site data.
-            if (!Array.isArray(cookies)) continue;
-            const clean = [];
-            for (const c of cookies) {
-                if (!c || typeof c.name !== 'string' || typeof c.value !== 'string') continue;
-                const expires = typeof c.expires === 'number' ? c.expires : null;
-                // Filter expired on the way in, mirroring saveCookieJar's
-                // filter on the way out. Without this the two sides
-                // disagree and expired cookies get resurrected on restart.
-                if (expires !== null && expires <= now) continue;
-                clean.push({
-                    name: c.name,
-                    value: c.value,
-                    path: typeof c.path === 'string' && c.path ? c.path : '/',
-                    expires,
-                    httpOnly: !!c.httpOnly,
-                });
-            }
-            if (clean.length > 0) cookieJar.set(key, clean);
-        }
-    } catch (e) {}
+// One partition as it comes out of the cache, normalized rather than trusted.
+//
+// The persisted shape has already changed once (httpOnly was added), and a
+// partial or corrupt write is possible. Without this, a non-array value makes
+// every later jar.filter/findIndex throw -- inside the response handler,
+// where an uncaught throw can leave the request promise unsettled and hang
+// the fetch. One bad entry would break cookies permanently until the user
+// cleared site data.
+function reviveCookies(cookies) {
+    if (!Array.isArray(cookies)) return undefined;
+    const clean = [];
+    for (const c of cookies) {
+        if (!c || typeof c.name !== 'string' || typeof c.value !== 'string') continue;
+        clean.push({
+            name: c.name,
+            value: c.value,
+            path: typeof c.path === 'string' && c.path ? c.path : '/',
+            expires: typeof c.expires === 'number' ? c.expires : null,
+            httpOnly: !!c.httpOnly,
+        });
+    }
+    // Expired ones are dropped on the way in as well as on the way out, or
+    // the two sides disagree and an expired cookie is resurrected on restart.
+    return unexpiredCookies(clean);
 }
 
-// Serializes jar writes. Every save persists a FULL snapshot, so two
-// concurrent saves resolving out of order would revert the whole jar to an
-// older state, not just lose one cookie. Chaining guarantees the last
-// caller's snapshot is the last one written.
-let cookieSaveChain = Promise.resolve();
-
-function saveCookieJar() {
-    const data = {};
+// One partition without its expired cookies; undefined if that leaves none.
+function unexpiredCookies(cookies) {
     const now = Date.now();
-    for (const [key, cookies] of cookieJar) {
-        const valid = cookies.filter(c => c.expires === null || c.expires > now);
-        if (valid.length > 0) data[key] = valid;
-    }
-    // Serialize synchronously so the snapshot is frozen at call time.
-    // Deferring JSON.stringify into the .then would stringify whatever the
-    // jar looks like when the promise runs, not when the save was requested.
-    const body = JSON.stringify(data);
-
-    cookieSaveChain = cookieSaveChain
-        .then(() => caches.open('bitbang-cookies'))
-        .then(cache => cache.put(COOKIE_CACHE_KEY,
-            new Response(body, {
-                headers: { 'Content-Type': 'application/json' }
-            })
-        ))
-        .catch(() => {});
-    // Returned so callers can hand it to keepAlive() -- an unawaited
-    // cache.put is dropped outright if the SW is terminated first.
-    return cookieSaveChain;
+    const valid = cookies.filter(c => c.expires === null || c.expires > now);
+    return valid.length > 0 ? valid : undefined;
 }
 
 // Hold the service worker alive until an async persistence write settles.
@@ -590,10 +571,6 @@ function keepAlive(event, promise) {
     }
     return promise;
 }
-
-// Load persisted cookies on SW startup. The promise is awaited in the
-// fetch handler to ensure cookies are available for the first request.
-const cookieJarReady = loadCookieJar();
 
 // Browsers cap cookie lifetime at 400 days (RFC 6265bis; Chrome 104+).
 // The jar clamps to the same ceiling so it is never MORE permissive than
