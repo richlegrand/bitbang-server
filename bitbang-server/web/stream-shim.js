@@ -344,9 +344,16 @@
 
     /* bootstrap hands the port over once the page has loaded. This listener is
        installed while the document is still parsing -- the shim is the first
-       script in the response -- so the handshake cannot be missed. */
+       script in the response -- so the handshake cannot be missed.
+
+       The whole vocabulary, with bootstrap.js's wireStreams as the other end:
+         parent -> page   stream_port   (window message, carries the port)
+         on the port:
+           page -> parent   subscribe   { name, on }
+           parent -> page   streams     the declared streams
+                            frame       one decoded frame */
     window.addEventListener('message', (e) => {
-        if (!e.data || e.data.type !== 'bitbang-stream-port') return;
+        if (!e.data || e.data.type !== 'stream_port') return;
         if (!e.ports || !e.ports[0]) return;
         port = e.ports[0];
         port.onmessage = onPortMessage;

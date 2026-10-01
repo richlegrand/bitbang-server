@@ -5,9 +5,16 @@
  * over the BitBang SWSP data channel. Loaded into the device iframe
  * before the app's own scripts.
  *
- * Communication with the bootstrap parent uses postMessage:
- *   iframe -> parent: ws-open, ws-send, ws-close
- *   parent -> iframe: ws-assign, ws-opened, ws-message, ws-closed, ws-error
+ * Communication with the bootstrap parent uses postMessage. The whole
+ * vocabulary, with bootstrap.js's handleWSShimMessage as the other end:
+ *
+ *   iframe -> parent  ws_open    { openId, pathname, protocols, cookies }
+ *                     ws_send    { streamId, data, isText }
+ *                     ws_close   { streamId, code, reason }
+ *   parent -> iframe  ws_assign  { openId, streamId }
+ *                     ws_opened  { streamId }
+ *                     ws_message { streamId, data }
+ *                     ws_closed  { streamId, code, reason }
  */
 
 (function() {
@@ -17,8 +24,8 @@
     // Sockets the bootstrap has given a stream, by streamId.
     const sockets = new Map();
 
-    // Sockets waiting for their stream, by an id this file mints. ws-open
-    // carries the id and ws-assign echoes it, so each assignment finds the
+    // Sockets waiting for their stream, by an id this file mints. ws_open
+    // carries the id and ws_assign echoes it, so each assignment finds the
     // socket that asked for it. They used to be matched on pathname, and two
     // sockets opened to one path before the first assignment both took it.
     const opening = new Map();
@@ -43,7 +50,7 @@
                 resolve(e.data?.cookies || '');
             };
             sw.postMessage({
-                type: 'getCookies',
+                type: 'get_cookies',
                 sessionId: window.__bbSessionId,
                 path,
             }, [channel.port2]);
@@ -55,15 +62,15 @@
         if (event.source !== parent) return;
         const { type, openId, streamId, data, code, reason } = event.data || {};
 
-        if (type === 'ws-assign') {
+        if (type === 'ws_assign') {
             const ws = opening.get(openId);
             if (!ws) return;
             opening.delete(openId);
-            log('ws-assign received, streamId=' + streamId);
+            log('ws_assign received, streamId=' + streamId);
             // Closed while it waited: the app has already had its close
             // event, so all that's left is to give the stream back.
             if (ws._readyState === NativeWebSocket.CLOSED) {
-                parent.postMessage({ type: 'ws-close', streamId, code: 1000, reason: '' }, '*');
+                parent.postMessage({ type: 'ws_close', streamId, code: 1000, reason: '' }, '*');
                 return;
             }
             ws._streamId = streamId;
@@ -74,25 +81,22 @@
         const ws = sockets.get(streamId);
         if (!ws) return;
 
-        if (type === 'ws-opened') {
-            log('ws-opened, streamId=' + streamId);
+        if (type === 'ws_opened') {
+            log('ws_opened, streamId=' + streamId);
             ws._readyState = NativeWebSocket.OPEN;
             fire(ws, new Event('open'));
-        } else if (type === 'ws-message') {
+        } else if (type === 'ws_message') {
             // Binary comes from the bootstrap as an ArrayBuffer. A real
             // WebSocket hands it over as a Blob unless binaryType says
             // otherwise.
             const msg = data instanceof ArrayBuffer && ws.binaryType !== 'arraybuffer'
                 ? new Blob([data]) : data;
             fire(ws, new MessageEvent('message', { data: msg }));
-        } else if (type === 'ws-closed') {
-            log('ws-closed, streamId=' + streamId, 'code=' + code);
+        } else if (type === 'ws_closed') {
+            log('ws_closed, streamId=' + streamId, 'code=' + code);
             sockets.delete(streamId);
             ws._readyState = NativeWebSocket.CLOSED;
             fire(ws, new CloseEvent('close', { code: code || 1000, reason: reason || '', wasClean: true }));
-        } else if (type === 'ws-error') {
-            log('ws-error, streamId=' + streamId);
-            fire(ws, new Event('error'));
         }
     });
 
@@ -149,7 +153,7 @@
             this.url = url;
             this._protocols = protocols;
 
-            // Ask the bootstrap for a stream; ws-assign answers with its id.
+            // Ask the bootstrap for a stream; ws_assign answers with its id.
             // Cookies come from the SW jar (canonical) instead of document.cookie,
             // which can be stale after AJAX Set-Cookie responses. A socket
             // closed during that wait never asks at all.
@@ -157,8 +161,8 @@
             getCookiesFromSW(pathname).then((cookies) => {
                 if (this._readyState === NativeWebSocket.CLOSED) return;
                 opening.set(openId, this);
-                log('ws-open posted', pathname, 'cookies.len=' + cookies.length);
-                parent.postMessage({ type: 'ws-open', openId, pathname, protocols, cookies }, '*');
+                log('ws_open posted', pathname, 'cookies.len=' + cookies.length);
+                parent.postMessage({ type: 'ws_open', openId, pathname, protocols, cookies }, '*');
             });
         }
 
@@ -170,7 +174,7 @@
             }
             const isText = typeof data === 'string';
             parent.postMessage({
-                type: 'ws-send',
+                type: 'ws_send',
                 streamId: this._streamId,
                 data,
                 isText
@@ -182,20 +186,20 @@
                 this._readyState === NativeWebSocket.CLOSED) return;
             if (this._readyState === NativeWebSocket.CONNECTING) {
                 // A stream already assigned is given back now. One not yet
-                // assigned is given back by ws-assign, which finds the
+                // assigned is given back by ws_assign, which finds the
                 // socket CLOSED.
                 if (this._streamId !== undefined) {
                     sockets.delete(this._streamId);
-                    parent.postMessage({ type: 'ws-close', streamId: this._streamId,
+                    parent.postMessage({ type: 'ws_close', streamId: this._streamId,
                                          code: 1000, reason: '' }, '*');
                 }
                 failLater(this);
                 return;
             }
-            // Open: the bootstrap answers with ws-closed, and that fires close.
+            // Open: the bootstrap answers with ws_closed, and that fires close.
             this._readyState = NativeWebSocket.CLOSING;
             parent.postMessage({
-                type: 'ws-close',
+                type: 'ws_close',
                 streamId: this._streamId,
                 code: code || 1000,
                 reason: reason || ''

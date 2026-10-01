@@ -25,7 +25,7 @@ function askServiceWorkerBuild(worker) {
             resolve(e.data?.build ?? null);
         };
         try {
-            worker.postMessage({ type: 'getBuild' }, [ch.port2]);
+            worker.postMessage({ type: 'get_build' }, [ch.port2]);
         } catch {
             clearTimeout(timer);
             resolve(null);
@@ -486,6 +486,10 @@ class BitBangConnection {
         console.log('[Bootstrap] ctor', this.sessionId);
         this.candidateQueue = new CandidateQueue();
         this.remoteDescriptionSet = false;
+        // Upload progress, for whichever device page started the upload
+        // (ota.html, the CLI's file browser). The whole vocabulary:
+        // upload_progress { loaded, total }, upload_complete (all bytes
+        // sent), then upload_success or upload_failed once the device answers.
         this.progressChannel = new BroadcastChannel('bitbang-progress');
         // Frames arriving on a stream channel, forwarded to whatever page the
         // device served. The page owns the canvas; this only carries bytes.
@@ -1015,11 +1019,7 @@ class BitBangConnection {
     // outside this file decides what goes on the screen.
     userErrorMessage(code) {
         switch (code) {
-            case 'device_not_found':
-            // A server that predates error codes sends only the English.
-            // Kept for one release, so a new page still reads an old server.
-            case 'Device not found':
-                return 'Device not found';
+            case 'device_not_found': return 'Device not found';
             case 'WebSocket connection failed': return 'Could not reach server';
             case 'Service Worker not supported': return 'This browser is not supported';
             case 'offer_timeout': return 'Device not responding';
@@ -1078,9 +1078,10 @@ class BitBangConnection {
         // to send one. A fetch of sw.js per half hour.
         setInterval(() => reg.update().catch(() => {}), 30 * 60 * 1000);
 
-        // Handle proxy requests from SW
+        // Handle proxy requests from SW. The vocabulary of this channel is
+        // listed beside the worker's own message listener in sw.js.
         navigator.serviceWorker.addEventListener('message', (event) => {
-            if (event.data?.type === 'request') {
+            if (event.data?.type === 'proxy_request') {
                 this.handleProxyRequest(event.data, event.ports[0]);
             }
         });
@@ -1089,7 +1090,7 @@ class BitBangConnection {
         // so the SW doesn't carry stale records into the next page load.
         window.addEventListener('pagehide', (event) => {
             navigator.serviceWorker.controller?.postMessage({
-                type: 'unsetBootstrap',
+                type: 'unset_bootstrap',
                 sessionId: this.sessionId,
             });
             // Tell the device too, by closing rather than just walking away.
@@ -1122,7 +1123,7 @@ class BitBangConnection {
 
         if (!this.dataChannel || this.dataChannel.readyState !== 'open') {
             console.warn('[Bootstrap] Data channel not open, rejecting request');
-            responsePort.postMessage({ type: 'error', message: 'Data channel not open' });
+            responsePort.postMessage({ type: 'proxy_error', message: 'Data channel not open' });
             // A live page with a dead channel should be recovering, not
             // rejecting forever — kick the reconnect if nothing else did.
             // (No-op while a reconnect is in flight or after a terminal end.)
@@ -1150,7 +1151,7 @@ class BitBangConnection {
             clearTimeout(timeout);
             timeout = setTimeout(() => {
                 this.pendingRequests.delete(streamId);
-                responsePort.postMessage({ type: 'error', message: 'Request timeout' });
+                responsePort.postMessage({ type: 'proxy_error', message: 'Request timeout' });
             }, 30000);
         };
         resetTimeout();
@@ -1183,8 +1184,8 @@ class BitBangConnection {
             try {
                 this.dataChannel.send(synFrame);
             } catch (e) {
-                responsePort.postMessage({ type: 'error', message: 'Failed to start upload' });
-                this.progressChannel.postMessage({ type: 'uploadFailed' });
+                responsePort.postMessage({ type: 'proxy_error', message: 'Failed to start upload' });
+                this.progressChannel.postMessage({ type: 'upload_failed' });
                 return;
             }
 
@@ -1195,8 +1196,8 @@ class BitBangConnection {
 
             const failUpload = (msg) => {
                 this.pendingRequests.delete(streamId);
-                responsePort.postMessage({ type: 'error', message: msg });
-                this.progressChannel.postMessage({ type: 'uploadFailed' });
+                responsePort.postMessage({ type: 'proxy_error', message: msg });
+                this.progressChannel.postMessage({ type: 'upload_failed' });
             };
 
             const isOpen = () => this.dataChannel?.readyState === 'open';
@@ -1205,7 +1206,7 @@ class BitBangConnection {
                 processingChain = processingChain.then(async () => {
                     if (!isOpen()) return failUpload('Connection lost');
 
-                    if (event.data.type === 'bodyChunk') {
+                    if (event.data.type === 'upload_chunk') {
                         const data = event.data.data;
 
                         for (let i = 0; i < data.byteLength; i += MAX_CHUNK) {
@@ -1225,13 +1226,13 @@ class BitBangConnection {
                             lastProgress = now;
                             resetTimeout();
                             this.progressChannel.postMessage({
-                                type: 'uploadProgress', loaded: bytesSent, total: contentLength
+                                type: 'upload_progress', loaded: bytesSent, total: contentLength
                             });
                         }
 
-                    } else if (event.data.type === 'bodyEnd') {
+                    } else if (event.data.type === 'upload_end') {
                         if (!isOpen()) return failUpload('Connection lost');
-                        this.progressChannel.postMessage({ type: 'uploadComplete' });
+                        this.progressChannel.postMessage({ type: 'upload_complete' });
                         this.dataChannel.send(this.createFrame(streamId, FLAG_FIN, new Uint8Array(0)));
                     }
                 });
@@ -1301,21 +1302,13 @@ class BitBangConnection {
                     this._onBuildStamp(msg.build);
                 } else if (msg.type === 'error') {
                     clearTimeout(offerTimeout);
-                    if (msg.message === 'device_preempted') {
-                        // A server that predates boot identities, still
-                        // booting clients when a device re-registers. It was
-                        // right that a reload is needed and could not tell
-                        // whether it was: do what it asks.
-                        this._reloadForRestart();
-                    } else {
-                        // Other error events. reject() is a no-op once the
-                        // connect promise has resolved, but harmless then.
-                        // The code rides along for userErrorMessage; a device
-                        // refusing (device_busy) sends a message only.
-                        const err = new Error(msg.message);
-                        err.code = msg.code || msg.message;
-                        reject(err);
-                    }
+                    // reject() is a no-op once the connect promise has
+                    // resolved, but harmless then. The code rides along for
+                    // userErrorMessage; a device refusing (device_busy) sends
+                    // a message only.
+                    const err = new Error(msg.message);
+                    err.code = msg.code || msg.message;
+                    reject(err);
                 }
             };
 
@@ -1976,8 +1969,9 @@ class BitBangConnection {
         let deadline = Date.now() + RECONNECT_WINDOW_MS;
         let backoff = 1000;
         let attempt = 0;
-        // A terminal screen (e.g. device_preempted, relay expiry) may fire at
-        // any await point — _turnEnded ends the loop wherever it's checked.
+        // A terminal screen (e.g. the device ending the session, relay
+        // expiry) may fire at any await point — _turnEnded ends the loop
+        // wherever it's checked.
         while (!this._turnEnded) {
             if (!navigator.onLine) {
                 console.log('[Bootstrap] offline — waiting for connectivity before reconnecting');
@@ -2308,7 +2302,7 @@ class BitBangConnection {
                 clearTimeout(req.timeout);
 
                 req.responsePort.postMessage({
-                    type: 'headers',
+                    type: 'proxy_headers',
                     status: status,
                     headers: metadata.headers || {}
                 });
@@ -2316,7 +2310,7 @@ class BitBangConnection {
                 // Broadcast upload result for iframe UI
                 if (req.isUpload) {
                     this.progressChannel.postMessage({
-                        type: status >= 200 && status < 300 ? 'uploadSuccess' : 'uploadFailed',
+                        type: status >= 200 && status < 300 ? 'upload_success' : 'upload_failed',
                         status: status
                     });
                 }
@@ -2327,7 +2321,7 @@ class BitBangConnection {
                 if (frame.payload.byteLength > 0 && !(frame.flags & FLAG_SYN)) {
                     req.bytesReceived += frame.payload.byteLength;
                     const data = new Uint8Array(frame.payload);
-                    req.responsePort.postMessage({ type: 'chunk', data }, [data.buffer]);
+                    req.responsePort.postMessage({ type: 'proxy_chunk', data }, [data.buffer]);
                 }
 
                 // Log completion for large transfers
@@ -2338,13 +2332,13 @@ class BitBangConnection {
                     console.log(`Download complete: ${sizeMB.toFixed(0)} MB in ${elapsed.toFixed(1)}s (${speed} MB/s)`);
                 }
 
-                req.responsePort.postMessage({ type: 'done' });
+                req.responsePort.postMessage({ type: 'proxy_end' });
                 this.pendingRequests.delete(frame.streamId);
             } else if (!(frame.flags & FLAG_SYN) && frame.payload.byteLength > 0) {
                 // Data chunk - use transferable to avoid copy
                 req.bytesReceived += frame.payload.byteLength;
                 const data = new Uint8Array(frame.payload);
-                req.responsePort.postMessage({ type: 'chunk', data }, [data.buffer]);
+                req.responsePort.postMessage({ type: 'proxy_chunk', data }, [data.buffer]);
 
                 // Log progress at each 50MB milestone
                 const currentMB = req.bytesReceived / (1024 * 1024);
@@ -2611,7 +2605,7 @@ class BitBangConnection {
         if (frame.flags & FLAG_SYN) {
             // Device acknowledged the WebSocket open
             if (this.debug) console.log(`[Bootstrap] ws SYN ack from device, streamId=${frame.streamId}`);
-            ws.iframe.postMessage({ type: 'ws-opened', streamId: frame.streamId }, '*');
+            ws.iframe.postMessage({ type: 'ws_opened', streamId: frame.streamId }, '*');
         }
 
         if (frame.flags & FLAG_FIN) {
@@ -2632,7 +2626,7 @@ class BitBangConnection {
             if (this.debug) console.log(`[Bootstrap] ws FIN from device, streamId=${frame.streamId} code=${code} reason=${JSON.stringify(reason)}`);
             this.wsStreams.delete(frame.streamId);
             ws.iframe.postMessage({
-                type: 'ws-closed',
+                type: 'ws_closed',
                 streamId: frame.streamId,
                 code,
                 reason
@@ -2674,7 +2668,7 @@ class BitBangConnection {
             }
 
             ws.iframe.postMessage({
-                type: 'ws-message',
+                type: 'ws_message',
                 streamId: frame.streamId,
                 data
             }, '*');
@@ -2697,7 +2691,7 @@ class BitBangConnection {
             const text = frame.payload && frame.payload.byteLength > 0
                 ? new TextDecoder().decode(frame.payload) : '';
             ws.iframe.postMessage({
-                type: 'ws-message', streamId: frame.streamId, data: text,
+                type: 'ws_message', streamId: frame.streamId, data: text,
             }, '*');
             return;
         }
@@ -2714,19 +2708,19 @@ class BitBangConnection {
             }
             this.wsStreams.delete(frame.streamId);
             ws.iframe.postMessage({
-                type: 'ws-closed', streamId: frame.streamId, code: 1000, reason,
+                type: 'ws_closed', streamId: frame.streamId, code: 1000, reason,
             }, '*');
             return;
         }
 
-        // DAT — raw bytes through. Send as a binary ws-message; the
+        // DAT — raw bytes through. Send as a binary ws_message; the
         // iframe is responsible for whatever tag-byte or framing
         // scheme its cap uses.
         if (!frame.payload || frame.payload.byteLength === 0) return;
         const view = new Uint8Array(frame.payload);
         const ab = view.buffer.slice(view.byteOffset, view.byteOffset + view.byteLength);
         ws.iframe.postMessage({
-            type: 'ws-message', streamId: frame.streamId, data: ab,
+            type: 'ws_message', streamId: frame.streamId, data: ab,
         }, '*');
     }
 
@@ -2800,13 +2794,13 @@ class BitBangConnection {
         const ackChannel = new MessageChannel();
         const ack = new Promise((resolve) => {
             const timer = setTimeout(() => {
-                console.warn('[Bootstrap] setBootstrap ack timed out — proceeding');
+                console.warn('[Bootstrap] set_bootstrap ack timed out — proceeding');
                 resolve();
             }, 2000);
             ackChannel.port1.onmessage = () => { clearTimeout(timer); resolve(); };
         });
         reg.active.postMessage({
-            type: 'setBootstrap',
+            type: 'set_bootstrap',
             sessionId: this.sessionId,
             uid: this.uid,
             target: this.target || 'device',
@@ -2820,14 +2814,17 @@ class BitBangConnection {
         }, [ackChannel.port2]);
         await ack;
 
-        // Listen for messages from the iframe (WebSocket shim + navigation
-        // + open-cap launcher requests).
+        // Listen for messages from the iframe. Besides the ws_* traffic
+        // (handleWSShimMessage), a device page can post:
+        //   navigate  { path }                 move the iframe to a path
+        //   open_cap  { path, newTab = true }  open /<uid>#<code><path>
+        // The CLI's device pages (capbar, proxy, file browser) use both.
         window.addEventListener('message', (event) => {
             const iframe = document.getElementById('device-frame');
             if (!iframe || event.source !== iframe.contentWindow) return;
-            if (event.data?.type === 'bb-navigate') {
+            if (event.data?.type === 'navigate') {
                 this.handleNavigateRequest(event.data.path);
-            } else if (event.data?.type === 'bb-open-cap') {
+            } else if (event.data?.type === 'open_cap') {
                 // The iframe asks us to land on /<uid>#<code><path>.
                 // The code lives in our fragment (never sent to the
                 // iframe), and the iframe sandbox forbids top-frame
@@ -2931,17 +2928,19 @@ class BitBangConnection {
         this.dataChannel.send(this.createFrame(0, FLAG_SYN, connectMsg));
     }
 
+    // The parent end of the ws-shim.js channel; its vocabulary is listed at
+    // the top of that file.
     handleWSShimMessage(event) {
         const iframe = document.getElementById('device-frame');
         if (!iframe || event.source !== iframe.contentWindow) return;
         if (!this.dataChannel || this.dataChannel.readyState !== 'open') return;
 
         const msg = event.data;
-        if (!msg || !msg.type?.startsWith('ws-')) return;
+        if (!msg || !msg.type?.startsWith('ws_')) return;
 
-        if (msg.type === 'ws-open') {
+        if (msg.type === 'ws_open') {
             const streamId = this.nextStreamId++;
-            if (this.debug) console.log(`[Bootstrap] ws-open ${msg.pathname}, streamId=${streamId}, cookies.len=${(msg.cookies || '').length}`);
+            if (this.debug) console.log(`[Bootstrap] ws_open ${msg.pathname}, streamId=${streamId}, cookies.len=${(msg.cookies || '').length}`);
 
             // Magic path: /__bitbang/<type>?<params> opens a SWSP
             // stream of the named type. bootstrap.js is a generic
@@ -2962,7 +2961,7 @@ class BitBangConnection {
                 const type = tail.split('/')[0];
                 if (!type) {
                     iframe.contentWindow.postMessage({
-                        type: 'ws-closed', streamId, code: 1008,
+                        type: 'ws_closed', streamId, code: 1008,
                         reason: 'bitbang: empty type in magic path',
                     }, '*');
                     return;
@@ -2981,21 +2980,21 @@ class BitBangConnection {
 
                 this.wsStreams.set(streamId, { iframe: iframe.contentWindow, kind: 'bitbang' });
                 iframe.contentWindow.postMessage({
-                    type: 'ws-assign', openId: msg.openId, streamId,
+                    type: 'ws_assign', openId: msg.openId, streamId,
                 }, '*');
                 this.dataChannel.send(this.createFrame(streamId, FLAG_SYN, JSON.stringify(syn)));
                 // Tell the iframe the WS is open now. Listener handlers
                 // typically don't send a SYN ack on the success path —
                 // the first DAT is the natural signal that things are
                 // working. Iframe code can start sending immediately.
-                iframe.contentWindow.postMessage({ type: 'ws-opened', streamId }, '*');
+                iframe.contentWindow.postMessage({ type: 'ws_opened', streamId }, '*');
                 return;
             }
 
             // Regular WebSocket proxy path (unchanged).
             this.wsStreams.set(streamId, { iframe: iframe.contentWindow, kind: 'websocket' });
             iframe.contentWindow.postMessage({
-                type: 'ws-assign',
+                type: 'ws_assign',
                 openId: msg.openId,
                 streamId
             }, '*');
@@ -3007,7 +3006,7 @@ class BitBangConnection {
             this.dataChannel.send(this.createFrame(streamId, FLAG_SYN, synPayload));
             if (this.debug) console.log(`[Bootstrap] ws SYN sent to device, streamId=${streamId}`);
 
-        } else if (msg.type === 'ws-send') {
+        } else if (msg.type === 'ws_send') {
             const ws = this.wsStreams.get(msg.streamId);
             if (!ws) return;
 
@@ -3052,7 +3051,7 @@ class BitBangConnection {
                     msg.streamId, flags, payload.subarray(off, Math.min(end, payload.length))));
             }
 
-        } else if (msg.type === 'ws-close') {
+        } else if (msg.type === 'ws_close') {
             const ws = this.wsStreams.get(msg.streamId);
             if (!ws) return;
             this.wsStreams.delete(msg.streamId);
@@ -3062,7 +3061,7 @@ class BitBangConnection {
             // code it asked to close with; without it the socket sat in
             // CLOSING and onclose never ran.
             ws.iframe.postMessage({
-                type: 'ws-closed', streamId: msg.streamId,
+                type: 'ws_closed', streamId: msg.streamId,
                 code: msg.code || 1000, reason: msg.reason || '',
             }, '*');
         }
@@ -3293,7 +3292,7 @@ class BitBangConnection {
     // `/?launchApp=…`) is now done entirely in the SW. It intercepts
     // bare-origin navigations that don't match any legitimate bitbang
     // shape and 302s them into the most-recently-active session's URL
-    // space, using the (uid, code, target) it learned via setBootstrap.
+    // space, using the (uid, code, target) it learned via set_bootstrap.
     // See sw.js's redirectViaActiveSession + isLikelyAppPopup. The old
     // saveOpenHint / interceptNewTabLinks pair used to do this from the
     // page; the SW-only approach avoids the async-cache race and covers
@@ -3468,7 +3467,7 @@ class BitBangConnection {
         // contentDocument is readable at all -- so naming the origin costs
         // nothing and means a frame that navigated somewhere else does not
         // receive a port that can subscribe to a device.
-        iframe.contentWindow.postMessage({ type: 'bitbang-stream-port' },
+        iframe.contentWindow.postMessage({ type: 'stream_port' },
                                          location.origin, [chan.port2]);
         // Channels usually open well before the page finishes loading, so the
         // shim would otherwise wait for a device to declare something new.
@@ -3588,10 +3587,8 @@ function pairEscapeHtml(s) {
     return d.innerHTML;
 }
 
-// The server's message is unknown_code either way for that error, so this
-// reads it from an old server too.
 function pairErrorText(msg) {
-    if ((msg.code || msg.message) === 'unknown_code') {
+    if (msg.code === 'unknown_code') {
         return "That code isn't valid or has expired. Pairing codes last 5 minutes — ask for a fresh one.";
     }
     return 'Could not start pairing: ' + (msg.message || 'unknown error') + '.';

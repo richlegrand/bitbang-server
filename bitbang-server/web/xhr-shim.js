@@ -156,7 +156,7 @@
                     var sw = navigator.serviceWorker && navigator.serviceWorker.controller;
                     if (sw && window.__bbSessionId) {
                         sw.postMessage({
-                            type: 'cookieWrite',
+                            type: 'cookie_write',
                             sessionId: window.__bbSessionId,
                             value: value,
                         });

@@ -145,15 +145,33 @@ function rememberClientSession(event, sessionId) {
     keepAlive(event, saveClientSessions());
 }
 
+// -- Messages from pages -------------------------------------------------------
+//
+// The whole vocabulary of the page <-> worker channel. Pages post to the
+// worker; replies go back on the MessagePort the page sent, if any.
+//
+//   get_build        page -> worker  reply on port: build { build }
+//   set_bootstrap    bootstrap.js    { sessionId, uid, target, code, debug,
+//                                      noCookieJar }; reply on port:
+//                                      set_bootstrap_ack
+//   unset_bootstrap  bootstrap.js    { sessionId }, on pagehide
+//   get_cookies      ws-shim.js      { sessionId, path }; reply on port:
+//                                      { cookies } (no type)
+//   cookie_write     xhr-shim.js     { sessionId, value }
+//
+// And the other direction, worker -> bootstrap.js, for each request it
+// proxies (proxyToDevice): proxy_request, then on that request's own port
+// upload_chunk / upload_end from the worker, and proxy_headers,
+// proxy_chunk, proxy_end or proxy_error back from bootstrap.js.
 self.addEventListener('message', async (event) => {
     // Answered on the port the page supplied, so it works before we
     // control the page (a claim may not have landed yet).
-    if (event.data?.type === 'getBuild') {
+    if (event.data?.type === 'get_build') {
         event.ports[0]?.postMessage({ type: 'build', build: BUILD });
         return;
     }
 
-    if (event.data?.type === 'setBootstrap' && event.data.sessionId) {
+    if (event.data?.type === 'set_bootstrap' && event.data.sessionId) {
         const uid = event.data.uid || '';
 
         await sessionsReady;
@@ -189,8 +207,8 @@ self.addEventListener('message', async (event) => {
             event.data.noCookieJar ? '(nocookiejar)' : '');
         // Ack so the page knows the session is routable before it creates
         // the iframe (whose first fetch races this message handler).
-        event.ports?.[0]?.postMessage({ type: 'bootstrapAck' });
-    } else if (event.data?.type === 'unsetBootstrap' && event.data.sessionId) {
+        event.ports?.[0]?.postMessage({ type: 'set_bootstrap_ack' });
+    } else if (event.data?.type === 'unset_bootstrap' && event.data.sessionId) {
         // Best-effort cleanup from pagehide. Don't gate on event.source --
         // it may be null when fired during page unload, and even when it's
         // present, postMessage delivery from a closing page to a possibly-
@@ -201,7 +219,7 @@ self.addEventListener('message', async (event) => {
             saveSessions();
             console.log('[SW] Bootstrap unregistered, session:', event.data.sessionId);
         }
-    } else if (event.data?.type === 'getCookies') {
+    } else if (event.data?.type === 'get_cookies') {
         // Iframe (ws-shim) asks for the current Cookie header value for a path.
         // The SW jar is canonical -- reading document.cookie can be stale
         // because Set-Cookie is stripped from responses.
@@ -215,7 +233,7 @@ self.addEventListener('message', async (event) => {
         const jarKey = `${session.uid}:${session.target}`;
         const path = (event.data.path || '/').split('?')[0];
         port.postMessage({ cookies: getCookieHeader(jarKey, path) || '' });
-    } else if (event.data?.type === 'cookieWrite') {
+    } else if (event.data?.type === 'cookie_write') {
         // App code in iframe wrote document.cookie. Mirror into the jar so
         // the next outbound request includes it.
         const session = sessions.get(event.data.sessionId);
@@ -655,7 +673,7 @@ function parseCookie(setCookieStr) {
 // -- HttpOnly invariant ------------------------------------------------------
 //
 // HttpOnly cookies live ONLY in the SW jar. They are attached to outbound
-// requests (getCookieHeader, and the WebSocket upgrade via the getCookies
+// requests (getCookieHeader, and the WebSocket upgrade via the get_cookies
 // message) but are never written into document.cookie by any of the three
 // mirror paths: the per-response X-BB-Set-Cookie header, the parse-time
 // cookieSync injection, and the cross-tab BroadcastChannel.
@@ -683,7 +701,7 @@ function isMirrorable(cookie) {
 // the shim's script tag and inject arbitrary markup into the bitba.ng page.
 //
 // That path is reachable: app code writing document.cookie is mirrored into
-// the jar via the cookieWrite message, and the jar is replayed into every
+// the jar via the cookie_write message, and the jar is replayed into every
 // subsequent HTML navigation by cookieSync. So an XSS inside a proxied app
 // could otherwise escalate into persistent injection in the proxy wrapper --
 // and persist across sessions, because the jar lives in the Cache API.
@@ -1070,7 +1088,7 @@ async function proxyToDevice(event) {
     let bootstrap = null;
     await sessionsReady;
     let session = sessions.get(sessionId);
-    // A request can still beat setBootstrap here (e.g. an ack-less older
+    // A request can still beat set_bootstrap here (e.g. an ack-less older
     // page, or a fetch already in flight when the SW restarted). Give
     // registration up to ~1s to land before declaring no connection.
     for (let i = 0; !session && i < 10; i++) {
@@ -1099,7 +1117,7 @@ async function proxyToDevice(event) {
             // stored id (SW-restart-with-same-page case), the rewrite is a
             // no-op; if it differs (refresh case), the rewrite would attach
             // the stale session to the new bootstrap, defeating the
-            // dead-clientId cleanup in setBootstrap and leaking entries.
+            // dead-clientId cleanup in set_bootstrap and leaking entries.
             for (const c of allClients) {
                 if (!c.url.includes('/__device__/')) {
                     bootstrap = c;
@@ -1162,7 +1180,7 @@ async function proxyToDevice(event) {
 
     const cleanUrl = url.origin + '/__device__' + devicePath + url.search;
     bootstrap.postMessage({
-        type: 'request',
+        type: 'proxy_request',
         url: cleanUrl,
         method: event.request.method,
         headers: reqHeaders,
@@ -1177,7 +1195,7 @@ async function proxyToDevice(event) {
                 // bootstrap.js splits this into MAX_CHUNK frames and applies
                 // backpressure, so one message is fine however large it is.
                 channel.port1.postMessage(
-                    { type: 'bodyChunk', data: bufferedBody }, [bufferedBody.buffer]);
+                    { type: 'upload_chunk', data: bufferedBody }, [bufferedBody.buffer]);
             }
         } else if (event.request.body) {
             const reader = event.request.body.getReader();
@@ -1185,13 +1203,13 @@ async function proxyToDevice(event) {
                 while (true) {
                     const { done, value } = await reader.read();
                     if (done) break;
-                    channel.port1.postMessage({ type: 'bodyChunk', data: value }, [value.buffer]);
+                    channel.port1.postMessage({ type: 'upload_chunk', data: value }, [value.buffer]);
                 }
             } finally {
                 reader.releaseLock();
             }
         }
-        channel.port1.postMessage({ type: 'bodyEnd' });
+        channel.port1.postMessage({ type: 'upload_end' });
     }
 
     // -- Stream response back to browser --
@@ -1210,9 +1228,7 @@ async function proxyToDevice(event) {
         channel.port1.onmessage = (msg) => {
             const { type, status, headers, data, message } = msg.data;
 
-            if (type === 'uploadProgress') {
-                return;
-            } else if (type === 'headers') {
+            if (type === 'proxy_headers') {
                 if (timeout) clearTimeout(timeout);
                 resolved = true;
 
@@ -1360,11 +1376,11 @@ async function proxyToDevice(event) {
                 // 204/304 responses must not have a body per spec
                 const nullBodyStatus = (status === 204 || status === 304);
                 resolve(new Response(nullBodyStatus ? null : stream, { status, headers }));
-            } else if (type === 'chunk') {
+            } else if (type === 'proxy_chunk') {
                 try { streamController?.enqueue(data); } catch (e) {}
-            } else if (type === 'done') {
+            } else if (type === 'proxy_end') {
                 try { streamController?.close(); } catch (e) {}
-            } else if (type === 'error') {
+            } else if (type === 'proxy_error') {
                 if (timeout) clearTimeout(timeout);
                 if (!resolved) {
                     resolve(new Response(`BitBang: ${message}`, { status: 500 }));
