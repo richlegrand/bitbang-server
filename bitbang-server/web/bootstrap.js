@@ -488,8 +488,13 @@ class BitBangConnection {
         this.remoteDescriptionSet = false;
         // Upload progress, for whichever device page started the upload
         // (ota.html, the CLI's file browser). The whole vocabulary:
-        // upload_progress { loaded, total }, upload_complete (all bytes
-        // sent), then upload_success or upload_failed once the device answers.
+        // uploadProgress { loaded, total }, uploadComplete (all bytes
+        // sent), then uploadSuccess or uploadFailed once the device answers.
+        //
+        // camelCase, unlike the rest of the browser's messages, because
+        // device pages hear these and we don't ship all of them: the CLI's
+        // file browser listens for these names, and a CLI already installed
+        // has to keep working against a new server. Never rename them.
         this.progressChannel = new BroadcastChannel('bitbang-progress');
         // Frames arriving on a stream channel, forwarded to whatever page the
         // device served. The page owns the canvas; this only carries bytes.
@@ -1185,7 +1190,7 @@ class BitBangConnection {
                 this.dataChannel.send(synFrame);
             } catch (e) {
                 responsePort.postMessage({ type: 'proxy_error', message: 'Failed to start upload' });
-                this.progressChannel.postMessage({ type: 'upload_failed' });
+                this.progressChannel.postMessage({ type: 'uploadFailed' });
                 return;
             }
 
@@ -1197,7 +1202,7 @@ class BitBangConnection {
             const failUpload = (msg) => {
                 this.pendingRequests.delete(streamId);
                 responsePort.postMessage({ type: 'proxy_error', message: msg });
-                this.progressChannel.postMessage({ type: 'upload_failed' });
+                this.progressChannel.postMessage({ type: 'uploadFailed' });
             };
 
             const isOpen = () => this.dataChannel?.readyState === 'open';
@@ -1226,13 +1231,13 @@ class BitBangConnection {
                             lastProgress = now;
                             resetTimeout();
                             this.progressChannel.postMessage({
-                                type: 'upload_progress', loaded: bytesSent, total: contentLength
+                                type: 'uploadProgress', loaded: bytesSent, total: contentLength
                             });
                         }
 
                     } else if (event.data.type === 'upload_end') {
                         if (!isOpen()) return failUpload('Connection lost');
-                        this.progressChannel.postMessage({ type: 'upload_complete' });
+                        this.progressChannel.postMessage({ type: 'uploadComplete' });
                         this.dataChannel.send(this.createFrame(streamId, FLAG_FIN, new Uint8Array(0)));
                     }
                 });
@@ -2310,7 +2315,7 @@ class BitBangConnection {
                 // Broadcast upload result for iframe UI
                 if (req.isUpload) {
                     this.progressChannel.postMessage({
-                        type: status >= 200 && status < 300 ? 'upload_success' : 'upload_failed',
+                        type: status >= 200 && status < 300 ? 'uploadSuccess' : 'uploadFailed',
                         status: status
                     });
                 }
@@ -2816,15 +2821,20 @@ class BitBangConnection {
 
         // Listen for messages from the iframe. Besides the ws_* traffic
         // (handleWSShimMessage), a device page can post:
-        //   navigate  { path }                 move the iframe to a path
-        //   open_cap  { path, newTab = true }  open /<uid>#<code><path>
-        // The CLI's device pages (capbar, proxy, file browser) use both.
+        //   bb-navigate  { path }                 move the iframe to a path
+        //   bb-open-cap  { path, newTab = true }  open /<uid>#<code><path>
+        //
+        // Kebab-case, unlike the rest of the browser's messages, because
+        // device pages send these and we don't ship all of them: the CLI's
+        // cap bar, proxy page and HTTP landing page post these names, and a
+        // CLI already installed has to keep working against a new server.
+        // Never rename them.
         window.addEventListener('message', (event) => {
             const iframe = document.getElementById('device-frame');
             if (!iframe || event.source !== iframe.contentWindow) return;
-            if (event.data?.type === 'navigate') {
+            if (event.data?.type === 'bb-navigate') {
                 this.handleNavigateRequest(event.data.path);
-            } else if (event.data?.type === 'open_cap') {
+            } else if (event.data?.type === 'bb-open-cap') {
                 // The iframe asks us to land on /<uid>#<code><path>.
                 // The code lives in our fragment (never sent to the
                 // iframe), and the iframe sandbox forbids top-frame

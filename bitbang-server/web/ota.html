@@ -303,10 +303,10 @@ function install(file) {
     if (progress) {
         progress.onmessage = e => {
             const m = e.data || {};
-            if (m.type === 'upload_progress') {
+            if (m.type === 'uploadProgress') {
                 sawBootstrap = true;
                 show(m.loaded, m.total || file.size);
-            } else if (m.type === 'upload_complete') {
+            } else if (m.type === 'uploadComplete') {
                 sawBootstrap = true;
                 fill.style.width = '100%';
                 /* The bytes are out, but the device is still writing the last
