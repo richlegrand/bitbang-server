@@ -212,30 +212,30 @@ self.addEventListener('message', async (event) => {
     }
 });
 
-/**
- * Find the session ID for a request. Strategies (in order):
- *
- *   1. Referer contains /__device__/<sessionId>
- *   2. Requesting client's URL contains /__device__/<sessionId>
- *   3. Referer path starts with /<uid> for a known session
- *   4. Single-session fallback (excludes top-level UID paths)
- *   5. Most recent session (sub-resources only)
- */
-// Session-resolution strategies, applied in order by findSession. Each
-// returns a sessionId on a hit or null on a miss.
+// -- Session resolution ------------------------------------------------------
 //
-// `evidence` controls how the strategy interacts with pair-entry paths
-// (bare `/` and `/<6-digit>`):
+// Which session does a request belong to? findSession answers that for every
+// caller: proxyAbsolutePath (a bare absolute path, proxied down the tunnel),
+// redirectViaActiveSession (a popup, 302'd into a session's URL) and
+// serveBareMetaPage (/*name). The callers differ in what they do with the
+// answer and in how much evidence they will act on -- not in how it is found.
+// There used to be a second resolver in the popup path, and the two drifted:
+// each had a signal the other called decisive, so a popup and a subresource
+// from one frame could resolve to different sessions.
 //
-//   - 'concrete' — the request carries an explicit `/__device__/<sid>`
-//     handle (in its referer or its requesting client's URL). Safe for
-//     pair-entry paths: an in-session iframe redirected to `/` still
-//     has a `/__device__/<sid>` referer, so we proxy correctly.
+// The strategies, applied in order. Each returns a sessionId or null, and
+// considers only sessions in ctx.pool -- the open sessions the caller can use.
 //
-//   - 'fuzzy' — the strategy infers a session from weaker signals
-//     (referer-uid match, single-session fallback, most-recent session).
-//     SKIPPED for pair-entry paths: a fresh tab to bitba.ng/ would
-//     otherwise leak to whatever session another tab has open.
+// `evidence`:
+//
+//   - 'concrete' -- the request carries an explicit handle on its session: a
+//     clientId the SW bound, or a /__device__/<sid> in its referer or its
+//     client's URL. Safe for pair-entry paths: an in-session iframe
+//     redirected to `/` still carries one, so it is proxied correctly.
+//
+//   - 'fuzzy' -- inferred from weaker signals. Skipped when the caller asks
+//     for concrete evidence only: a fresh tab to bitba.ng/ would otherwise
+//     leak into whatever session another tab has open.
 const SESSION_STRATEGIES = [
     {
         name: 'client-binding',  // clientId recorded when this frame was navigated
@@ -244,40 +244,40 @@ const SESSION_STRATEGIES = [
         // await), so it runs first. Concrete because the binding was
         // recorded by the SW itself while proxying a navigation for a
         // known session -- it is not inferred from anything the page
-        // controls, and it survives xhr-shim.js:44 rewriting the URL.
-        async match({ event }) {
+        // controls, and it survives xhr-shim.js rewriting the URL.
+        async match({ event, pool }) {
             if (!event.clientId) return null;
             const sid = clientSessions.get(event.clientId);
-            return sid && sessions.has(sid) ? sid : null;
+            return sid && pool.has(sid) ? sid : null;
         },
     },
     {
         name: 'referer-device',  // referer has /__device__/<sid>
         evidence: 'concrete',
-        async match({ referer }) {
-            const m = referer.match(/\/__device__\/([^/]+)/);
-            return m && sessions.has(m[1]) ? m[1] : null;
+        async match({ referer, pool }) {
+            const m = referer.match(/\/__device__\/([^/?#]+)/);
+            return m && pool.has(m[1]) ? m[1] : null;
         },
     },
     {
         name: 'client-device',  // requesting client's URL has /__device__/<sid>
         evidence: 'concrete',
-        async match({ event }) {
+        async match({ event, pool }) {
             if (!event.clientId) return null;
             const client = await self.clients.get(event.clientId);
             if (!client) return null;
-            const m = client.url.match(/\/__device__\/([^/]+)/);
-            return m && sessions.has(m[1]) ? m[1] : null;
+            const m = client.url.match(/\/__device__\/([^/?#]+)/);
+            return m && pool.has(m[1]) ? m[1] : null;
         },
     },
     {
         name: 'referer-uid',  // referer has /<uid>
         evidence: 'fuzzy',
-        async match({ referer }) {
+        async match({ referer, pool }) {
             if (!referer) return null;
             try {
                 const refPath = new URL(referer).pathname;
-                for (const [sid, sess] of sessions) {
+                for (const [sid, sess] of pool) {
                     if (sess.uid && refPath.startsWith('/' + sess.uid)) return sid;
                 }
             } catch (e) {}
@@ -285,35 +285,66 @@ const SESSION_STRATEGIES = [
         },
     },
     {
+        name: 'focused-tab',  // the session whose tab had focus last
+        evidence: 'fuzzy',
+        // bootstrap.js writes its session id to this cache on iframe load,
+        // window focus and visibility -> visible. Focus comes well before a
+        // click, so the write has settled by the time a popup opens. For a
+        // popup it is often the only signal left: Cookie and Referer are
+        // stripped from it, and postMessage races its fetch.
+        //
+        // Fuzzy all the same. It says which tab the person was looking at,
+        // not which frame sent the request, so anything concrete outranks
+        // it, and a fresh tab must never be handed to it.
+        async match({ pool }) {
+            try {
+                const cache = await caches.open('bitbang-active-session');
+                const resp = await cache.match('/_/active');
+                const sid = resp && await resp.text();
+                return sid && pool.has(sid) ? sid : null;
+            } catch (e) {
+                return null;
+            }
+        },
+    },
+    {
         name: 'single-session',  // exactly one open session
         evidence: 'fuzzy',
-        async match({ isUidPath }) {
+        async match({ isUidPath, pool }) {
             // Excludes top-level UID paths (e.g. /bb29bead...) which
             // need the signaling server to load bootstrap.html, even
             // when the only open session happens to share the UID.
-            if (sessions.size === 1 && !isUidPath) {
-                return Array.from(sessions.keys())[0];
+            if (pool.size === 1 && !isUidPath) {
+                return pool.keys().next().value;
             }
             return null;
         },
     },
     {
-        name: 'most-recent',  // any session → most recent
+        name: 'most-recent',  // the session that most recently proxied anything
         evidence: 'fuzzy',
         // Final fallback: covers sub-resource fetches (XHR, fetch, img,
-        // …) from contexts whose URL doesn't include /__device__/<sid>
-        // — bare-origin iframes the proxied app spawns — and form-POST
+        // ...) from contexts whose URL doesn't include /__device__/<sid>
+        // -- bare-origin iframes the proxied app spawns -- form-POST
         // navigations into hidden iframes (Synology DSM uses this for
-        // /webman/login.cgi). Top-level UID-path navigations are already
-        // excluded by the isUidPath+navigate early return in findSession,
-        // so it's safe to include 'navigate' mode here.
-        async match() {
-            return sessions.size > 0 ? Array.from(sessions.keys()).pop() : null;
+        // /webman/login.cgi), and a popup when no tab has recorded focus.
+        // Top-level UID-path navigations are already excluded by the
+        // isUidPath+navigate early return in findSession, so it's safe to
+        // include 'navigate' mode here.
+        async match({ pool }) {
+            let best = null;
+            for (const [sid, sess] of pool) {
+                if (!best || (sess.lastActive || 0) > (pool.get(best).lastActive || 0)) best = sid;
+            }
+            return best;
         },
     },
 ];
 
-async function findSession(event) {
+// concreteOnly: act only on concrete evidence (see `evidence` above).
+// accept: which sessions the caller can use. A strategy that names one it
+// can't is a miss, and the next strategy gets its turn.
+async function findSession(event, { concreteOnly = false, accept = () => true } = {}) {
     await sessionsReady;
 
     // Top-level navigations to /<uid>/... are bootstrap-page loads — they
@@ -330,28 +361,46 @@ async function findSession(event) {
     const isUidPath = /^\/[A-Za-z0-9_-]{22}(\/|$)/.test(reqUrl.pathname);
     if (isUidPath && event.request.mode === 'navigate') return null;
 
-    // Short top-level paths — bare `/`, 6-digit pair codes, and any
-    // single-segment lowercase path like `/install`, `/status`, `/health`
-    // — share the server-owned namespace. They're resolved against active
-    // sessions using concrete-evidence strategies only (referer-device,
-    // client-device): an iframe inside a session that redirects to such
-    // a path is correctly proxied to the device, but a fresh tab to the
-    // same URL reaches the server.
-    //
-    // The syntactic rule means future server-side utility endpoints
-    // (`/install.ps1`, `/docs`, anything similar) route correctly with
-    // no SW change required. Convention to preserve: server routes are
-    // short, lowercase, single-segment; device-tunneled deep paths can
-    // be any shape (they're disambiguated by concrete evidence).
-    const isShortTopPath = reqUrl.pathname === '/'
-        || /^\/\d{6}$/.test(reqUrl.pathname)
-        || /^\/[a-z][a-z0-9_-]*\/?$/.test(reqUrl.pathname);
+    await sweepDeadSessions(event);
 
-    // Drop sessions whose owning client is gone. Without this, an
-    // auto-fetch (e.g. /favicon.ico right after a refresh) can match a
-    // stale uid-keyed entry from a previous page and get routed into
-    // the rescue path. The pagehide cleanup is best-effort; this sweep
-    // is authoritative.
+    const pool = new Map();
+    for (const [sid, sess] of sessions) if (accept(sess)) pool.set(sid, sess);
+
+    const ctx = {
+        event,
+        isUidPath,
+        pool,
+        referer: event.request.referrer || '',
+    };
+    for (const strat of SESSION_STRATEGIES) {
+        if (concreteOnly && strat.evidence !== 'concrete') break;
+        const sid = await strat.match(ctx);
+        if (sid) {
+            // On concrete evidence only, client-binding resolving is the case
+            // -- a short top path, say -- that used to fall through to the
+            // signaling server and load bootstrap.html into the iframe. Rare
+            // by nature, so not noisy, and if it never prints on a
+            // post-login navigation, the binding is not being recorded.
+            if (concreteOnly && strat.name === 'client-binding') {
+                console.log('[SW] client-binding resolved',
+                    reqUrl.pathname, '->', sid);
+            }
+            return sid;
+        }
+    }
+    return null;
+}
+
+// Drop sessions whose bootstrap page is gone, and with them the client
+// bindings that pointed at them -- or a recycled clientId could resolve to a
+// dead session. Without the sweep, an auto-fetch (e.g. /favicon.ico right after
+// a refresh) can match a stale entry from the previous page. The pagehide
+// cleanup is best-effort; this is authoritative.
+//
+// Run on every resolution, so it costs one clients.get per open session per
+// request findSession sees -- a handful of sessions at most. It used to be
+// written twice, and the popup path's copy left the bindings behind.
+async function sweepDeadSessions(event) {
     let swept = false;
     for (const [sid, sess] of sessions) {
         if (!(await self.clients.get(sess.clientId))) {
@@ -359,38 +408,29 @@ async function findSession(event) {
             swept = true;
         }
     }
-    if (swept) {
-        saveSessions();
-        // Bindings pointing at a swept session must go too, or a recycled
-        // clientId could resolve to a dead session.
-        pruneClientSessions();
-        saveClientSessions();
-        if (dropSessionCookiesForDeadDevices()) keepAlive(event, saveCookieJar());
-    }
+    if (!swept) return;
+    saveSessions();
+    pruneClientSessions();
+    saveClientSessions();
+    if (dropSessionCookiesForDeadDevices()) keepAlive(event, saveCookieJar());
+}
 
-    const ctx = {
-        event,
-        isUidPath,
-        referer: event.request.referrer || '',
-    };
-    for (const strat of SESSION_STRATEGIES) {
-        if (isShortTopPath && strat.evidence !== 'concrete') break;
-        const sid = await strat.match(ctx);
-        if (sid) {
-            // Confirmation log for fix 1c. A short top path resolving via
-            // client-binding is exactly the case that used to fall through
-            // to the signaling server and load bootstrap.html into the
-            // iframe. Rare by nature, so it is not noisy -- if this never
-            // prints on a post-login navigation, the binding is not being
-            // recorded and the fix is inert.
-            if (isShortTopPath && strat.name === 'client-binding') {
-                console.log('[SW] client-binding resolved short top path',
-                    reqUrl.pathname, '->', sid);
-            }
-            return sid;
-        }
-    }
-    return null;
+// Short top-level paths -- bare `/`, 6-digit pair codes, and any
+// single-segment lowercase path like `/install`, `/status`, `/health` --
+// share the server-owned namespace. proxyAbsolutePath resolves them on
+// concrete evidence only: an iframe inside a session that redirects to such
+// a path is correctly proxied to the device, but a fresh tab to the same URL
+// reaches the server.
+//
+// The syntactic rule means future server-side utility endpoints
+// (`/install.ps1`, `/docs`, anything similar) route correctly with no SW
+// change required. Convention to preserve: server routes are short,
+// lowercase, single-segment; device-tunneled deep paths can be any shape
+// (they're disambiguated by concrete evidence).
+function isShortTopPath(pathname) {
+    return pathname === '/'
+        || /^\/\d{6}$/.test(pathname)
+        || /^\/[a-z][a-z0-9_-]*\/?$/.test(pathname);
 }
 
 // -- Cookie jar (persisted to Cache API) -------------------------------------
@@ -826,33 +866,20 @@ self.addEventListener('fetch', (event) => {
 });
 
 // Serve a meta-page for a bare /*name, but only on concrete evidence that this
-// request belongs to a device session -- a referer or client URL carrying an
-// actual /__device__/<sid>.
+// request belongs to a device session -- a client binding, or a referer or
+// client URL carrying an actual /__device__/<sid>.
 //
-// Concrete specifically, not findSession: that falls back to fuzzy strategies
-// (single-session, most-recent), and on one of those a stray top-level visit to
-// bitba.ng/*settings would render a settings shell bound to whatever session
-// another tab happened to have open.
+// Concrete specifically: the fuzzy strategies (focused tab, most-recent) would
+// let a stray top-level visit to bitba.ng/*settings render a settings shell
+// bound to whatever session another tab happened to have open.
 //
 // Anything unproven falls through to proxyAbsolutePath, which is exactly what
 // happened before this existed -- so the failure mode of this route is the old
 // behavior rather than a new one.
 async function serveBareMetaPage(event, url) {
     const name = url.pathname.match(BARE_META_PATH)[1];
-    await sessionsReady;
-
-    const fromReferer = (event.request.referrer || '').match(/\/__device__\/([^/]+)/);
-    let sid = fromReferer && fromReferer[1];
-    if (!sid && event.clientId) {
-        // A navigation may carry no referer; the initiating client's own URL
-        // is the other concrete handle.
-        const client = await self.clients.get(event.clientId);
-        const m = client && client.url.match(/\/__device__\/([^/]+)/);
-        sid = m && m[1];
-    }
-    if (!sid || !sessions.has(sid)) {
-        return proxyAbsolutePath(event, url);
-    }
+    const sid = await findSession(event, { concreteOnly: true });
+    if (!sid) return proxyAbsolutePath(event, url);
     return serveMetaPage(name, sid);
 }
 
@@ -873,7 +900,7 @@ async function serveBareMetaPage(event, url) {
 // exists, so cold-start users typing exotic URLs are unaffected: only
 // users who have a live session in this browser get redirected.
 //
-// We do NOT re-use findSession's `isShortTopPath` short-route reservation
+// We do NOT re-use proxyAbsolutePath's `isShortTopPath` short-route reservation
 // here. That reservation exists so new server-side lowercase routes can
 // be added without SW updates, but for the popup-redirect path we'd
 // rather catch a real proxied-app popup than preserve the shortcut.
@@ -888,84 +915,19 @@ function isLikelyAppPopup(url) {
     return true;
 }
 
-// extractRefererSession pulls the /__device__/<sid> segment out of a
-// Referer URL, or null if it's absent. Used to identify which session a
-// popup came from — a hard signal that beats the lastActive tie-breaker
-// when multiple sessions are open in the same browser.
-function extractRefererSession(referer) {
-    if (!referer) return null;
-    const m = referer.match(/\/__device__\/([^/?#]+)/);
-    return m ? m[1] : null;
-}
-
-// redirectViaActiveSession: 302 the request into the most-recently-used
-// session's URL space. Path/search from the request are preserved; the
+// redirectViaActiveSession: 302 the request into the URL space of the
+// session it came from. Path/search from the request are preserved; the
 // session provides uid, target, and code. If no session qualifies (none
 // registered, or the ones we have lack a code), falls through to the
 // network so the entry page still loads normally for genuinely-fresh
 // visitors.
+//
+// Which session is findSession's answer, with fuzzy evidence allowed: a
+// popup rarely carries anything better than which tab had focus.
 async function redirectViaActiveSession(event, url) {
-    await sessionsReady;
-
-    // Sweep dead sessions so we don't redirect into a session whose page
-    // has been closed. Cheap here — happens only on the popup-shaped
-    // navigation, not on every fetch.
-    let swept = false;
-    for (const [sid, sess] of sessions) {
-        if (!(await self.clients.get(sess.clientId))) {
-            sessions.delete(sid);
-            swept = true;
-        }
-    }
-    if (swept) {
-        saveSessions();
-        if (dropSessionCookiesForDeadDevices()) keepAlive(event, saveCookieJar());
-    }
-
-    // Selection priority — most specific signal first.
-    //
-    // 1. Cache API "active session" — bootstrap writes on iframe load,
-    //    window focus, and visibility→visible. Focus fires WAY before
-    //    the user can click a link, so the async write is always settled
-    //    by popup time. This is the only signal that reliably identifies
-    //    the source session when Cookie and Referer are stripped from
-    //    the popup navigation by the browser (noreferrer, cross-context).
-    //
-    // 2. Referer contains /__device__/<sid>. Works for iframes still on
-    //    the proxy prefix. Defensive fallback; not usually helpful for
-    //    popups since Referer is usually stripped there.
-    //
-    // 3. Most-recently-active (lastActive). Final fallback for the
-    //    single-session case where any answer is right.
-    let best = null;
-
-    try {
-        const cache = await caches.open('bitbang-active-session');
-        const resp = await cache.match('/_/active');
-        if (resp) {
-            const s = sessions.get(await resp.text());
-            if (s && s.uid && s.code) best = s;
-        }
-    } catch (e) {}
-
-    if (!best) {
-        const refererSid = extractRefererSession(event.request.referrer);
-        if (refererSid) {
-            const s = sessions.get(refererSid);
-            if (s && s.uid && s.code) best = s;
-        }
-    }
-
-    if (!best) {
-        for (const sess of sessions.values()) {
-            if (!sess.uid || !sess.code) continue;
-            if (!best || (sess.lastActive || 0) > (best.lastActive || 0)) {
-                best = sess;
-            }
-        }
-    }
-
-    if (!best) return fetch(event.request);
+    const sid = await findSession(event, { accept: (s) => s.uid && s.code });
+    if (!sid) return fetch(event.request);
+    const best = sessions.get(sid);
 
     // Build the canonical URL per CONVENTIONS.md's URL scheme:
     //
@@ -1070,7 +1032,7 @@ async function serveMetaPage(name, sessionId) {
 }
 
 async function proxyAbsolutePath(event, url) {
-    const sessionId = await findSession(event);
+    const sessionId = await findSession(event, { concreteOnly: isShortTopPath(url.pathname) });
     if (sessionId) {
         // Keep the chain alive: an in-session navigation to an absolute path
         // mints a new client, which must inherit the binding or the NEXT
