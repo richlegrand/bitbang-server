@@ -70,6 +70,9 @@ var stampInputs = []string{
 	// running the old copy.
 	"settings-panel.js",
 	"console.html",
+	// The same for the console: console.html mounts it, and so does a device
+	// page through data-bitbang-page="console".
+	"console-panel.js",
 	"ota.html",
 	// The renderers. Temporary in the same sense: they move to a plugin of
 	// their own, which is not the one settings.html goes to -- a renderer is a
@@ -234,11 +237,13 @@ var allowedBitbangAssets = map[string]bool{
 	"favicon.ico":    true, // handler internally maps this to favicon.png
 	// Temporary: goes away when a plugin serves its own assets.
 	"settings.html": true, // the device-settings meta-page shell
-	// Mounted into a shadow root: by settings.html standalone, and by the stream
-	// shim when a device page carries data-bitbang-page="settings".
+	// Mounted into a shadow root: by settings.html standalone, and through
+	// bitbang.js when a device page carries data-bitbang-page="settings".
 	"settings-panel.js": true,
 	"console.html":      true, // the device-console meta-page shell
-	"ota.html":          true, // the device-firmware meta-page shell
+	// The same for the console, and data-bitbang-page="console".
+	"console-panel.js": true,
+	"ota.html":         true, // the device-firmware meta-page shell
 	// The renderers, one per codec, fetched by the shim the first time a
 	// channel announces that codec. Served here rather than embedded in a
 	// device page, because rendering is a property of the codec and not of any

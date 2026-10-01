@@ -55,15 +55,20 @@
         });
     }
 
-    /* attribute -> what renders it. The only table in here, and the only thing
+    /* element -> what renders it. The only table in here, and the only thing
        that changes when a new kind of element is added.
+
+       By selector rather than attribute, because data-bitbang-page names which
+       panel: "settings" and "console" are different files, and a page with
+       only a console should not fetch the settings panel to find that out.
 
        `module` is the file's own business rather than the page's: a page says
        what it wants rendered and this knows how the thing that renders it is
        built. */
     const WANTS = [
-        { attr: 'data-bitbang-stream', file: 'stream-shim.js',    module: false },
-        { attr: 'data-bitbang-page',   file: 'settings-panel.js', module: true  },
+        { sel: '[data-bitbang-stream]',          file: 'stream-shim.js',    module: false },
+        { sel: '[data-bitbang-page="settings"]', file: 'settings-panel.js', module: true  },
+        { sel: '[data-bitbang-page="console"]',  file: 'console-panel.js',  module: true  },
     ];
 
     function boot() {
@@ -73,15 +78,24 @@
                the whole fetch on a page that has none. A device serving plain
                pages was pulling 15 KB of stream machinery it had no element
                for. */
-            if (!document.querySelector('[' + w.attr + ']')) {
+            if (!document.querySelector(w.sel)) {
                 continue;
             }
             load(w.file, w.module).catch(err => {
                 /* Named, because the failure is otherwise silent: elements never
                    bind and nothing appears anywhere a person is looking. That is
                    the one failure mode injection did not have. */
-                console.error('[bitbang] ' + w.attr + ': ' + err.message);
+                console.error('[bitbang] ' + w.sel + ': ' + err.message);
             });
+        }
+
+        /* A panel nobody renders would otherwise be an empty div with no
+           explanation anywhere. */
+        for (const el of document.querySelectorAll('[data-bitbang-page]')) {
+            if (!WANTS.some(w => el.matches(w.sel))) {
+                console.error('[bitbang] no panel called "' +
+                              el.getAttribute('data-bitbang-page') + '"');
+            }
         }
     }
 

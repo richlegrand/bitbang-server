@@ -27,6 +27,7 @@ func stampDir(t *testing.T) string {
 		"settings.html":     "<html><!-- settings --></html>",
 		"settings-panel.js": "// settings panel\n",
 		"console.html":      "<html><!-- console --></html>",
+		"console-panel.js":  "// console panel\n",
 		"ota.html":          "<html><!-- firmware --></html>",
 		"pcm-ring.js":       "// pcm ring\n",
 		"render-mjpeg.js":   "// mjpeg\n",

@@ -1086,10 +1086,14 @@ export function mount(host, opts = {}) {
 /*
  * Mount into every element that asked, when this module is loaded.
  *
- * So a sketch's page is one line of markup and one of script:
+ * So a sketch's page is one line of markup and one of script, the script being
+ * bitbang.js, which loads this file because the page has the element:
  *
  *     <div data-bitbang-page="settings"></div>
- *     <script type="module" src="/__bitbang__/settings-panel.js"></script>
+ *     <script src="/__bitbang__/bitbang.js"></script>
+ *
+ * Naming settings-panel.js in the tag instead would work today and break the
+ * day this file is renamed, which bitbang.js exists so that it can be.
  *
  * Here rather than in an injected shim, which is where this first went. The
  * service worker injects ws-shim and xhr-shim because those replace
@@ -1109,15 +1113,9 @@ export function mount(host, opts = {}) {
  * or pass title:true. This is the convenient case, not the only one.
  */
 function mountDeclared() {
-    for (const el of document.querySelectorAll('[data-bitbang-page]')) {
-        const name = el.getAttribute('data-bitbang-page');
-        /* One module, one panel it knows how to be. A page asking for a console
-           here is asking the wrong file, and saying so beats rendering settings
-           under the wrong heading. */
-        if (name !== 'settings') {
-            console.error(`[settings] this module renders "settings", not "${name}"`);
-            continue;
-        }
+    /* Only its own: a page can carry a console too, which console-panel.js
+       mounts, and a name nothing renders is reported by bitbang.js. */
+    for (const el of document.querySelectorAll('[data-bitbang-page="settings"]')) {
         if (el.shadowRoot) continue;          /* already mounted */
         /* No title: the page has already labelled the column. Actions stay,
            which is the default -- this is where the work happens, so making
