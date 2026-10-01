@@ -33,6 +33,74 @@ function askServiceWorkerBuild(worker) {
     });
 }
 
+// -- Banners -------------------------------------------------------------------
+//
+// A strip across the top of the page, over the device's UI. Everything that
+// takes that place goes through banner(), so they share one look, and the
+// level is what decides both the color and which strip is on top when two are
+// up. That order used to be two z-index literals in two functions, related
+// only by a comment in one of them.
+//
+// Nothing may hide a session in trouble, which is the whole reason there is an
+// order.
+const BANNER_LEVELS = {
+    trouble: { z: 2147483647, background: '#333' },     // reconnecting, device reset
+    news:    { z: 2147483646, background: '#1f4e79' },  // a new browser runtime
+};
+
+// Strips asked for before the body existed, by id, latest request winning.
+const pendingBanners = new Map();
+
+// banner shows the strip `id`, or changes the words of the one already up.
+// `action`, if given, is a button: { label, onClick }.
+function banner(spec) {
+    const { id, text, level, action } = spec;
+    /* Callers can run before the body exists -- the stale-build check can
+       finish first -- and nobody awaits them, so a throw would just mean the
+       strip never appears. Wait for the body instead, and let removeBanner
+       cancel the wait. */
+    if (!document.body) {
+        if (!pendingBanners.has(id)) {
+            document.addEventListener('DOMContentLoaded', () => {
+                const latest = pendingBanners.get(id);
+                pendingBanners.delete(id);
+                if (latest) banner(latest);
+            }, { once: true });
+        }
+        pendingBanners.set(id, spec);
+        return;
+    }
+    const existing = document.getElementById(id);
+    if (existing) {
+        existing.querySelector('span').textContent = text;
+        return;
+    }
+    const { z, background } = BANNER_LEVELS[level];
+    const el = document.createElement('div');
+    el.id = id;
+    el.style.cssText = `position:fixed;top:0;left:0;right:0;z-index:${z};` +
+        `background:${background};color:#fff;font:13px/1.6 sans-serif;` +
+        'text-align:center;padding:5px;opacity:0.95;';
+    const words = document.createElement('span');
+    words.textContent = text;
+    el.appendChild(words);
+    if (action) {
+        const b = document.createElement('button');
+        b.textContent = action.label;
+        b.style.cssText = 'font:inherit;color:inherit;background:none;' +
+            'border:1px solid currentColor;border-radius:3px;padding:0 .6em;' +
+            'margin-left:.6em;cursor:pointer;';
+        b.onclick = action.onClick;
+        el.appendChild(b);
+    }
+    document.body.appendChild(el);
+}
+
+function removeBanner(id) {
+    pendingBanners.delete(id);
+    document.getElementById(id)?.remove();
+}
+
 // offerReload puts a bar across the top of the page saying a new browser
 // runtime is available, with a button that reloads.
 //
@@ -52,45 +120,26 @@ function askServiceWorkerBuild(worker) {
 // beside BUILD, one that moves only when the contract between them does,
 // so a breaking mismatch can insist where a cosmetic one asks.
 function offerReload(theirs) {
-    let el = document.getElementById('bb-update-banner');
-    if (el) return;                        // already offered, nothing new to say
-
-    /* Nobody awaits the caller, so a throw in here would be an unhandled
-       rejection and the offer would just never appear. The stale check can
-       finish before the body exists, so wait for it rather than find out. */
-    if (!document.body) {
-        document.addEventListener('DOMContentLoaded', () => offerReload(theirs),
-                                  { once: true });
-        return;
-    }
-
-    el = document.createElement('div');
-    el.id = 'bb-update-banner';
-    el.style.cssText = 'position:fixed;top:0;left:0;right:0;z-index:2147483646;' +
-        'background:#1f4e79;color:#fff;font:13px/1.6 sans-serif;text-align:center;' +
-        'padding:5px;opacity:0.96;';
-
-    /* One z-index below the reconnect banner, so a session in trouble is
-       never hidden behind news about a release. */
-    /* "Browser runtime" rather than "version": what changed is the code this
-       page runs, not the device's firmware or the app behind it, and on a page
-       that is showing a device "new version" reads as news about the device. */
-    el.append(document.createTextNode('New browser runtime available '));
-
-    const b = document.createElement('button');
-    b.textContent = 'Reload';
-    b.style.cssText = 'font:inherit;color:inherit;background:none;' +
-        'border:1px solid currentColor;border-radius:3px;padding:0 .6em;' +
-        'margin-left:.3em;cursor:pointer;';
-    b.onclick = () => {
-        /* Remembered before reloading, not after: if a deploy left the two
-           files disagreeing for good, the page comes back still stale and
-           would be offered the same reload forever. One click per stamp. */
-        try { sessionStorage.setItem('bb-reloaded-for', theirs); } catch { /* private mode */ }
-        window.location.reload();
-    };
-    el.appendChild(b);
-    document.body.appendChild(el);
+    banner({
+        id: 'bb-update-banner',
+        level: 'news',
+        /* "Browser runtime" rather than "version": what changed is the code
+           this page runs, not the device's firmware or the app behind it, and
+           on a page that is showing a device "new version" reads as news
+           about the device. */
+        text: 'New browser runtime available',
+        action: {
+            label: 'Reload',
+            onClick: () => {
+                /* Remembered before reloading, not after: if a deploy left the
+                   two files disagreeing for good, the page comes back still
+                   stale and would be offered the same reload forever. One
+                   click per stamp. */
+                try { sessionStorage.setItem('bb-reloaded-for', theirs); } catch { /* private mode */ }
+                window.location.reload();
+            },
+        },
+    });
 }
 
 // offerReloadIfStale compares our build stamp against the worker's and
@@ -921,6 +970,17 @@ class BitBangConnection {
         if (this.debug) this._print(msg);
     }
 
+    // Same, marked as an error, with the status area made visible. Was
+    // showErrorScreen, beside showReloadScreen -- which does replace the page.
+    // This only writes a line.
+    _printError(msg) {
+        if (this.connectionUI) {
+            this._print(msg);
+            if (this.statusEl) this.statusEl.classList.add('error');
+            this.connectionUI.style.display = '';
+        }
+    }
+
     // Parse the coturn REST-API expiry from a TURN credential's username
     // ("<epoch>[:<user_name>]") and stash it in this._turnExpiryMs. The
     // server stamps the same epoch on every entry it returns, so the
@@ -1408,7 +1468,7 @@ class BitBangConnection {
                     // than surfacing a terminal error screen.
                     this._settleReconnect(false, new Error('pc_failed'));
                 } else {
-                    this.showErrorScreen('Peer connection failed');
+                    this._printError('Peer connection failed');
                 }
             }
         };
@@ -2171,23 +2231,13 @@ class BitBangConnection {
     // -- so one strip that changes its words beats two competing for the same
     // place at the top of the page.
     _showReconnecting(text = 'Reconnecting…') {
-        let el = document.getElementById('bb-reconnect-banner');
-        if (!el) {
-            this._prevTitle = document.title;   // restored in _hideReconnecting
-            el = document.createElement('div');
-            el.id = 'bb-reconnect-banner';
-            el.style.cssText = 'position:fixed;top:0;left:0;right:0;z-index:2147483647;' +
-                'background:#333;color:#fff;font:13px/1.6 sans-serif;text-align:center;' +
-                'padding:4px;opacity:0.92;';
-            document.body.appendChild(el);
-        }
-        el.textContent = text;
+        if (this._prevTitle == null) this._prevTitle = document.title;   // restored in _hideReconnecting
+        banner({ id: 'bb-reconnect-banner', level: 'trouble', text });
         document.title = text + ' - bitba.ng';
     }
 
     _hideReconnecting() {
-        const el = document.getElementById('bb-reconnect-banner');
-        if (el) el.remove();
+        removeBanner('bb-reconnect-banner');
         if (this._prevTitle != null) {
             document.title = this._prevTitle;
             this._prevTitle = null;
@@ -2314,7 +2364,7 @@ class BitBangConnection {
             const expected = await sha256Base64(this.verifyNonce);
             if (msg.hash !== expected) {
                 console.error('[Bootstrap] nonce hash mismatch — device did not prove possession of the private key. Closing.');
-                this.showErrorScreen('Connection rejected: device identity could not be verified.');
+                this._printError('Connection rejected: device identity could not be verified.');
                 try { this.dataChannel.close(); } catch (e) {}
                 try { this.pc.close(); } catch (e) {}
                 return;
@@ -2329,7 +2379,7 @@ class BitBangConnection {
             // Any non-verify control message before verify is a protocol
             // violation. Treat as if the device failed to authenticate.
             console.error('[Bootstrap] control message %o received before verify_nonce_hash — closing', msg.type);
-            this.showErrorScreen('Connection rejected: device identity could not be verified.');
+            this._printError('Connection rejected: device identity could not be verified.');
             try { this.dataChannel.close(); } catch (e) {}
             try { this.pc.close(); } catch (e) {}
             return;
@@ -2416,7 +2466,7 @@ class BitBangConnection {
             //
             // Once the iframe exists it is position:fixed, full viewport,
             // opaque, z-index 1 -- it paints straight over #connection-ui, so
-            // showErrorScreen would say nothing at all. Worse, the device is
+            // _printError would say nothing at all. Worse, the device is
             // about to close the channel, and onclose routes into the
             // reconnect loop: the user would be left watching "Reconnecting..."
             // for a session that has intentionally ended, which is the
@@ -2426,7 +2476,7 @@ class BitBangConnection {
             if (document.getElementById('device-frame')) {
                 this.showReloadScreen(msg.message || 'The device ended this session');
             } else {
-                this.showErrorScreen(msg.message || 'Connection refused');
+                this._printError(msg.message || 'Connection refused');
             }
         }
     }
@@ -2493,14 +2543,6 @@ class BitBangConnection {
             `;
             this.connectionUI.style.display = '';
             document.getElementById('bb-reload-btn').onclick = () => location.reload();
-        }
-    }
-
-    showErrorScreen(message) {
-        if (this.connectionUI) {
-            this._print(message);
-            if (this.statusEl) this.statusEl.classList.add('error');
-            this.connectionUI.style.display = '';
         }
     }
 
