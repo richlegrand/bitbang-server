@@ -2236,6 +2236,18 @@ class BitBangConnection {
         this._clearRelayMonitor();
         this._turnHoldPromise = null;
         this._turnExpiryMs = null;
+
+        // Every stream the page has open was on the data channel just closed,
+        // and none of them will be carried over: a new peer connection is a new
+        // set of streams on the device too. Closed here, as a device FIN would,
+        // so each socket's close handler runs and the page can open it again.
+        // Left alone, a socket stayed OPEN with nothing ever arriving on it --
+        // the console panel sat at "connected" and silent after a soft
+        // reconnect, and only a reload brought it back (2026-10-01).
+        for (const [streamId, s] of this.wsStreams) {
+            s.iframe.postMessage({ type: 'ws_closed', streamId, code: 1006, reason: '' }, '*');
+        }
+        this.wsStreams.clear();
     }
 
     // The text is a parameter because this strip says two things: that the
@@ -2943,10 +2955,24 @@ class BitBangConnection {
     handleWSShimMessage(event) {
         const iframe = document.getElementById('device-frame');
         if (!iframe || event.source !== iframe.contentWindow) return;
-        if (!this.dataChannel || this.dataChannel.readyState !== 'open') return;
 
         const msg = event.data;
         if (!msg || !msg.type?.startsWith('ws_')) return;
+
+        if (!this.dataChannel || this.dataChannel.readyState !== 'open') {
+            // No transport, so an open fails rather than being dropped. Dropped,
+            // the socket waited in CONNECTING for an answer that never came,
+            // and a page retrying across a reconnect -- the console panel --
+            // retried once and then hung. The shim matches a waiting socket by
+            // openId and a closing one by streamId, so it is assigned a stream
+            // and closed on it in the same breath.
+            if (msg.type === 'ws_open') {
+                const streamId = this.nextStreamId++;
+                iframe.contentWindow.postMessage({ type: 'ws_assign', openId: msg.openId, streamId }, '*');
+                iframe.contentWindow.postMessage({ type: 'ws_closed', streamId, code: 1006, reason: '' }, '*');
+            }
+            return;
+        }
 
         if (msg.type === 'ws_open') {
             const streamId = this.nextStreamId++;
