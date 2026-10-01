@@ -1,10 +1,14 @@
 /*
  * Renders the streams a device declares, inside the device's own page.
  *
- * A device page loads it with a script tag, like any other library:
+ * A device page doesn't load this file by name. It includes bitbang.js, which
+ * loads this when the page has a stream element:
  *
  *     <canvas data-bitbang-stream="cam"></canvas>
- *     <script src="/__bitbang__/stream-shim.js"></script>
+ *     <script src="/__bitbang__/bitbang.js"></script>
+ *
+ * A script tag naming stream-shim.js would work today and break the day this
+ * file is renamed or split -- which bitbang.js exists so that it can be.
  *
  * It runs in the page because it needs a DOM -- a service worker could not do
  * this job at all: no canvas, no AudioContext, nothing to draw on.

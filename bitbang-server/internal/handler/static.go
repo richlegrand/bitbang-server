@@ -360,8 +360,10 @@ func Static(stamps *StampCache, frontPagePath string) http.HandlerFunc {
 			first = trimmed[:i]
 		}
 
-		// Special case: /<file>.js at the top level — serve that JS file
-		// (matches Python's "if uid.endswith('.js'): send_file(uid)" branch).
+		// Special case: /<file>.js at the top level -- serve that JS file.
+		// Inherited from the Python server and unexamined: nothing served
+		// today asks for one (bootstrap.html and the service worker both use
+		// /__bitbang__/), so it may only be here for pages older than that.
 		if strings.HasSuffix(first, ".js") && !strings.ContainsAny(first, "/\\") && !strings.Contains(first, "..") {
 			// no-cache like the /__bitbang__/ route. This branch served
 			// cacheable until now, which meant the same asset had a stale

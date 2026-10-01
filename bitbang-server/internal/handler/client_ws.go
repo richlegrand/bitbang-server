@@ -268,7 +268,10 @@ func (d *Deps) clientRelay(conn *registry.ClientConn) {
 
 		case "candidate":
 			if err := device.SendJSON(msg); err != nil {
-				// Match Python: silently drop candidate if device is gone.
+				// The device's socket is gone. This ends the relay with
+				// nothing sent first, where the answer case above sends
+				// device_not_found -- inherited from the Python server,
+				// and the difference has never been examined.
 				return
 			}
 			d.Log.Debug("forwarded candidate", "client_id", conn.ClientID, "target", conn.TargetUID)

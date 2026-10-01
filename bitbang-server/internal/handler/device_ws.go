@@ -47,8 +47,13 @@ type Deps struct {
 	// Upgrader is the gorilla websocket upgrader, configured once.
 	Upgrader websocket.Upgrader
 
-	// PingInterval / PongWait control the keepalive cycle. Match Python:
-	// websocket_ping_interval=60, keep_alive_timeout=300.
+	// PingInterval / PongWait control the keepalive cycle (main.go sets 60s
+	// and 300s). Both numbers are inherited from the Python server and have
+	// never been examined, so there is nothing about them to preserve.
+	//
+	// What PongWait decides: how long a device that vanished without coming
+	// back stays registered. A device that reboots doesn't wait on it -- its
+	// new register replaces the old connection at once (see DeviceWS).
 	PingInterval time.Duration
 	PongWait     time.Duration
 
@@ -384,7 +389,7 @@ func readJSON(ws *websocket.Conn, v any) error {
 
 // setReadKeepalive configures the read deadline + pong handler so idle
 // connections are dropped after PongWait without a pong from the peer.
-// Matches Python's websocket_ping_interval=60 + keep_alive_timeout=300.
+// The 300s fallback is the same inherited number as on Deps.PongWait.
 func (d *Deps) setReadKeepalive(ws *websocket.Conn) {
 	wait := d.PongWait
 	if wait == 0 {

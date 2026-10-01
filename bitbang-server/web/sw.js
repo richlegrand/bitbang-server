@@ -88,16 +88,17 @@ const {
     map: sessions, ready: sessionsReady, save: saveSessions,
 } = persistedMap('bitbang-sessions', '/__bitbang__/sessions');
 
-// -- Client -> session binding (fix 1c) --------------------------------------
+// -- Client -> session binding -----------------------------------------------
 //
 // Maps clientId -> sessionId. Recorded when the SW proxies a navigation for
 // an already-resolved session: FetchEvent.resultingClientId is the id of the
 // client that navigation will create, so the frame that lands can later be
 // resolved by IDENTITY instead of by parsing a URL.
 //
-// Why this exists: xhr-shim.js:44 deliberately strips /__device__/<sid> from
-// the iframe's own URL (SPA routers read location.pathname and can't match a
-// route with the proxy prefix in it). That erases the routing key from BOTH
+// Why this exists: xhr-shim.js, in its "Strip proxy prefix" block,
+// deliberately strips /__device__/<sid> from the iframe's own URL (SPA
+// routers read location.pathname and can't match a route with the proxy
+// prefix in it). That erases the routing key from BOTH
 // signals the concrete strategies read -- the frame's client.url and the
 // referrer it sends. So a short-top-path navigation out of a proxied iframe
 // (Frigate's post-login `location.href = '/'`) is structurally unresolvable:
