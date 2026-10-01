@@ -50,10 +50,14 @@ const DUR = 220;
  *          the state is remembered under
  * onChange called with the new state after a click, not for the remembered
  *          state applied at mount -- a panel reads isFolded() for that
+ * dock     'end' for a panel docked at the far end of its axis -- the console,
+ *          along the bottom of the window -- so it grows and shrinks from that
+ *          edge. Omitted, the near edge stays put, which is right for the
+ *          settings column on the left.
  *
  * Returns { isFolded }.
  */
-export function foldable({ host, fold, wrap, axis, name, onChange }) {
+export function foldable({ host, fold, wrap, axis, name, onChange, dock }) {
   /* Remembered per viewer and per device, because whether the panel is in the
      way is a fact about this screen rather than about the device. The read is
      wrapped because storage throws in a private window and comes back empty
@@ -113,6 +117,19 @@ export function foldable({ host, fold, wrap, axis, name, onChange }) {
     if (!folded) wrap.style[axis] = wrap.getBoundingClientRect()[axis] + 'px';
     host.style.overflow = 'hidden';
 
+    /* Docked at the far end, the panel has to stay there while it is held to
+       the animated size. Opening, the page goes straight to its open layout
+       -- the rows above give up the room the console will take -- while the
+       console is still small, which leaves room between them; without this
+       the console sat at the top of that room and grew down, popping up and
+       then dropping, the reverse of how it folds. An auto margin on the near
+       side takes the room instead, so the panel stays against its edge and
+       grows from it. In ordinary flow an auto margin is nothing, so it only
+       acts where there is room to take. For the animation only: settled, the
+       panel fills the room and there is none. */
+    const nearMargin = axis === 'height' ? 'marginTop' : 'marginLeft';
+    if (dock === 'end') host.style[nearMargin] = 'auto';
+
     /* The min and max animated with the size, all three the same, so the host
        is exactly the animated size whatever the page's layout wants. A page
        can make the host grow into free space -- the camera page's console
@@ -130,6 +147,7 @@ export function foldable({ host, fold, wrap, axis, name, onChange }) {
     anim.finished.then(() => {
       wrap.style[axis] = '';
       host.style.overflow = '';
+      if (dock === 'end') host.style[nearMargin] = '';
     }, () => {});
   };
 

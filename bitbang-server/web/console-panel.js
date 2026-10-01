@@ -447,7 +447,9 @@ export function mount(host, opts = {}) {
   let fold = null;
   if (collapsible) {
     fold = foldable({
-      host, axis: 'height', name: 'Console',
+      /* Docked at the end: a folding console is a row along the bottom of a
+         page, and grows up from there. In ordinary flow this does nothing. */
+      host, axis: 'height', name: 'Console', dock: 'end',
       fold: root.getElementById('fold'),
       wrap: root.getElementById('fold-wrap'),
       onChange: (folded) => {
