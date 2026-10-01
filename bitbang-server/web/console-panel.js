@@ -188,16 +188,57 @@ export function mount(host, opts = {}) {
 
   const say = (t, bad) => { stateEl.textContent = t; stateEl.className = bad ? 'err' : ''; };
 
+  /* -- getting text onto the page without stalling it ------------------------
+
+     This shares a thread with the video. It used to add each line to the log
+     the moment it arrived, reading the log's scroll position before and setting
+     it after -- two forced layouts per line, of one block of text that only
+     ever grew. Measured on 2026-10-01: a 1 KB chunk took 3.9 ms against a
+     300-line log and 125.6 ms against 7,300 lines, which is twelve minutes of
+     this camera's output. That was the video stuttering whenever the console
+     printed, worse the longer the page was open; and nothing was ever let go.
+
+     So: lines wait for the next frame and go in together; whether the view is
+     at the bottom is learned from its own scroll events rather than measured
+     per line; and the log keeps the last MAX_PIECES and lets the rest go. */
+  const MAX_PIECES = 4000;
+  let queued = document.createDocumentFragment();
+  let frameAsked = false;
+
+  /* At the bottom, so new lines should keep it there. Updated when the log
+     scrolls -- by a person, or by flush() below -- so appending never has to
+     measure anything. */
+  let atBottom = true;
+  logEl.addEventListener('scroll', () => {
+    atBottom = logEl.scrollHeight - logEl.scrollTop - logEl.clientHeight < 40;
+  }, { passive: true });
+
+  function flush() {
+    frameAsked = false;
+    logEl.appendChild(queued);              /* moves the nodes; queued is empty after */
+    for (let extra = logEl.childElementCount - MAX_PIECES; extra > 0; extra--) {
+      logEl.firstChild.remove();
+    }
+    if (followEl.checked && atBottom) logEl.scrollTop = logEl.scrollHeight;
+  }
+
   /* Untrusted by construction: device output is bytes, and the only safe way to
      put bytes on a page is as text. Everything here appends text nodes. */
   function append(text, cls) {
     if (!text) return;
-    const atBottom = logEl.scrollHeight - logEl.scrollTop - logEl.clientHeight < 40;
     const node = document.createElement('span');
     if (cls) node.className = cls;
     node.textContent = text;
-    logEl.appendChild(node);
-    if (followEl.checked && atBottom) logEl.scrollTop = logEl.scrollHeight;
+    queued.appendChild(node);
+    /* A hidden tab runs no frames, so the queue is capped too: a device that
+       logged for an hour behind another tab would otherwise all land at once. */
+    for (let extra = queued.childElementCount - MAX_PIECES; extra > 0; extra--) {
+      queued.firstChild.remove();
+    }
+    if (!frameAsked) {
+      frameAsked = true;
+      requestAnimationFrame(flush);
+    }
   }
 
   /* The level color is decided per line, so text is held until its newline
@@ -266,7 +307,10 @@ export function mount(host, opts = {}) {
     }
   }
 
-  root.getElementById('clear').onclick = () => { logEl.textContent = ''; };
+  root.getElementById('clear').onclick = () => {
+    logEl.textContent = '';
+    queued = document.createDocumentFragment();
+  };
 
   /* -- the device's console settings ---------------------------------------- */
 
