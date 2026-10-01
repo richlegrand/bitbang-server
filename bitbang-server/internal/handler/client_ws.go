@@ -268,10 +268,11 @@ func (d *Deps) clientRelay(conn *registry.ClientConn) {
 
 		case "candidate":
 			if err := device.SendJSON(msg); err != nil {
-				// The device's socket is gone. This ends the relay with
-				// nothing sent first, where the answer case above sends
-				// device_not_found -- inherited from the Python server,
-				// and the difference has never been examined.
+				// The device's socket is gone: say so, as the answer case
+				// does. Ending the relay without it left the browser seeing
+				// only a closed socket, which it reports as "Connection
+				// failed" -- pointing at the network rather than the device.
+				_ = conn.SendJSON(wire.NewError(wire.ErrDeviceNotFound, "Device not found"))
 				return
 			}
 			d.Log.Debug("forwarded candidate", "client_id", conn.ClientID, "target", conn.TargetUID)
