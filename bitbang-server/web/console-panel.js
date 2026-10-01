@@ -24,6 +24,9 @@
  * Temporary, with console.html: both move out when the server has plugins.
  */
 
+import { foldable, FOLD_CSS } from './panel-fold.js';
+import { control, absorb, THEME_CSS, CONTROL_CSS } from './setting-control.js';
+
 const STYLE = `
   /* :host, not :root, for the reason settings-panel.js gives: these land on
      the host element, and the variables are the override point a sketch has. */
@@ -33,27 +36,43 @@ const STYLE = `
     min-height: 0;
     color-scheme: light dark;
     --font: ui-monospace, SFMono-Regular, Menlo, Consolas, "Liberation Mono", monospace;
-    --dim: #8a8a8e;
-    --line: #8884;
-    --bad: #e5484d;
-    --accent: #3b82f6;
+    /* The colors are setting-control.js's THEME_CSS, shared with settings. */
     font: 13px/1.5 var(--font);
   }
   /* Embedded, the log needs a height to scroll inside, and a div in a sketch's
      layout has none unless the sketch gives it one. This is the default; a
      height the page sets on the element wins, since a page's own rule on the
-     host outranks :host. The border marks where the scrolling region is. */
+     host outranks :host. */
   :host([data-bb-embedded]) {
     /* border-box, so a height the page gives the element is its outer height
-       rather than that plus the border. */
+       rather than that plus anything inside. */
     box-sizing: border-box;
     height: 18rem;
-    border: 1px solid var(--line);
-    border-radius: 6px;
   }
   header { display:flex; align-items:center; gap:1rem; flex-wrap:wrap;
            padding:.6rem 1rem; border-bottom:1px solid var(--line); }
-  :host([data-bb-embedded]) header { padding:.35rem .75rem; }
+  /* What folds away. A flex child of its own, so the log inside it still fills
+     whatever height the host has. */
+  #fold-wrap { flex:1; min-height:0; display:flex; flex-direction:column; }
+
+  /* Embedded, the toolbar sits above a bordered log rather than inside one
+     border with it -- the settings panel's arrangement, a row of buttons over
+     the content. That is what keeps the toggle still: it is at the panel's
+     left edge open and folded, so folding moves it down and nothing else.
+     Inside a border it sat a padding's width further in when open, and
+     jumped sideways every time it was pressed. */
+  :host([data-bb-embedded]) header { padding:0 0 .4rem; border-bottom:none; }
+  :host([data-bb-embedded]) #fold-wrap { border:1px solid var(--line);
+                                         border-radius:6px; }
+
+  /* Folded, the panel is its toggle and nothing else -- a button in the corner
+     of the page, as the settings toggle is. The height goes to the button's,
+     which is what the page above takes back. A page that sets its own height
+     on the element says what folded is worth, as the camera page does for
+     settings' width: #con[data-bb-collapsed]{height:auto}. */
+  :host([data-bb-collapsed]) { height:auto; }
+  :host([data-bb-collapsed]) header { padding:0; border-bottom:none; }
+  :host([data-bb-collapsed]) header > :not(#fold) { display:none; }
   h1 { font-size:.75rem; font-weight:600; letter-spacing:.08em;
        text-transform:uppercase; color:var(--dim); margin:0; }
   #state { font-size:.75rem; color:var(--dim); }
@@ -64,6 +83,17 @@ const STYLE = `
            border:1px solid var(--line); border-radius:5px;
            padding:.2rem .6rem; cursor:pointer; }
   button:hover { border-color:var(--accent); }
+  /* The device's own controls, laid out as toolbar items like follow beside
+     them rather than as a group of their own. */
+  #ctl { display:contents; }
+  /* The shared rows, sized for a toolbar: one line each, no label column, no
+     line reserved for the device's answer, and type the size of follow's. */
+  #ctl .row { display:inline-flex; flex-wrap:nowrap; align-items:center;
+              column-gap:.4rem; padding:0; font-size:.75rem; }
+  #ctl .label { flex:none; min-width:0; }
+  #ctl .ctl, #ctl .ctl.narrow, #ctl .ctl.wide { flex:none; min-width:0; gap:.3rem; }
+  #ctl .state { min-height:0; }
+  #ctl select { padding:.1rem .3rem; }
 
   #log { flex:1; min-height:0; overflow:auto; margin:0; padding:.6rem 1rem;
          white-space:pre-wrap; word-break:break-word; }
@@ -116,30 +146,40 @@ function classForSGR(params, current) {
 }
 
 /*
- * opts.title   the "Console" heading. Default true; the embedded mount passes
- *              false, because the page supplies its own label.
+ * opts.title        the "Console" heading. Default true; the embedded mount
+ *                   passes false, because the page supplies its own label.
+ * opts.collapsible  a toggle that folds the console down to just that toggle.
+ *                   Default false. Folds vertically -- a console is a row along
+ *                   the bottom of a page, not a column -- with the same
+ *                   mechanism as the settings panel (panel-fold.js).
  *
  * Everything below lives in this function rather than at module scope, so two
  * consoles on one page keep their own socket, position and line buffer.
  */
 export function mount(host, opts = {}) {
   const title = opts.title !== false;
+  const collapsible = opts.collapsible === true;
   if (!title) host.setAttribute('data-bb-embedded', '');
 
   const root = host.attachShadow({ mode: 'open' });
   const style = document.createElement('style');
-  style.textContent = STYLE;
+  /* The shared pieces first, so this panel's own rules can refine them. */
+  style.textContent = THEME_CSS + CONTROL_CSS + STYLE + FOLD_CSS;
   root.appendChild(style);
 
+  /* The toggle first in the toolbar, which is the one part that does not
+     fold -- so folded, it is the button left in the corner. */
   const frag = document.createElement('div');
   frag.innerHTML = `
     <header>
+      ${collapsible ? '<button id="fold" aria-expanded="true">Hide</button>' : ''}
       ${title ? '<h1>Console</h1>' : ''}
       <span id="state">connecting</span>
       <label><input type="checkbox" id="follow" checked> follow</label>
+      <span id="ctl"></span>
       <button id="clear">Clear</button>
     </header>
-    <pre id="log"></pre>`;
+    <div id="fold-wrap"><pre id="log"></pre></div>`;
   while (frag.firstChild) root.appendChild(frag.firstChild);
 
   const logEl = root.getElementById('log');
@@ -228,6 +268,48 @@ export function mount(host, opts = {}) {
 
   root.getElementById('clear').onclick = () => { logEl.textContent = ''; };
 
+  /* -- the device's console settings ---------------------------------------- */
+
+  /* Settings the device declares for this panel -- "p": "console" -- shown in
+     the toolbar. Log level today. Built by setting-control.js, the same code
+     the settings panel's rows are: writing, showing the device's answer,
+     greying when the device says why, and staying put when a refresh finds
+     nothing structural changed. This panel decides only where they go.
+
+     Fetched when the console opens and when the window comes back, not polled:
+     a change made from another browser shows up then. Polling one row every
+     four seconds is not worth link the video is competing for.
+
+     A device without the settings module answers 404, and there is simply
+     nothing to show. */
+  const SETTINGS = '/__bitbang/settings';
+  const ctlEl = root.getElementById('ctl');
+  const ctx = {
+    root, base: SETTINGS, inflight: new Map(), pending: new Map(),
+    /* The device asked for a refetch after a write: this panel's only
+       declarations are its own, so that is all it refetches. */
+    onReload: () => loadControls(),
+  };
+  let onScreen = [];
+
+  async function loadControls() {
+    try {
+      const r = await fetch(SETTINGS);
+      if (!r.ok) return;
+      const next = ((await r.json()).settings || []).filter(s => s.p === 'console');
+      /* Values only when nothing structural moved -- which is what keeps a
+         refresh on window focus from replacing a dropdown somebody has just
+         opened. */
+      if (absorb(onScreen, next)) {
+        for (const el of ctlEl.children) el._sync?.();
+        return;
+      }
+      onScreen = next;
+      ctlEl.textContent = '';
+      for (const s of onScreen) ctlEl.appendChild(control(s, ctx));
+    } catch (e) { /* nothing to show */ }
+  }
+
   const dec = new TextDecoder();
   let retry = 0;
 
@@ -237,18 +319,28 @@ export function mount(host, opts = {}) {
      device: every byte is accounted for, so from + received is exact. */
   let seq = null;
 
+  /* The socket in use, and the retry waiting to replace it. Folding closes the
+     one and cancels the other, and every handler below checks it still belongs
+     to the current socket: a frame or a close arriving from one that folding
+     shut must neither count toward seq -- the resume would then skip it -- nor
+     schedule a reconnect behind the fold's back. */
+  let ws = null, retryTimer = null;
+
   function connect() {
+    retryTimer = null;
     /* Same URL shape a device page would use. bootstrap turns the path into a
        SWSP SYN of {"type":"console",...}; nothing in the browser below this
        knows what a console is. */
     const q = seq === null ? `tail=${TAIL}` : `since=${seq}`;
     const base = (location.protocol === 'https:' ? 'wss://' : 'ws://') + location.host;
-    const ws = new WebSocket(`${base}/__bitbang/console?${q}`);
-    ws.binaryType = 'arraybuffer';
+    const sock = new WebSocket(`${base}/__bitbang/console?${q}`);
+    ws = sock;
+    sock.binaryType = 'arraybuffer';
 
-    ws.onopen = () => { retry = 0; say('connected'); };
+    sock.onopen = () => { if (sock !== ws) return; retry = 0; say('connected'); };
 
-    ws.onmessage = (ev) => {
+    sock.onmessage = (ev) => {
+      if (sock !== ws) return;
       if (typeof ev.data === 'string') {
         /* The device's SYN reply: what it is about to send and what it could
            not. Shown only when it means something was lost. */
@@ -284,18 +376,50 @@ export function mount(host, opts = {}) {
       writeAnsi(dec.decode(body, { stream: true }));
     };
 
-    ws.onclose = () => {
+    sock.onclose = () => {
+      if (sock !== ws) return;
+      ws = null;
       /* Backoff, because a device that is rebooting will refuse for a few
          seconds and hammering it helps nobody. */
       const wait = Math.min(1000 * 2 ** retry++, 15000);
       say(`disconnected -- retrying in ${Math.round(wait / 1000)}s`, true);
-      setTimeout(connect, wait);
+      retryTimer = setTimeout(connect, wait);
     };
 
-    ws.onerror = () => say('connection failed', true);
+    sock.onerror = () => { if (sock === ws) say('connection failed', true); };
   }
 
-  connect();
+  /* Folded, nobody is reading, and the stream would only compete with the
+     video for the link. Opening resumes from seq, so what was logged in the
+     meantime arrives then -- as far back as the device's ring reaches. */
+  function disconnect() {
+    clearTimeout(retryTimer);
+    retryTimer = null;
+    const sock = ws;
+    ws = null;
+    sock?.close();
+  }
+
+  let fold = null;
+  if (collapsible) {
+    fold = foldable({
+      host, axis: 'height', name: 'Console',
+      fold: root.getElementById('fold'),
+      wrap: root.getElementById('fold-wrap'),
+      onChange: (folded) => {
+        if (folded) { disconnect(); return; }
+        retry = 0;
+        say('connecting');
+        connect();
+        loadControls();
+      },
+    });
+  }
+
+  /* Coming back to the window is when another browser's change would show. */
+  addEventListener('focus', () => { if (!fold?.isFolded()) loadControls(); });
+
+  if (!fold?.isFolded()) { connect(); loadControls(); }
 }
 
 /*
@@ -307,11 +431,17 @@ export function mount(host, opts = {}) {
  *
  * Give the element a height to set the size of the log; without one it gets
  * the default in STYLE. No title: the page has labelled the area already.
+ * data-bitbang-collapsible asks for the fold toggle, opt-in for the reason
+ * settings-panel.js gives: whether folding makes sense is a fact about the
+ * page's layout, which only the page knows.
  */
 function mountDeclared() {
   for (const el of document.querySelectorAll('[data-bitbang-page="console"]')) {
     if (el.shadowRoot) continue;          /* already mounted */
-    mount(el, { title: false });
+    mount(el, {
+      title:       false,
+      collapsible: el.hasAttribute('data-bitbang-collapsible'),
+    });
   }
 }
 

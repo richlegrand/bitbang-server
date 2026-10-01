@@ -27,6 +27,9 @@
  * Temporary, with settings.html: both move out when the server has plugins.
  */
 
+import { foldable, FOLD_CSS } from './panel-fold.js';
+import { control, absorb, THEME_CSS, CONTROL_CSS } from './setting-control.js';
+
 const STYLE = `
   /* :host, not :root. Inside a shadow root these declarations have to land on
      the host element, and that is also what makes the variables below an
@@ -42,12 +45,7 @@ const STYLE = `
        which is what made this look unlike a settings page. */
     --font: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto,
             "Helvetica Neue", Arial, sans-serif;
-    --accent: #3b82f6;
-    --dim: #8a8a8e;
-    --line: #8884;
-    --bad: #e5484d;
-    --ok: #30a46c;
-    accent-color: var(--accent);
+    /* The colors are setting-control.js's THEME_CSS, shared with the console. */
   }
   /* 1.45 rather than 1.6, and half the padding. A settings page is a dense
      list read by someone looking for one row, not prose. The narrow padding
@@ -68,40 +66,9 @@ const STYLE = `
   #tabs button[aria-selected=true] { color:inherit; border-bottom-color:var(--accent); }
   #tabs button:hover { color:inherit; }
 
-  /* No rules between rows -- spacing separates them, and a settings page that
-     is merely calm reads as deliberate. */
-  /* A wrapping line, not a grid with a breakpoint.
-     
-     Each control takes a second line only when it does not fit on the first, and
-     the ones that do fit all start at the same x because the label's basis is
-     fixed -- so a column of checkboxes and selects lines up while the sliders
-     beside them wrap. A breakpoint cannot do that: it moves every row at once,
-     at a width somebody guessed.
-     
-     em and not rem throughout. rem is the document's font size, which a host
-     page sets and this cannot see: the camera page picks 12px for the panel, and
-     an 11rem label column stayed 176px of a 280px column -- 63% of it, leaving
-     about 100px for the control. em tracks whatever size the host chose. */
-  .row { display:flex; flex-wrap:wrap; align-items:baseline;
-         column-gap:1em; row-gap:.1rem; padding:.28rem 0; }
-  .label { flex:0 1 11em; min-width:6em; }
-  /* A label with a hint says so. Nobody hovers something that looks inert, and
-     a dotted underline is the one convention for "there is an explanation
-     here" that costs no vertical space -- which matters when the alternative
-     was two extra lines on every row. */
-  .label.hinted { text-decoration:underline dotted; text-underline-offset:.2em;
-                  cursor:help; }
-  .ctl   { flex:1 1 auto; }
+  /* The rows themselves -- label, control, the device's answer -- are styled
+     by setting-control.js's CONTROL_CSS, shared with the console. */
 
-  /* What each kind of control asks for before it would rather have its own line.
-     Set here and chosen in row(), where the type is already known, rather than
-     inferred back out of the DOM by a selector.
-     
-     A checkbox and a button ask for nothing and so never wrap. A select or a
-     number fits beside an 11em label in a 300px column. A slider with its value,
-     or a text field, does not. */
-  .ctl.narrow { min-width:7em; }
-  .ctl.wide   { min-width:13em; flex-wrap:nowrap; }
   /* A heading inside a tab. Quieter than the tab labels above it and louder
      than a row, which is the whole job: 24 rows in one column are navigable
      because of six of these, and they must not read as a second tab bar.
@@ -111,29 +78,7 @@ const STYLE = `
   .section { margin:.75rem 0 .15rem; font-size:.8rem; font-weight:600;
              letter-spacing:.06em; text-transform:uppercase; color:var(--dim); }
   .section:first-child { margin-top:0; }
-  .label { color:var(--dim); }
-  .ctl { display:flex; align-items:center; gap:.45rem; flex-wrap:wrap; }
 
-  input, select, button.action { font:inherit; color:inherit; background:none;
-    border:1px solid var(--line); border-radius:5px; padding:.2rem .45rem; }
-  /* Canvas and CanvasText follow color-scheme, so this is right in both
-     themes. A transparent select inherits white text while the browser paints
-     the option list on its own default background -- white on white until a
-     row is highlighted. */
-  select, option { background:Canvas; color:CanvasText; }
-  input:focus, select:focus, button.action:focus { outline:2px solid var(--accent);
-    outline-offset:1px; border-color:transparent; }
-  /* Size the control to the value: a port number does not get a full-width box. */
-  input[type=number] { width:7rem; text-align:right; }
-  input[type=text], input[type=password] { width:100%; max-width:20rem; }
-  /* Fills what it is given, up to a comfortable length. The max was 11rem and
-     so unrelated to the panel's own scale. */
-  input[type=range] { width:100%; max-width:14em; border:0; padding:0; }
-  input[type=checkbox], input[type=radio] { width:auto; border:0; padding:0; }
-  label { display:inline-flex; align-items:center; gap:.3rem; }
-
-  button.action { cursor:pointer; padding:.35rem .9rem; }
-  button.action:hover { border-color:var(--accent); }
   /* Export and import act on the whole device, so they sit with the title
      rather than inside a tab. Restore defaults is per tab and sits with it. */
   /* Its own row now, since the actions outlive the title. Right-aligned so it
@@ -148,38 +93,9 @@ const STYLE = `
      They are one click away, which is the click that already happened. */
   :host([data-bb-collapsed]) #top > .action:not(#fold) { display:none; }
   :host([data-bb-collapsed]) #top { margin-bottom:0; }
-
-  /* Out of flow the moment it is folded, in the same rule that the page's own
-     collapsed width keys off. That matters: while the settings are in flow they
-     have a width, so a host sized to its content would size itself to the
-     widest row -- wider than the column it was -- for as long as the two were
-     out of step. Nothing here animates; the animation is the column's, in
-     apply() below. */
-  :host([data-bb-collapsed]) #fold-wrap { display:none; }
-  .foot { margin-top:1rem; padding-top:.7rem; border-top:1px solid var(--line); }
-  button.danger { border-color:var(--bad); color:var(--bad); }
-
-  /* A note used to lead with "-- ", which was punctuation doing a job the
-     layout was already doing: .ctl's gap separates it and the dim smaller type
-     says it is an aside. Two separators is one too many, and the dash read as
-     part of the sentence the device wrote. */
-  .unit, .bound, .note, .ro { color:var(--dim); font-size:.85em; }
-  /* A device URL is 55 characters with no space in it, so it overflows a 280px
-     column and takes the layout with it. Broken anywhere rather than truncated,
-     because the reason this row exists is to be copied, and you cannot select
-     what an ellipsis hid. */
-  .ro { overflow-wrap:anywhere; }
-  .track { display:inline-flex; align-items:center; gap:.5rem; }
-  .value { font-variant-numeric:tabular-nums; margin-left:.4rem; }
-  /* The reserved line stops the row jumping when a write answers. Reserved only
-     on rows that can be written: a readonly row never has a message, and paying
-     a line each for the six on the Device tab is most of a screen in a narrow
-     column -- which is where the gap under the URL came from, the empty box
-     wrapping onto its own line because the URL had filled the first. */
-  .state { font-size:.85em; color:var(--dim); min-height:1.2em; }
-  .row.readonly .state { min-height:0; }
-  .state.err { color:var(--bad); }
-  .state.ok  { color:var(--ok); }`;
+  /* The toggle's own look, and the rule that takes the rows out of flow when
+     folded, are in panel-fold.js's FOLD_CSS, shared with the console. */
+  .foot { margin-top:1rem; padding-top:.7rem; border-top:1px solid var(--line); }`;
 
 /* Two separable pieces, not one "chrome".
  *
@@ -241,7 +157,8 @@ export function mount(host, opts = {}) {
 
   const root = host.attachShadow({ mode: 'open' });
   const style = document.createElement('style');
-  style.textContent = STYLE;
+  /* The shared pieces first, so this panel's own rules can refine them. */
+  style.textContent = THEME_CSS + CONTROL_CSS + STYLE + FOLD_CSS;
   root.appendChild(style);
 
   const frag = document.createElement('div');
@@ -259,26 +176,22 @@ export function mount(host, opts = {}) {
      as five separate small decisions rather than one. */
   const BASE = SRC.split('?')[0];
 
-  /* Absent `n`, derive from the key: underscores to spaces, first letter up. */
-  const label = s => s.n || (s.k.replace(/_/g, ' ').replace(/^./, c => c.toUpperCase()));
-
-  /* An aside beside a control: why it is disabled, why it is readonly, that it
-     needs a restart, what is pending. Four of these were built a line at a time
-     in four places, which is three more places than a span needs. */
-  const note = (text) => {
-    const el = document.createElement('span');
-    el.className = 'note';
-    el.textContent = text;
-    return el;
-  };
-
   /* One request in flight per key. A timer alone still allows two POSTs for the
      same setting to be outstanding, and the older landing last leaves the device
      holding a stale value with nothing reporting an error. */
   const inflight = new Map(), pending = new Map();
 
+  /* What every row reaches outside itself for -- see control() in
+     setting-control.js. Arrow functions, so they read `rev` and reload() at
+     the time of the call rather than when this was built. */
+  const ctx = {
+    root, base: BASE, inflight, pending,
+    onRev: (r) => { rev = r; },
+    onReload: (group) => reload(group),
+  };
+
   let current = null;          // selected tab label
-  let folded = false;          // only ever true when opts.collapsible
+  let fold = null;             // the fold, when opts.collapsible
 
   /* The declaration revision the device last reported. Offered back on a poll so
      it can answer "nothing changed" without building 2 KB of JSON and calling
@@ -288,13 +201,21 @@ export function mount(host, opts = {}) {
      setting's value. */
   let rev = null;
 
+  /* Only the settings this panel renders. A setting can name another panel in
+     "p" -- log level is "console", a control on the log it changes -- and is
+     then that panel's to show. Applied wherever a declaration arrives, not just
+     the first load: a partial refetch that kept a setting `all` had dropped
+     would look like a new one every time, and send absorb() for a full reload
+     on every poll. */
+  const mine = (list) => list.filter(s => !s.p || s.p === 'settings');
+
   async function load(group) {
     const url = group && SRC.startsWith('/') ? SRC + '?g=' + encodeURIComponent(group) : SRC;
     const r = await fetch(url);
     if (!r.ok) throw new Error(r.status + ' from ' + url);
     const body = await r.json();
     if ('rev' in body) rev = body.rev;
-    return body.settings || [];
+    return mine(body.settings || []);
   }
 
   /* Ask whether anything changed and fetch only if it did. Returns the new
@@ -309,7 +230,7 @@ export function mount(host, opts = {}) {
     const body = await r.json();
     if ('rev' in body) rev = body.rev;
     /* The device sends settings only when they are worth sending. */
-    return body.settings || null;
+    return body.settings ? mine(body.settings) : null;
   }
 
   /* Reads the module-level `all` rather than taking the declarations as an
@@ -383,7 +304,7 @@ export function mount(host, opts = {}) {
         }
         shownSection = sec;
       }
-      panel.appendChild(row(s));
+      panel.appendChild(control(s, ctx));
     }
 
     /* Restore defaults belongs on the tab it applies to. A button's scope
@@ -409,353 +330,6 @@ export function mount(host, opts = {}) {
     }
   }
 
-  /* No array parameter. It had one, unused, which shadowed the module-level
-     `all` -- the same trap render() just fell into, sitting one function away. */
-  function row(s) {
-    const div = document.createElement('div');
-    div.className = 'row';
-
-    const l = document.createElement('div');
-    l.className = 'label';
-    l.textContent = label(s);
-    /* The browser's own tooltip. No layout, no positioning inside a 300px
-       column, and no background color to match against the host -- which the
-       styled version would need, and which would be a seventh custom property
-       in the contract.
-     
-       On the row rather than the label, so hovering anywhere across it works,
-       including the control. What it does not do is touch: there is no hover
-       there, and a tap reveals nothing. That is the known gap, and the fix if
-       this proves worth keeping is :focus-within with the hint positioned
-       absolutely so it does not shove the rows below it down the column. */
-    if (s.hint) {
-      div.title = s.hint;
-      l.classList.add('hinted');
-    }
-    div.appendChild(l);
-
-    const ctl = document.createElement('div');
-    ctl.className = 'ctl';
-    const state = document.createElement('div');
-    state.className = 'state';
-
-    const say = (msg, cls) => { state.textContent = msg; state.className = 'state ' + (cls || ''); };
-
-    const send = async (body) => {
-      if (inflight.get(s.k)) { pending.set(s.k, body); return; }   // coalesce
-      inflight.set(s.k, true);
-      say('...');
-      try {
-        const r = await fetch(BASE, {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify(body),
-        });
-        const j = await r.json().catch(() => ({}));
-        if (!r.ok) {
-          /* The error string is the whole guidance -- there is no pattern in the
-             declaration a page could have checked first.
-
-             A range used to arrive as separate min and max fields and get
-             appended here. The device writes it into the message now, because
-             the same dispatch answers callers that have no page to decorate
-             anything with. */
-          say(j.error || ('HTTP ' + r.status), 'err');
-        } else {
-          say(j.msg || 'applied', 'ok');
-          setTimeout(() => { if (state.textContent === (j.msg || 'applied')) say(''); }, 1500);
-          /* Display what came back, not what was sent: a setter may quantize.
-             And write it into the declaration, not only into the control --
-             switching tabs re-renders from that array, so a DOM-only update
-             looks right until you leave the tab and come back to the old
-             value. */
-          /* Our own write moved the revision. Taking it here keeps the next poll
-             from seeing a number it does not know and refetching the change we
-             just made and have already applied. */
-          if ('rev' in j) rev = j.rev;
-          if ('v' in j) s.v = j.v;
-          if ('set' in j) s.set = j.set;
-          if ('pv' in j) s.pv = j.pv; else delete s.pv;
-          /* show() rather than reaching for the control, which is what this did
-             -- three lines that asked whether input.type was a checkbox and
-             wrote .value or .checked accordingly. It had no answer for a radio
-             group or for a secret's placeholder, so those two never showed a
-             value the device had quantized. The branch that built the nodes
-             knows how to put a value on them; nothing else needs to guess. */
-          if (show !== null) show();
-          if (j.reload) reload(typeof j.reload === 'string' ? j.reload : null);
-        }
-      } catch (e) {
-        say(String(e), 'err');
-      } finally {
-        inflight.delete(s.k);
-        const next = pending.get(s.k);
-        if (next) { pending.delete(s.k); send(next); }
-      }
-    };
-
-    let input = null, out = null;
-
-    /* Puts s's value on the nodes this row built. Set by whichever branch below
-       builds them, because only that branch knows whether the value means
-       `.value`, `.checked`, one of three radios, or a placeholder.
-
-       Unconditional on purpose. Whether to overwrite is a different question
-       with a different answer depending on who is asking -- a poll must not
-       tread on a half-typed field, a write's own reply must -- and the two were
-       tangled together in every branch, with the reply path re-deciding it by
-       sniffing input.type. */
-    let show = null;
-
-    /* Which a poll asks. render() rebuilds the panel, and that replaces the
-       element under the pointer and swallows the click -- the defect the tab bar
-       above describes -- so a refetch that changed no declaration calls this
-       instead of rebuilding anything.
-
-       Two things it must not overwrite: an input somebody is typing in, and a
-       key with a write in flight, whose reply is the authority on where the
-       value ended up. */
-    const sync = () => {
-      if (show === null || inflight.get(s.k)) return;
-      if (input !== null && input === root.activeElement) return;
-      show();
-    };
-
-    if (s.ro) {
-      /* No message can appear on a row that cannot be written, so it reserves
-         no line for one. */
-      div.classList.add('readonly');
-      const span = document.createElement('span');
-      span.className = 'ro';
-      /* Text, not a disabled input -- a disabled box reads as broken rather
-         than as deliberate. A bool reads as on/off; "false" is not a word
-         anyone wants on a settings page. */
-      const shown = () =>
-        (s.t === 'bool' ? (s.v ? 'on' : 'off') : (s.v ?? '')) + (s.u ? ' ' + s.u : '');
-      span.textContent = shown();
-      /* The readonly rows are the ones that actually move on their own -- free
-         memory, uptime, the address -- so this is the case the focus refetch
-         exists for. */
-      show = () => { span.textContent = shown(); };
-      ctl.appendChild(span);
-      if (typeof s.ro === 'string') {
-        ctl.appendChild(note(s.ro));
-      }
-    } else if (s.t === 'action') {
-      const b = document.createElement('button');
-      b.className = 'action' + (s.confirm ? ' danger' : '');
-      b.textContent = label(s);
-      l.textContent = '';
-      b.onclick = () => { if (!s.confirm || confirm(s.confirm)) send({ k: s.k }); };
-      ctl.appendChild(b);
-    } else if (s.t === 'bool') {
-      input = document.createElement('input');
-      input.type = 'checkbox';
-      input.checked = !!s.v;
-      /* No class: a checkbox is 1em wide and never wants a line of its own. */
-      input.onchange = () => send({ k: s.k, v: input.checked });
-      show = () => { input.checked = !!s.v; };
-      ctl.appendChild(input);
-    } else if (s.t === 'enum' && s.r === 'radio') {
-      /* Honoring the hint. A client that ignores `r` and renders the select
-         below is equally correct -- which is what a terminal does. */
-      const name = 'r' + Math.random().toString(36).slice(2);
-      const radios = [];
-      for (const o of s.o || []) {
-        const lab = document.createElement('label');
-        const rb = document.createElement('input');
-        rb.type = 'radio';
-        rb.name = name;
-        rb.value = o;
-        rb.checked = o === s.v;
-        rb.onchange = () => send({ k: s.k, v: o });
-        radios.push(rb);
-        lab.append(rb, document.createTextNode(' ' + o));
-        ctl.appendChild(lab);
-      }
-      show = () => { for (const rb of radios) rb.checked = rb.value === s.v; };
-    } else if (s.t === 'enum') {
-      input = document.createElement('select');
-      for (const o of s.o || []) {
-        const opt = document.createElement('option');
-        opt.value = opt.textContent = o;
-        input.appendChild(opt);
-      }
-      input.value = s.v;
-      input.onchange = () => send({ k: s.k, v: input.value });
-      show = () => { input.value = s.v; };
-      ctl.classList.add('narrow');
-      ctl.appendChild(input);
-    } else if (s.t === 'int' || s.t === 'float') {
-      const slider = s.r === 'slider' && s.min !== undefined;
-      input = document.createElement('input');
-      input.type = slider ? 'range' : 'number';
-      if (s.min !== undefined) { input.min = s.min; input.max = s.max; }
-      if (s.step) input.step = s.step;
-      input.value = s.v;
-      if (slider) {
-        const lo = document.createElement('span'); lo.className = 'bound'; lo.textContent = s.min;
-        const hi = document.createElement('span'); hi.className = 'bound'; hi.textContent = s.max;
-        out = document.createElement('span');
-        out.textContent = s.v;
-        /* Debounce on a timer and commit on release: a slow drag can sit inside
-           the timer for a long time. */
-        let t = null;
-        input.oninput = () => {
-          out.textContent = input.value;
-          clearTimeout(t);
-          t = setTimeout(() => send({ k: s.k, v: Number(input.value) }), 300);
-        };
-        input.onchange = () => { clearTimeout(t); send({ k: s.k, v: Number(input.value) }); };
-        /* The bounds travel with the slider; the value stands apart from them,
-           or the max bound and the current value read as one number pair. */
-        const track = document.createElement('span');
-        track.className = 'track';
-        track.append(lo, input, hi);
-        out.className = 'value';
-        /* The track and its value are one thing: the row wraps around them
-           rather than the number dropping below the slider. */
-        ctl.classList.add('wide');
-        /* The readout is part of the value, so it moves with it. Skipped while
-           the slider is being dragged, which is what activeElement catches. */
-        show = () => {
-          input.value = s.v;
-          out.textContent = s.v;
-        };
-        ctl.append(track, out);
-      } else {
-        input.onchange = () => send({ k: s.k, v: Number(input.value) });
-        show = () => { input.value = s.v; };
-        ctl.classList.add('narrow');
-        ctl.appendChild(input);
-        if (s.min !== undefined) {
-          const b = document.createElement('span');
-          b.className = 'bound';
-          b.textContent = `${s.min}-${s.max}`;
-          ctl.appendChild(b);
-        }
-      }
-    } else {                                    /* str */
-      input = document.createElement('input');
-      input.type = s.secret ? 'password' : 'text';
-      if (s.maxlen) input.maxLength = s.maxlen;
-      const place = () => (s.set ? 'set -- leave blank to keep' : 'not set');
-      if (s.secret) {
-        input.placeholder = place();
-      } else {
-        input.value = s.v ?? '';
-      }
-      input.onchange = () => {
-        if (s.secret && input.value === '') return;
-        send({ k: s.k, v: input.value });
-      };
-      /* A secret has no value to show, only whether one is set. Not clobbering
-         a half-typed credential is why sync() checks activeElement. */
-      show = () => {
-        if (s.secret) input.placeholder = place();
-        else input.value = s.v ?? '';
-      };
-      ctl.classList.add('wide');
-      ctl.appendChild(input);
-    }
-
-    if (s.u && !s.ro) {
-      const u = document.createElement('span');
-      u.className = 'unit';
-      u.textContent = s.u;                      /* beside the value, not in the label */
-      ctl.appendChild(u);
-    }
-    /* At the row, not in a banner. */
-    if (s.rb) ctl.appendChild(note('after restart'));
-    if (s.pv !== undefined) ctl.appendChild(note(`${s.pv} pending`));
-
-    /* -- the device's refine hook, applied once for every type --
-
-       `en:false` greys whatever control this row built and puts the device's
-       reason beside it. Done here rather than in each branch because the answer is
-       the same shape for a checkbox, a slider and a select, and because `why` is a
-       sentence the device wrote -- nothing here decides what it says.
-
-       Advisory, and the device knows it: the setter refuses the same write with
-       the same sentence. So a page that has not polled since the condition
-       changed shows a live control, and clicking it produces the explanation
-       rather than silence. */
-    const why = note('');
-    const gate = () => {
-      const off = s.en === false;
-      for (const el of ctl.querySelectorAll('input,select,button')) el.disabled = off;
-      why.textContent = off && s.why ? s.why : '';
-      /* Hidden is the stronger form and the device has to ask for it by name.
-         Greying is preferred: a control that vanishes leaves someone hunting for
-         what was there a moment ago, which is what the camera's own panel does. */
-      div.style.display = s.hide ? 'none' : '';
-    };
-    ctl.appendChild(why);
-
-    ctl.appendChild(state);
-    div.appendChild(ctl);
-    gate();
-    /* An action has no value to show, so show stays null -- but every row gates. */
-    div._sync = () => { sync(); gate(); };
-    return div;
-  }
-
-  /* What _sync can apply to nodes that already exist, so a change in one of
-     these is not structural and costs no rebuild. Everything else is the DOM's
-     shape: two declarations agreeing on all of it can swap values without a
-     node being replaced, which is what sig() below compares.
-
-     `pv` is deliberately outside this set, so a value arriving as pending does
-     rebuild: a pending marker appears and disappears as a whole element, which
-     is structural however small it looks.
-
-     `en`, `why` and `hide` come from the device's refine hook and move at runtime:
-     toggling automatic gain disables the manual one. Disabling an input and
-     putting a reason beside it are properties of a node, not a reason for a new
-     one -- and rebuilding is what swallows a click mid-press, so keeping these out
-     of the signature is what makes a conditional control cheap.
-
-     min, max and step are deliberately *not* here even though refine can move
-     them. They are attributes of a live input, but a slider's bound labels travel
-     with them, and the case that moves a range is a mode change -- a deliberate,
-     rare click where a rebuild costs nothing. */
-  const SYNCED = new Set(['v', 'set', 'en', 'why', 'hide']);
-
-  function sig(s) {
-    const o = {};
-    for (const k of Object.keys(s).sort()) {
-      if (SYNCED.has(k)) continue;
-      o[k] = s[k];
-    }
-    return JSON.stringify(o);
-  }
-
-  /* Fold a refetch into the declarations already on screen, keeping their object
-     identity so every row's closures stay pointed at live data. False when the
-     structure moved and the caller has to rebuild.
-
-     This is what makes the focus refetch free. Without it, returning to the
-     window destroys and recreates every row, and the click that brought focus
-     back lands on an element that no longer exists. */
-  function absorb(next, group) {
-    const mine = group ? all.filter(s => (s.g || 'Other') === group) : all;
-    if (next.length !== mine.length) return false;
-    for (let i = 0; i < next.length; i++) {
-      if (next[i].k !== mine[i].k || sig(next[i]) !== sig(mine[i])) return false;
-    }
-    /* Every synced field, copied or removed. Removal matters as much as the copy:
-       a control that became available again sends no `en`, and leaving the old
-       false behind would keep it greyed with a reason that is no longer true. */
-    for (let i = 0; i < next.length; i++) {
-      mine[i].v = next[i].v;
-      for (const k of SYNCED) {
-        if (k === 'v') continue;
-        if (k in next[i]) mine[i][k] = next[i][k]; else delete mine[i][k];
-      }
-    }
-    return true;
-  }
-
   function syncRows() {
     for (const el of root.getElementById('panel').children) {
       if (el._sync) el._sync();
@@ -765,9 +339,9 @@ export function mount(host, opts = {}) {
   /* -- restore, export, import ------------------------------------------- */
 
   /* The one line under the panel, for what a whole-panel action did. Called
-     banner and not note because note() above builds the asides beside a
-     control, and two different things under one name in one file is one name
-     too few. */
+     banner and not note because note() in setting-control.js builds the asides
+     beside a control, and two different things under one name is one name too
+     few. */
   const banner = (msg, cls) => {
     const el = root.getElementById('err');
     el.textContent = msg;
@@ -865,7 +439,8 @@ export function mount(host, opts = {}) {
       const part = await load(group);
       /* Values only, no rebuild -- which is the common case, since a refetch
          usually finds the same firmware declaring the same things. */
-      if (absorb(part, group)) { syncRows(); return; }
+      const onScreen = group ? all.filter(s => (s.g || 'Other') === group) : all;
+      if (absorb(onScreen, part)) { syncRows(); return; }
       if (group) {
         /* Replaced in place, not filtered and appended. Appending moved the
            refetched tab to the end of `all`, so the tab bar reordered itself under
@@ -925,95 +500,17 @@ export function mount(host, opts = {}) {
     };
   }
 
-  /* Folded state lives on the host, so the page can say what a folded panel does
-     to its own layout -- #side[data-bb-collapsed]{width:auto}, and the video
-     beside it widens -- without this knowing that there is a video.
-
-     Remembered per viewer and per device, because whether the column is in the
-     way is a fact about this screen rather than about the device. The read is
-     wrapped because storage throws in a private window and comes back empty
-     after a clear, and a panel that will not render is worse than one that
-     forgets which way it was left. */
+  /* Folds sideways: a column beside the video, which takes the width back.
+     The mechanism is panel-fold.js's, shared with the console. */
   if (collapsible) {
-    const fold = root.getElementById('fold');
-    const wrap = root.getElementById('fold-wrap');
-    const KEY = 'bb-settings-folded:' + location.pathname;
-    try { folded = localStorage.getItem(KEY) === '1'; } catch (e) { /* fine */ }
-
-    /* The state, and only the state. Applying it is one change of one attribute
-       and the stylesheet does the rest, so there is never a moment where the
-       panel is half in one state and half in the other. */
-    const setState = (next) => {
-      folded = next;
-      host.toggleAttribute('data-bb-collapsed', folded);
-      fold.textContent = folded ? 'Settings' : 'Hide';
-      fold.setAttribute('aria-expanded', String(!folded));
-      try { localStorage.setItem(KEY, folded ? '1' : '0'); } catch (e) { /* fine */ }
-    };
-
-    const DUR = 220;
-    const stillness = matchMedia('(prefers-reduced-motion: reduce)');
-    let anim = null;
-
-    /*
-     * What moves is the column, not the rows inside it.
-     *
-     * The first version folded the rows away over 220ms and left the width to
-     * the page, and it flashed: the attribute that starts the fold is the one
-     * the page's collapsed width keys off, so for the length of the animation
-     * the column was shrink-to-fit around settings that were still in flow. It
-     * sized to the widest row, which is wider than the 300px it had been, and
-     * the video was squeezed before it was given anything back.
-     *
-     * Measure, then animate. The width the column has now, the width it has in
-     * the new state -- both read from a layout that is settled and correct --
-     * and the host moved between the two. The intermediate layout that flashed
-     * does not exist any more: the settings leave flow in the same style rule
-     * that narrows the column, so there is no frame where one has happened and
-     * the other has not. Nothing in between is painted; `to` is measured and
-     * the animation starts before the frame ends.
-     *
-     * Reading `from` off the current rect rather than remembering where the
-     * column started is what makes a click during an animation behave: it
-     * carries on from wherever it had reached.
-     */
-    const apply = (next) => {
-      const from = host.getBoundingClientRect().width;
-      setState(next);
-      const to = host.getBoundingClientRect().width;
-      if (stillness.matches || Math.abs(to - from) < 1) return;
-
-      /* Opening, the settings are back in flow and would lay out to each
-         intermediate width in turn, so the rows rewrap all the way out. Pinned
-         to the width they have when open and clipped by the host, they sit
-         still and the column uncovers them. Closing needs neither: they are
-         already out of flow. */
-      if (!folded) wrap.style.width = wrap.getBoundingClientRect().width + 'px';
-      host.style.overflow = 'hidden';
-
-      anim?.cancel();
-      anim = host.animate([{ width: from + 'px' }, { width: to + 'px' }],
-                          { duration: DUR, easing: 'ease' });
-      /* No fill, so the width goes back to the stylesheet's when it ends --
-         which is the width just animated to. A cancelled animation leaves the
-         cleanup to whichever call cancelled it, since that one is mid-flight
-         and still needs the pin and the clipping. */
-      anim.finished.then(() => {
-        wrap.style.width = '';
-        host.style.overflow = '';
-      }, () => {});
-    };
-
-    /* The remembered state, put on directly. apply() is for a change someone
-       is watching; this one was decided on a previous visit. */
-    setState(folded);
-
-    fold.onclick = () => {
-      apply(!folded);
+    fold = foldable({
+      host, axis: 'width', name: 'Settings',
+      fold: root.getElementById('fold'),
+      wrap: root.getElementById('fold-wrap'),
       /* Opening is when the values are most likely stale, since the poll has
          been off for as long as it was shut. */
-      if (!folded) tick();
-    };
+      onChange: (folded) => { if (!folded) tick(); },
+    });
   }
 
   /* Values move without us: another admin edits, an action lands late. Refetch
@@ -1055,7 +552,7 @@ export function mount(host, opts = {}) {
        every four seconds to refresh rows nobody can see spends link the video is
        competing for. visibilityState cannot see this -- that is the tab's, and
        the tab is perfectly visible. */
-    if (folded) return;
+    if (fold?.isFolded()) return;
     try {
       if (tabHasLive(current)) {
         /* A real fetch of this tab. reload() absorbs it without replacing nodes
@@ -1066,7 +563,7 @@ export function mount(host, opts = {}) {
       }
       const next = await poll();
       if (!next) return;                       /* revision unmoved */
-      if (absorb(next, null)) { syncRows(); return; }
+      if (absorb(all, next)) { syncRows(); return; }
       all = next;
       render();
     } catch (e) {

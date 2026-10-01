@@ -73,6 +73,9 @@ var stampInputs = []string{
 	// The same for the console: console.html mounts it, and so does a device
 	// page through data-bitbang-page="console".
 	"console-panel.js",
+	// Folding, and one setting's control, which both panels import.
+	"panel-fold.js",
+	"setting-control.js",
 	"ota.html",
 	// The renderers. Temporary in the same sense: they move to a plugin of
 	// their own, which is not the one settings.html goes to -- a renderer is a
@@ -242,8 +245,10 @@ var allowedBitbangAssets = map[string]bool{
 	"settings-panel.js": true,
 	"console.html":      true, // the device-console meta-page shell
 	// The same for the console, and data-bitbang-page="console".
-	"console-panel.js": true,
-	"ota.html":         true, // the device-firmware meta-page shell
+	"console-panel.js":   true,
+	"panel-fold.js":      true, // folding, imported by both panels
+	"setting-control.js": true, // one setting's control, imported by both panels
+	"ota.html":           true, // the device-firmware meta-page shell
 	// The renderers, one per codec, fetched by the shim the first time a
 	// channel announces that codec. Served here rather than embedded in a
 	// device page, because rendering is a property of the codec and not of any
