@@ -116,7 +116,7 @@ func (d *Deps) PairWS(w http.ResponseWriter, r *http.Request) {
 		// Honor the same delay we'd apply to a real lookup so timing
 		// of "malformed message" matches "unknown code".
 		time.Sleep(3 * time.Second)
-		_ = sendJSON(ws, wire.Error{Type: "error", Message: "unknown_code"})
+		_ = sendJSON(ws, wire.NewError(wire.ErrUnknownCode, "unknown_code"))
 		return
 	}
 
@@ -125,7 +125,7 @@ func (d *Deps) PairWS(w http.ResponseWriter, r *http.Request) {
 	uid := d.Pairing.Lookup(init.Code)
 	d.setReadKeepalive(ws)
 	if uid == "" {
-		_ = sendJSON(ws, wire.Error{Type: "error", Message: "unknown_code"})
+		_ = sendJSON(ws, wire.NewError(wire.ErrUnknownCode, "unknown_code"))
 		d.Log.Info("pair_init unknown code", "remote", ip)
 		return
 	}
@@ -133,7 +133,7 @@ func (d *Deps) PairWS(w http.ResponseWriter, r *http.Request) {
 	device, ok := d.Devices.Get(uid)
 	if !ok {
 		// Device disconnected between code issuance and this lookup.
-		_ = sendJSON(ws, wire.Error{Type: "error", Message: "Device not found"})
+		_ = sendJSON(ws, wire.NewError(wire.ErrDeviceNotFound, "Device not found"))
 		d.Log.Info("pair_init device gone", "uid", uid, "remote", ip)
 		return
 	}
@@ -175,7 +175,7 @@ func (d *Deps) PairWS(w http.ResponseWriter, r *http.Request) {
 	stun, _ := d.iceForClient(device, clientID, true)
 	pr := wire.PairRequest{Type: "pair_request", ClientID: clientID, RemoteIP: ip, ICEServers: stun}
 	if err := device.SendJSON(pr); err != nil {
-		_ = sendJSON(ws, wire.Error{Type: "error", Message: "Device not found"})
+		_ = sendJSON(ws, wire.NewError(wire.ErrDeviceNotFound, "Device not found"))
 		return
 	}
 

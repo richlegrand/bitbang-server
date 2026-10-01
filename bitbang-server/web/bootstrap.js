@@ -1004,22 +1004,32 @@ class BitBangConnection {
             await this.connectWebSocket();
         } catch (error) {
             console.error('Connection failed:', error);
-            this._print(this.userErrorMessage(error.message));
+            this._print(this.userErrorMessage(error.code || error.message));
             if (this.statusEl) this.statusEl.classList.add('error');
         }
     }
 
-    userErrorMessage(msg) {
-        if (msg === 'Device not found') return 'Device not found';
-        if (msg === 'WebSocket connection failed') return 'Could not reach server';
-        if (msg === 'Service Worker not supported') return 'This browser is not supported';
-        if (msg === 'offer_timeout') return 'Device not responding';
-        // The device answered and refused: every session slot is taken. Worth
-        // its own wording because it is the one failure here the person can
-        // actually do something about, and because it used to arrive as
-        // "Device not responding" after a 30 second wait.
-        if (msg === 'device_busy') return 'Device is busy: too many viewers connected';
-        return 'Connection failed';
+    // The wording for a failure, by its code: a server error's `code`, a
+    // device's refusal, or one of the failures this file raises itself. The
+    // wording is ours; an unrecognized code gets the generic one, so nothing
+    // outside this file decides what goes on the screen.
+    userErrorMessage(code) {
+        switch (code) {
+            case 'device_not_found':
+            // A server that predates error codes sends only the English.
+            // Kept for one release, so a new page still reads an old server.
+            case 'Device not found':
+                return 'Device not found';
+            case 'WebSocket connection failed': return 'Could not reach server';
+            case 'Service Worker not supported': return 'This browser is not supported';
+            case 'offer_timeout': return 'Device not responding';
+            // The device answered and refused: every session slot is taken.
+            // Worth its own wording because it is the one failure here the
+            // person can actually do something about, and because it used to
+            // arrive as "Device not responding" after a 30 second wait.
+            case 'device_busy': return 'Device is busy: too many viewers connected';
+            default: return 'Connection failed';
+        }
     }
 
     async registerServiceWorker() {
@@ -1300,7 +1310,11 @@ class BitBangConnection {
                     } else {
                         // Other error events. reject() is a no-op once the
                         // connect promise has resolved, but harmless then.
-                        reject(new Error(msg.message));
+                        // The code rides along for userErrorMessage; a device
+                        // refusing (device_busy) sends a message only.
+                        const err = new Error(msg.message);
+                        err.code = msg.code || msg.message;
+                        reject(err);
                     }
                 }
             };
@@ -3574,11 +3588,13 @@ function pairEscapeHtml(s) {
     return d.innerHTML;
 }
 
-function pairErrorText(serverMsg) {
-    if (serverMsg === 'unknown_code') {
+// The server's message is unknown_code either way for that error, so this
+// reads it from an old server too.
+function pairErrorText(msg) {
+    if ((msg.code || msg.message) === 'unknown_code') {
         return "That code isn't valid or has expired. Pairing codes last 5 minutes — ask for a fresh one.";
     }
-    return 'Could not start pairing: ' + (serverMsg || 'unknown error') + '.';
+    return 'Could not start pairing: ' + (msg.message || 'unknown error') + '.';
 }
 
 function pairRejectText(reason) {
@@ -3713,7 +3729,7 @@ class PairingFlow {
         let msg; try { msg = JSON.parse(ev.data); } catch (e) { return; }
         switch (msg.type) {
             case 'pair_routed': break;
-            case 'error': this.fail(pairErrorText(msg.message)); break;
+            case 'error': this.fail(pairErrorText(msg)); break;
             case 'offer': await this._handleOffer(msg); break;
             case 'candidate':
                 if (this.remoteSet && this.pc) this.pc.addIceCandidate(msg.candidate).catch(() => {});

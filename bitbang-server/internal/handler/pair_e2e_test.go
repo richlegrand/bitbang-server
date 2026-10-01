@@ -261,6 +261,9 @@ func TestCodeExchange_UnknownCode(t *testing.T) {
 	if !strings.Contains(errMsg["message"].(string), "unknown_code") {
 		t.Errorf("error.message = %q, want contains 'unknown_code'", errMsg["message"])
 	}
+	if errMsg["code"] != wire.ErrUnknownCode {
+		t.Errorf("error.code = %v, want %q", errMsg["code"], wire.ErrUnknownCode)
+	}
 	if elapsed := time.Since(start); elapsed < pairing.LookupDelay-500*time.Millisecond {
 		t.Errorf("response in %v, want at least ~%v (constant-time)", elapsed, pairing.LookupDelay)
 	}

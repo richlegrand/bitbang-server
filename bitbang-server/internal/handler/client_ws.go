@@ -61,7 +61,7 @@ func (d *Deps) ClientWS(w http.ResponseWriter, r *http.Request, targetUID string
 	// fast negative lets someone sweep the UID space to find live devices.
 	if _, ok := d.Devices.Get(targetUID); !ok {
 		time.Sleep(3 * time.Second)
-		_ = conn.SendJSON(wire.Error{Type: "error", Message: "Device not found"})
+		_ = conn.SendJSON(wire.NewError(wire.ErrDeviceNotFound, "Device not found"))
 		return
 	}
 
@@ -206,7 +206,7 @@ func (d *Deps) clientRelay(conn *registry.ClientConn) {
 			}
 			d.Log.Info("client gave up its grace window",
 				"client_id", conn.ClientID, "target", conn.TargetUID)
-			_ = conn.SendJSON(wire.Error{Type: "error", Message: "Device not found"})
+			_ = conn.SendJSON(wire.NewError(wire.ErrDeviceNotFound, "Device not found"))
 			return
 		}
 		// Present again, so the next absence is a new one and gets its own
@@ -251,7 +251,7 @@ func (d *Deps) clientRelay(conn *registry.ClientConn) {
 			}
 			if err := device.SendJSON(msg); err != nil {
 				d.Log.Warn("forward request failed", "client_id", conn.ClientID, "target", conn.TargetUID, "err", err)
-				_ = conn.SendJSON(wire.Error{Type: "error", Message: "Device not found"})
+				_ = conn.SendJSON(wire.NewError(wire.ErrDeviceNotFound, "Device not found"))
 				return
 			}
 			d.Log.Info("forwarded request",
@@ -261,7 +261,7 @@ func (d *Deps) clientRelay(conn *registry.ClientConn) {
 
 		case "answer":
 			if err := device.SendJSON(msg); err != nil {
-				_ = conn.SendJSON(wire.Error{Type: "error", Message: "Device not found"})
+				_ = conn.SendJSON(wire.NewError(wire.ErrDeviceNotFound, "Device not found"))
 				return
 			}
 			d.Log.Debug("forwarded answer", "client_id", conn.ClientID, "target", conn.TargetUID)

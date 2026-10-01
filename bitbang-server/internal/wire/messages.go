@@ -139,9 +139,39 @@ type Hello struct {
 }
 
 // Error is sent by the server when any validation/auth step fails.
+//
+// Code is what a program matches on; Message is for a person, or a log.
+// Message used to be both, half machine tokens and half English sentences,
+// and the browser matched on the English -- so rewording "Device not found"
+// here would have quietly turned it into "Connection failed" there.
+//
+// Message is unchanged for every error that predates Code, token or not:
+// the CLI and the firmware match on the tokens (unknown_code, preempted,
+// protocol_too_old), and an older browser on the English. Build one with
+// NewError so the two are always filled in together.
 type Error struct {
 	Type    string `json:"type"`    // "error"
-	Message string `json:"message"` // short error string
+	Code    string `json:"code"`    // one of the Err* constants
+	Message string `json:"message"` // human-readable
+}
+
+// Error codes. Snake case, and never reworded: they are the contract.
+const (
+	ErrUnknownCode      = "unknown_code"       // pairing code not found or expired
+	ErrDeviceNotFound   = "device_not_found"   // no device registered under that UID
+	ErrPreempted        = "preempted"          // another connection registered this UID
+	ErrInvalidUID       = "invalid_uid"        // register: UID is malformed
+	ErrExpectedRegister = "expected_register"  // first message was not a register
+	ErrProtocolTooOld   = "protocol_too_old"   // register: protocol version unsupported
+	ErrMissingPublicKey = "missing_public_key" // register: no public_key
+	ErrInvalidPublicKey = "invalid_public_key" // register: public_key does not parse
+	ErrUIDKeyMismatch   = "uid_key_mismatch"   // register: UID is not hash(public_key)
+	ErrRejectedKey      = "rejected_key"       // register: key type or size not accepted
+)
+
+// NewError builds an Error with both fields.
+func NewError(code, message string) Error {
+	return Error{Type: "error", Code: code, Message: message}
 }
 
 // Offer is a WebRTC offer SDP relayed between device and client.

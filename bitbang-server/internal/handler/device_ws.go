@@ -119,7 +119,7 @@ func (d *Deps) DeviceWS(w http.ResponseWriter, r *http.Request, uid string) {
 	// browser-side bidirectional verify without the private key.
 	if old := d.Devices.Add(uid, conn); old != nil {
 		d.Log.Warn("device preempted", "uid", uid)
-		_ = old.SendJSON(wire.Error{Type: "error", Message: "preempted"})
+		_ = old.SendJSON(wire.NewError(wire.ErrPreempted, "preempted"))
 		old.Close(websocket.CloseNormalClosure, "preempted")
 	}
 
@@ -188,7 +188,7 @@ func (d *Deps) DeviceWS(w http.ResponseWriter, r *http.Request, uid string) {
 // fingerprint+nonce payload and so cannot complete a session).
 func (d *Deps) authenticateDevice(uid string, conn *registry.DeviceConn) (*wire.Register, error) {
 	if !identity.ValidateUID(uid) {
-		_ = conn.SendJSON(wire.Error{Type: "error", Message: "Invalid UID format"})
+		_ = conn.SendJSON(wire.NewError(wire.ErrInvalidUID, "Invalid UID format"))
 		return nil, errors.New("invalid uid")
 	}
 
@@ -198,34 +198,34 @@ func (d *Deps) authenticateDevice(uid string, conn *registry.DeviceConn) (*wire.
 		return nil, err
 	}
 	if reg.Type != "register" {
-		_ = conn.SendJSON(wire.Error{Type: "error", Message: "Expected register message"})
+		_ = conn.SendJSON(wire.NewError(wire.ErrExpectedRegister, "Expected register message"))
 		return nil, errors.New("expected register")
 	}
 
 	if reg.Protocol < wire.MinProtocolVersion {
-		_ = conn.SendJSON(wire.Error{Type: "error", Message: "protocol_too_old"})
+		_ = conn.SendJSON(wire.NewError(wire.ErrProtocolTooOld, "protocol_too_old"))
 		return nil, errors.New("protocol too old")
 	}
 
 	if reg.PublicKey == "" {
-		_ = conn.SendJSON(wire.Error{Type: "error", Message: "Missing public_key"})
+		_ = conn.SendJSON(wire.NewError(wire.ErrMissingPublicKey, "Missing public_key"))
 		return nil, errors.New("missing public_key")
 	}
 
 	pubKey, pubDER, err := identity.ParsePublicKeyB64(reg.PublicKey)
 	if err != nil {
-		_ = conn.SendJSON(wire.Error{Type: "error", Message: "Invalid public_key format"})
+		_ = conn.SendJSON(wire.NewError(wire.ErrInvalidPublicKey, "Invalid public_key format"))
 		return nil, err
 	}
 
 	if identity.UIDFromPublicKeyBytes(pubDER) != uid {
-		_ = conn.SendJSON(wire.Error{Type: "error", Message: "UID does not match public key"})
+		_ = conn.SendJSON(wire.NewError(wire.ErrUIDKeyMismatch, "UID does not match public key"))
 		return nil, errors.New("uid mismatch")
 	}
 
 	if msg := identity.ValidatePublicKey(pubKey); msg != "" {
 		d.Log.Warn("device rejected key", "uid", uid, "reason", msg)
-		_ = conn.SendJSON(wire.Error{Type: "error", Message: msg})
+		_ = conn.SendJSON(wire.NewError(wire.ErrRejectedKey, msg))
 		return nil, errors.New(msg)
 	}
 
