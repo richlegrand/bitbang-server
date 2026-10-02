@@ -98,6 +98,13 @@ const STYLE = `
   #log { flex:1; min-height:0; overflow:auto; margin:0; padding:.6rem 1rem;
          white-space:pre-wrap; word-break:break-word; }
   :host([data-bb-embedded]) #log { padding:.4rem .75rem; }
+  /* Typing: the log takes focus and shows where the next character lands. */
+  #log.typing { cursor:text; }
+  #log.typing:focus { outline:1px solid var(--accent); outline-offset:-1px; }
+  #log.typing:focus #tail::after { content:''; display:inline-block; width:.55em;
+         height:1.1em; vertical-align:text-bottom; background:currentColor;
+         animation:blink 1s steps(1) infinite; }
+  @keyframes blink { 50% { opacity:0; } }
   .drop { color:var(--bad); }
   /* Matching what idf.py monitor shows: green info, yellow warn, red error.
      Applied from the level letter on each line, and from ANSI escapes when a
@@ -186,6 +193,13 @@ export function mount(host, opts = {}) {
   const stateEl = root.getElementById('state');
   const followEl = root.getElementById('follow');
 
+  /* The unfinished last line, shown as it arrives. A log could wait for the
+     newline, and did; a prompt cannot -- "bitbang> " and the characters typed
+     after it have no newline until Enter. Kept the last child of the log. */
+  const tailEl = document.createElement('span');
+  tailEl.id = 'tail';
+  logEl.appendChild(tailEl);
+
   const say = (t, bad) => { stateEl.textContent = t; stateEl.className = bad ? 'err' : ''; };
 
   /* -- getting text onto the page without stalling it ------------------------
@@ -216,10 +230,19 @@ export function mount(host, opts = {}) {
   function flush() {
     frameAsked = false;
     logEl.appendChild(queued);              /* moves the nodes; queued is empty after */
+    logEl.appendChild(tailEl);              /* and the tail back behind them */
+    renderTail();
     for (let extra = logEl.childElementCount - MAX_PIECES; extra > 0; extra--) {
       logEl.firstChild.remove();
     }
     if (followEl.checked && atBottom) logEl.scrollTop = logEl.scrollHeight;
+  }
+
+  function askFrame() {
+    if (!frameAsked) {
+      frameAsked = true;
+      requestAnimationFrame(flush);
+    }
   }
 
   /* Untrusted by construction: device output is bytes, and the only safe way to
@@ -235,10 +258,7 @@ export function mount(host, opts = {}) {
     for (let extra = queued.childElementCount - MAX_PIECES; extra > 0; extra--) {
       queued.firstChild.remove();
     }
-    if (!frameAsked) {
-      frameAsked = true;
-      requestAnimationFrame(flush);
-    }
+    askFrame();
   }
 
   /* The level color is decided per line, so text is held until its newline
@@ -258,7 +278,7 @@ export function mount(host, opts = {}) {
     held = 0;
   }
 
-  function emit(text, cls) {
+  function emitPlain(text, cls) {
     let start = 0, nl;
     while ((nl = text.indexOf('\n', start)) >= 0) {
       pieces.push([text.slice(start, nl + 1), cls]);
@@ -270,6 +290,52 @@ export function mount(host, opts = {}) {
       held += text.length - start;
     }
     if (held > 4096) flushLine();
+    askFrame();                             /* the tail changed */
+  }
+
+  /* Backspace takes the last character off the unfinished line, as it moves a
+     terminal's cursor back over it -- which is how a device erases what was
+     typed: linenoise answers a backspace with "\b \b". DEL is dropped: it is a
+     serial terminal's backspace key, echoed back, and draws nothing. A line
+     that has already ended cannot be reached, on a terminal either. */
+  function emit(text, cls) {
+    if (!/[\x08\x7f]/.test(text)) { emitPlain(text, cls); return; }
+    let run = '';
+    for (const ch of text) {
+      if (ch === '\x08') {
+        emitPlain(run, cls);
+        run = '';
+        eraseOne();
+      } else if (ch !== '\x7f') {
+        run += ch;
+      }
+    }
+    emitPlain(run, cls);
+  }
+
+  function eraseOne() {
+    while (pieces.length) {
+      const last = pieces[pieces.length - 1];
+      if (last[0].length) {
+        last[0] = last[0].slice(0, -1);
+        held--;
+        if (!last[0].length) pieces.pop();
+        return;
+      }
+      pieces.pop();
+    }
+  }
+
+  function renderTail() {
+    tailEl.textContent = '';
+    if (!pieces.length) return;
+    const level = levelClass(pieces.map(p => p[0]).join(''));
+    for (const [t, c] of pieces) {
+      const node = document.createElement('span');
+      if (c || level) node.className = c || level;
+      node.textContent = t;
+      tailEl.appendChild(node);
+    }
   }
 
   /* ANSI, for the cases where escapes really are in the stream.
@@ -309,8 +375,81 @@ export function mount(host, opts = {}) {
 
   root.getElementById('clear').onclick = () => {
     logEl.textContent = '';
+    logEl.appendChild(tailEl);    /* emptied with everything else; put it back */
     queued = document.createDocumentFragment();
+    pieces = [];
+    held = 0;
+    renderTail();
   };
+
+  /* -- typing --------------------------------------------------------------
+
+     Only when the device said so: "input": true in its reply to our SYN, which
+     a device sends only when its firmware turned input on. Otherwise the log is
+     a log, and keys do what keys do on a page.
+
+     Framed as a shell's input (swsp.md 5.4): tag 0x00, then the bytes. Nothing
+     is echoed here. The device echoes -- linenoise does -- so what is on screen
+     is what the device actually did, a wedged device visibly stops echoing,
+     and a local echo would print every character twice. */
+  let inputOn = false;
+  const enc = new TextEncoder();
+
+  function setTyping(on) {
+    inputOn = on;
+    logEl.tabIndex = on ? 0 : -1;
+    logEl.classList.toggle('typing', on);
+    logEl.title = on ? 'Click here and type: keys go to the device' : '';
+  }
+
+  function sendInput(text) {
+    if (!inputOn || !ws || ws.readyState !== 1 || !text) return;
+    const bytes = enc.encode(text);
+    /* A paste can be long, and a data channel message is not; well under the
+       16 KB bootstrap sends in one frame. */
+    for (let off = 0; off < bytes.length; off += 1024) {
+      const part = bytes.subarray(off, off + 1024);
+      const frame = new Uint8Array(part.length + 1);
+      frame[0] = 0x00;                        /* stdin */
+      frame.set(part, 1);
+      ws.send(frame.buffer);
+    }
+    /* Typing is looking at the bottom. */
+    if (followEl.checked) { atBottom = true; askFrame(); }
+  }
+
+  /* What the device's linenoise understands in dumb mode: printable
+     characters, Enter, backspace, control keys. Not the arrows or Escape --
+     dumb mode drops the ESC and prints the rest, so an up-arrow would type
+     "[A". They come with smart mode. Not Tab either, which leaves the log the
+     way it leaves anything else. */
+  logEl.addEventListener('keydown', (e) => {
+    if (!inputOn || e.isComposing || e.metaKey || e.altKey) return;
+    let s = null;
+    if (e.ctrlKey) {
+      const k = e.key.length === 1 ? e.key.toUpperCase() : '';
+      /* Ctrl-C with text selected is a copy, not an interrupt, and Ctrl-V is
+         a paste, which arrives below. */
+      if (k === 'C' && String(document.getSelection()) !== '') return;
+      if (k === 'V') return;
+      if (k >= '@' && k <= '_') s = String.fromCharCode(k.charCodeAt(0) - 64);
+    } else if (e.key === 'Enter') {
+      s = '\r';                 /* what a terminal sends; the device makes it LF */
+    } else if (e.key === 'Backspace') {
+      s = '\x08';               /* Ctrl-H: linenoise answers it with "\b \b" */
+    } else if (e.key.length === 1) {
+      s = e.key;
+    }
+    if (s === null) return;
+    e.preventDefault();
+    sendInput(s);
+  });
+
+  logEl.addEventListener('paste', (e) => {
+    if (!inputOn) return;
+    e.preventDefault();
+    sendInput(e.clipboardData.getData('text').replace(/\r?\n/g, '\r'));
+  });
 
   /* -- the device's console settings ---------------------------------------- */
 
@@ -391,6 +530,7 @@ export function mount(host, opts = {}) {
         try {
           const m = JSON.parse(ev.data);
           if (m.from !== undefined) {
+            setTyping(m.input === true);
             seq = m.from;
             if (m.first_seq > m.from) {
               append(`[${m.first_seq - m.from} bytes older than the buffer are gone]\n`, 'drop');
