@@ -51,6 +51,16 @@ const STYLE = `
   }
   header { display:flex; align-items:center; gap:1rem; flex-wrap:wrap;
            padding:.6rem 1rem; border-bottom:1px solid var(--line); }
+  /* No toolbar (opts.toolbar). Hidden rather than left out, so follow stays
+     on and nothing that reads the toolbar has to know. The connection state
+     moves to a note in the corner, shown only while it is not "connected". */
+  :host([data-bb-toolbar="none"]) { position:relative; }
+  :host([data-bb-toolbar="none"]) header { display:none; }
+  #status { position:absolute; top:.5rem; right:.75rem; z-index:1;
+            font-size:.75rem; padding:.15rem .5rem; border-radius:4px;
+            border:1px solid var(--line); background:Canvas; color:var(--dim); }
+  #status.err { border-color:var(--bad); color:var(--bad); }
+  #status[hidden] { display:none; }
   /* What folds away. A flex child of its own, so the log inside it still fills
      whatever height the host has. */
   #fold-wrap { flex:1; min-height:0; display:flex; flex-direction:column; }
@@ -101,7 +111,8 @@ const STYLE = `
   /* Typing: the log takes focus and shows where the next character lands. */
   #log.typing { cursor:text; }
   #log.typing:focus { outline:1px solid var(--accent); outline-offset:-1px; }
-  #log.typing:focus #tail::after { content:''; display:inline-block; width:.55em;
+  #log.typing:focus #tail::after,
+  :host([data-bb-keys]) #log.typing #tail::after { content:''; display:inline-block; width:.55em;
          height:1.1em; vertical-align:text-bottom; background:currentColor;
          animation:blink 1s steps(1) infinite; }
   @keyframes blink { 50% { opacity:0; } }
@@ -159,6 +170,17 @@ function classForSGR(params, current) {
  *                   Default false. Folds vertically -- a console is a row along
  *                   the bottom of a page, not a column -- with the same
  *                   mechanism as the settings panel (panel-fold.js).
+ * opts.keys         'page' to take keystrokes from anywhere on the page, not
+ *                   only when the log has focus -- for a page whose job is the
+ *                   console, like a REPL. Keys aimed at a field, a dropdown, a
+ *                   button or a link still go there, and the browser's own
+ *                   shortcuts still work. Default: click the log, then type.
+ *                   Only has an effect on a device that accepts input.
+ * opts.toolbar      'none' for no toolbar -- for a page that is a REPL, where
+ *                   the log always follows and the device has commands for the
+ *                   rest. The connection state still shows, in a corner, while
+ *                   it is anything but "connected". Takes the fold toggle with
+ *                   it. Default: the toolbar.
  *
  * Everything below lives in this function rather than at module scope, so two
  * consoles on one page keep their own socket, position and line buffer.
@@ -166,7 +188,11 @@ function classForSGR(params, current) {
 export function mount(host, opts = {}) {
   const title = opts.title !== false;
   const collapsible = opts.collapsible === true;
+  const pageKeys = opts.keys === 'page';
+  const noToolbar = opts.toolbar === 'none';
   if (!title) host.setAttribute('data-bb-embedded', '');
+  if (pageKeys) host.setAttribute('data-bb-keys', 'page');
+  if (noToolbar) host.setAttribute('data-bb-toolbar', 'none');
 
   const root = host.attachShadow({ mode: 'open' });
   const style = document.createElement('style');
@@ -186,6 +212,7 @@ export function mount(host, opts = {}) {
       <span id="ctl"></span>
       <button id="clear">Clear</button>
     </header>
+    ${noToolbar ? '<div id="status" role="status">connecting</div>' : ''}
     <div id="fold-wrap"><pre id="log"></pre></div>`;
   while (frag.firstChild) root.appendChild(frag.firstChild);
 
@@ -200,7 +227,16 @@ export function mount(host, opts = {}) {
   tailEl.id = 'tail';
   logEl.appendChild(tailEl);
 
-  const say = (t, bad) => { stateEl.textContent = t; stateEl.className = bad ? 'err' : ''; };
+  const statusEl = root.getElementById('status');      /* only without a toolbar */
+  const say = (t, bad) => {
+    stateEl.textContent = t;
+    stateEl.className = bad ? 'err' : '';
+    if (statusEl) {
+      statusEl.textContent = t;
+      statusEl.className = bad ? 'err' : '';
+      statusEl.hidden = t === 'connected';
+    }
+  };
 
   /* -- getting text onto the page without stalling it ------------------------
 
@@ -399,7 +435,17 @@ export function mount(host, opts = {}) {
     inputOn = on;
     logEl.tabIndex = on ? 0 : -1;
     logEl.classList.toggle('typing', on);
-    logEl.title = on ? 'Click here and type: keys go to the device' : '';
+    logEl.title = on ? (pageKeys ? 'Type anywhere on the page: keys go to the device'
+                                 : 'Click here and type: keys go to the device')
+                     : '';
+    /* A page that asked for every key also wants them before anyone clicks.
+       It runs in bootstrap's iframe, so until something focuses it the keys go
+       to the frame above -- this page focuses itself, the opted-in page and no
+       other. Not over a field someone is already typing in. */
+    if (on && pageKeys && (!document.activeElement || document.activeElement === document.body)) {
+      window.focus();
+      logEl.focus({ preventScroll: true });
+    }
   }
 
   function sendInput(text) {
@@ -418,13 +464,30 @@ export function mount(host, opts = {}) {
     if (followEl.checked) { atBottom = true; askFrame(); }
   }
 
+  /* With keys taken from the whole page, the ones aimed at something else are
+     left alone: a field or dropdown being typed in -- the settings panel's, the
+     log level beside this one, both inside shadow roots, which is why it is the
+     composed path's first element and not the event's target -- and a button
+     or link, where Enter and space mean press. */
+  function aimedElsewhere(e) {
+    const t = e.composedPath()[0];
+    if (!(t instanceof Element) || t === logEl) return false;
+    return t.isContentEditable || /^(INPUT|TEXTAREA|SELECT|BUTTON|A)$/.test(t.tagName);
+  }
+
+  /* Where keys are listened for: the log, or with opts.keys the whole page.
+     Keyboard events cross shadow boundaries, so one listener on the document
+     sees keys typed with the log focused as well. */
+  const keySource = pageKeys ? document : logEl;
+
   /* What the device's linenoise understands in dumb mode: printable
      characters, Enter, backspace, control keys. Not the arrows or Escape --
      dumb mode drops the ESC and prints the rest, so an up-arrow would type
      "[A". They come with smart mode. Not Tab either, which leaves the log the
      way it leaves anything else. */
-  logEl.addEventListener('keydown', (e) => {
+  keySource.addEventListener('keydown', (e) => {
     if (!inputOn || e.isComposing || e.metaKey || e.altKey) return;
+    if (pageKeys && aimedElsewhere(e)) return;
     let s = null;
     if (e.ctrlKey) {
       const k = e.key.length === 1 ? e.key.toUpperCase() : '';
@@ -445,8 +508,8 @@ export function mount(host, opts = {}) {
     sendInput(s);
   });
 
-  logEl.addEventListener('paste', (e) => {
-    if (!inputOn) return;
+  keySource.addEventListener('paste', (e) => {
+    if (!inputOn || (pageKeys && aimedElsewhere(e))) return;
     e.preventDefault();
     sendInput(e.clipboardData.getData('text').replace(/\r?\n/g, '\r'));
   });
@@ -476,6 +539,7 @@ export function mount(host, opts = {}) {
   let onScreen = [];
 
   async function loadControls() {
+    if (noToolbar) return;      /* nowhere to show them, so not worth a fetch */
     try {
       const r = await fetch(SETTINGS);
       if (!r.ok) return;
@@ -619,7 +683,9 @@ export function mount(host, opts = {}) {
  * the default in STYLE. No title: the page has labelled the area already.
  * data-bitbang-collapsible asks for the fold toggle, opt-in for the reason
  * settings-panel.js gives: whether folding makes sense is a fact about the
- * page's layout, which only the page knows.
+ * page's layout, which only the page knows. data-bitbang-keys="page" takes
+ * typing from the whole page (opts.keys), and data-bitbang-toolbar="none"
+ * drops the toolbar (opts.toolbar), both opt-in for the same reason.
  */
 function mountDeclared() {
   for (const el of document.querySelectorAll('[data-bitbang-page="console"]')) {
@@ -627,6 +693,8 @@ function mountDeclared() {
     mount(el, {
       title:       false,
       collapsible: el.hasAttribute('data-bitbang-collapsible'),
+      keys:        el.getAttribute('data-bitbang-keys'),
+      toolbar:     el.getAttribute('data-bitbang-toolbar'),
     });
   }
 }
