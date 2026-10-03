@@ -111,11 +111,18 @@ const STYLE = `
   /* Typing: the log takes focus and shows where the next character lands. */
   #log.typing { cursor:text; }
   #log.typing:focus { outline:1px solid var(--accent); outline-offset:-1px; }
-  #log.typing:focus #tail::after,
-  :host([data-bb-keys]) #log.typing #tail::after { content:''; display:inline-block; width:.55em;
-         height:1.1em; vertical-align:text-bottom; background:currentColor;
-         animation:blink 1s steps(1) infinite; }
-  @keyframes blink { 50% { opacity:0; } }
+  /* The cursor: the character under it in inverse, blinking. renderTail marks
+     it only while there is input to aim, and it shows only while keys will
+     reach the device.
+
+     The glyph's color is set with text-fill-color and color is left alone:
+     currentColor is the element's own color, so setting color to the
+     background as well made the block and the character both the background
+     -- a cursor nobody could see (2026-10-02). */
+  #log.typing:focus .cur,
+  :host([data-bb-keys]) #log.typing .cur { background:currentColor;
+         -webkit-text-fill-color:Canvas; animation:cursor 1s steps(1) infinite; }
+  @keyframes cursor { 50% { background:transparent; -webkit-text-fill-color:currentColor; } }
   .drop { color:var(--bad); }
   /* Matching what idf.py monitor shows: green info, yellow warn, red error.
      Applied from the level letter on each line, and from ANSI escapes when a
@@ -297,87 +304,132 @@ export function mount(host, opts = {}) {
     askFrame();
   }
 
-  /* The level color is decided per line, so text is held until its newline
-     arrives -- a chunk boundary lands mid-line constantly at 1024 bytes.
-     Held as pieces, each with the escape color it arrived under. It used to be
-     one string colored at the newline with whatever was in force by then, so
-     text an application colored and reset before the end of the line lost its
-     color. The level color fills in only where no escape set one. The cap is
-     for a device that writes without newlines at all: better to show it than
-     to hold it forever. */
-  let pieces = [], held = 0;
+  /* The level color is decided per line, so the line is held until its newline
+     arrives -- a chunk boundary lands mid-line constantly at 1024 bytes -- and
+     shown meanwhile as the tail. Each character keeps the escape color it
+     arrived under: the line used to be one string colored at the newline with
+     whatever was in force by then, so text an application colored and reset
+     before the end of the line lost its color. The level color fills in only
+     where no escape set one.
+
+     The current line is a terminal's line: its text, a class per character,
+     and a cursor. A device may move the cursor back and write over what is
+     there -- linenoise redraws its whole line that way on every key, and
+     answers a backspace with "\b \b" -- so text is written at the cursor, not
+     appended. Once a line ends it goes to the log and cannot be reached again,
+     on a terminal either. Log output, with the cursor at the end, is plain
+     appending. The cap is for a device that writes without newlines at all:
+     better to show it than to hold it forever. */
+  let lineText = '';
+  let lineCls = [];       // the class each character arrived under
+  let cur = 0;            // the cursor, as an index into lineText
 
   function flushLine() {
-    const level = levelClass(pieces.map(p => p[0]).join(''));
-    for (const [t, c] of pieces) append(t, c || level);
-    pieces = [];
-    held = 0;
+    const level = levelClass(lineText);
+    for (const [t, c] of runs(lineText.length)) append(t, c || level);
+    lineText = '';
+    lineCls = [];
+    cur = 0;
   }
 
-  function emitPlain(text, cls) {
-    let start = 0, nl;
-    while ((nl = text.indexOf('\n', start)) >= 0) {
-      pieces.push([text.slice(start, nl + 1), cls]);
-      flushLine();
-      start = nl + 1;
+  /* The line in runs of one class: [text, class] pairs, up to `end`. */
+  function runs(end, from = 0) {
+    const out = [];
+    for (let i = from; i < end; i++) {
+      const last = out[out.length - 1];
+      if (last && last[1] === lineCls[i]) last[0] += lineText[i];
+      else out.push([lineText[i], lineCls[i]]);
     }
-    if (start < text.length) {
-      pieces.push([text.slice(start), cls]);
-      held += text.length - start;
+    return out;
+  }
+
+  /* Printable text, at the cursor: over what is there, or past the end with
+     the gap filled with spaces, as a cursor moved beyond the text leaves it. */
+  function put(text, cls) {
+    if (cur > lineText.length) {
+      const gap = cur - lineText.length;
+      lineText += ' '.repeat(gap);
+      for (let i = 0; i < gap; i++) lineCls.push(null);
     }
-    if (held > 4096) flushLine();
+    lineText = lineText.slice(0, cur) + text + lineText.slice(cur + text.length);
+    for (let i = 0; i < text.length; i++) lineCls[cur + i] = cls;
+    cur += text.length;
+  }
+
+  /* Control characters a terminal acts on rather than draws. DEL, BEL and NUL
+     draw nothing: DEL is a serial terminal's backspace key echoed back, BEL a
+     beep, and linenoise sends a NUL after some of its commands. */
+  function emit(text, cls) {
+    let start = 0;
+    for (let i = 0; i < text.length; i++) {
+      const ch = text[i];
+      if (ch !== '\n' && ch !== '\r' && ch !== '\b' && ch !== '\x7f'
+          && ch !== '\x07' && ch !== '\0') continue;
+      if (i > start) put(text.slice(start, i), cls);
+      start = i + 1;
+      if (ch === '\n') {
+        lineText += '\n';
+        lineCls.push(cls);
+        flushLine();
+      } else if (ch === '\r') {
+        cur = 0;
+      } else if (ch === '\b') {
+        if (cur > 0) cur--;
+      }
+    }
+    if (start < text.length) put(text.slice(start), cls);
+    if (lineText.length > 4096) flushLine();
     askFrame();                             /* the tail changed */
   }
 
-  /* Backspace takes the last character off the unfinished line, as it moves a
-     terminal's cursor back over it -- which is how a device erases what was
-     typed: linenoise answers a backspace with "\b \b". DEL is dropped: it is a
-     serial terminal's backspace key, echoed back, and draws nothing. A line
-     that has already ended cannot be reached, on a terminal either. */
-  function emit(text, cls) {
-    if (!/[\x08\x7f]/.test(text)) { emitPlain(text, cls); return; }
-    let run = '';
-    for (const ch of text) {
-      if (ch === '\x08') {
-        emitPlain(run, cls);
-        run = '';
-        eraseOne();
-      } else if (ch !== '\x7f') {
-        run += ch;
-      }
-    }
-    emitPlain(run, cls);
-  }
-
-  function eraseOne() {
-    while (pieces.length) {
-      const last = pieces[pieces.length - 1];
-      if (last[0].length) {
-        last[0] = last[0].slice(0, -1);
-        held--;
-        if (!last[0].length) pieces.pop();
-        return;
-      }
-      pieces.pop();
-    }
-  }
-
+  /* The current line, with the cursor when there is input to aim: the
+     character under it is wrapped, or a space after the end, and the
+     stylesheet decides when it shows. */
   function renderTail() {
     tailEl.textContent = '';
-    if (!pieces.length) return;
-    const level = levelClass(pieces.map(p => p[0]).join(''));
-    for (const [t, c] of pieces) {
+    const level = levelClass(lineText);
+    const add = (t, c, extra) => {
       const node = document.createElement('span');
-      if (c || level) node.className = c || level;
+      const cls = [c || level, extra].filter(Boolean).join(' ');
+      if (cls) node.className = cls;
       node.textContent = t;
       tailEl.appendChild(node);
+    };
+    if (!inputOn) {
+      for (const [t, c] of runs(lineText.length)) add(t, c);
+      return;
+    }
+    const at = Math.min(cur, lineText.length);
+    for (const [t, c] of runs(at)) add(t, c);
+    if (cur < lineText.length) {
+      add(lineText[cur], lineCls[cur], 'cur');
+      for (const [t, c] of runs(lineText.length, cur + 1)) add(t, c);
+    } else {
+      if (cur > lineText.length) add(' '.repeat(cur - lineText.length), null);
+      add(' ', null, 'cur');
     }
   }
 
-  /* ANSI, for the cases where escapes really are in the stream.
+  function clearAll() {
+    logEl.textContent = '';
+    logEl.appendChild(tailEl);    /* emptied with everything else; put it back */
+    queued = document.createDocumentFragment();
+    lineText = '';
+    lineCls = [];
+    cur = 0;
+    askFrame();
+  }
+
+  /* ANSI escapes: color, and the line editing a device that reads its own
+   * input does on the current line.
    *
-   * Only SGR (ESC[...m) is handled; a viewer that tried to implement cursor
-   * movement in a scrollback pane would be inventing a terminal it cannot honor.
+   * SGR (ESC[...m) colors. Then what linenoise and serial terminals use to edit
+   * a line in place: K erases to the end of the line (or the start, or all of
+   * it), C and D move the cursor right and left, G sets its column, and
+   * ESC[H ESC[2J -- Ctrl-L -- clears the screen. Nothing that moves between
+   * lines: in a scrollback pane that would mean rewriting history, which is
+   * inventing a terminal it cannot honor. Any other sequence is consumed and
+   * ignored rather than drawn.
    *
    * Two pieces of state have to survive across frames, and both would be bugs if
    * they did not: a 1024-byte chunk can split an escape sequence down the
@@ -385,6 +437,32 @@ export function mount(host, opts = {}) {
    * next chunk continues it. */
   let ansiPending = '';   // a partial escape held back for the next chunk
   let ansiClass = null;   // color currently in force
+
+  function csi(params, final) {
+    const n = parseInt(params || '0', 10) || 0;
+    switch (final) {
+      case 'm': ansiClass = classForSGR(params, ansiClass); break;
+      case 'K':
+        if (n === 0) {                        /* cursor to end of line */
+          lineText = lineText.slice(0, cur);
+          lineCls.length = Math.min(lineCls.length, cur);
+        } else if (n === 1) {                 /* start of line to cursor */
+          const upto = Math.min(cur + 1, lineText.length);
+          lineText = ' '.repeat(upto) + lineText.slice(upto);
+          for (let i = 0; i < upto; i++) lineCls[i] = null;
+        } else {                              /* the whole line */
+          lineText = '';
+          lineCls = [];
+        }
+        break;
+      case 'C': cur += n || 1; break;
+      case 'D': cur = Math.max(0, cur - (n || 1)); break;
+      case 'G': cur = Math.max(0, (n || 1) - 1); break;
+      case 'H': cur = 0; break;
+      case 'J': if (n === 2) clearAll(); break;
+    }
+    askFrame();
+  }
 
   function writeAnsi(text) {
     const s = ansiPending + text;
@@ -395,28 +473,23 @@ export function mount(host, opts = {}) {
       if (esc < 0) { emit(s.slice(i), ansiClass); return; }
       emit(s.slice(i, esc), ansiClass);
 
-      const m = /^\x1b\[([0-9;]*)m/.exec(s.slice(esc));
+      const rest = s.slice(esc, esc + 16);
+      const m = /^\x1b\[([0-9;?]*)([@-~])/.exec(rest);
       if (m) {
-        ansiClass = classForSGR(m[1], ansiClass);
+        csi(m[1], m[2]);
         i = esc + m[0].length;
         continue;
       }
-      /* No match: either the sequence is still arriving, or it is not an SGR.
-         A real one is short, so a long unmatched tail is junk rather than a
-         fragment -- dropping the ESC and moving on stops it eating the log. */
-      if (s.length - esc < 16) { ansiPending = s.slice(esc); return; }
+      /* Not a whole sequence: either it is still arriving -- a chunk boundary
+         landed inside it -- or it is not one at all. A real one is short, so
+         an unfinished prefix is held for the next chunk, and anything else is
+         junk: dropping the ESC and moving on stops it eating the log. */
+      if (/^\x1b(\[[0-9;?]*)?$/.test(s.slice(esc))) { ansiPending = s.slice(esc); return; }
       i = esc + 1;
     }
   }
 
-  root.getElementById('clear').onclick = () => {
-    logEl.textContent = '';
-    logEl.appendChild(tailEl);    /* emptied with everything else; put it back */
-    queued = document.createDocumentFragment();
-    pieces = [];
-    held = 0;
-    renderTail();
-  };
+  root.getElementById('clear').onclick = clearAll;
 
   /* -- typing --------------------------------------------------------------
 
@@ -433,6 +506,7 @@ export function mount(host, opts = {}) {
 
   function setTyping(on) {
     inputOn = on;
+    askFrame();                 /* the tail gains or loses its cursor */
     logEl.tabIndex = on ? 0 : -1;
     logEl.classList.toggle('typing', on);
     logEl.title = on ? (pageKeys ? 'Type anywhere on the page: keys go to the device'
@@ -480,11 +554,18 @@ export function mount(host, opts = {}) {
      sees keys typed with the log focused as well. */
   const keySource = pageKeys ? document : logEl;
 
-  /* What the device's linenoise understands in dumb mode: printable
-     characters, Enter, backspace, control keys. Not the arrows or Escape --
-     dumb mode drops the ESC and prints the rest, so an up-arrow would type
-     "[A". They come with smart mode. Not Tab either, which leaves the log the
-     way it leaves anything else. */
+  /* What a serial terminal sends, so that whatever reads the device's stdin
+     sees what it would see at the bench: printable characters, Enter as CR,
+     Backspace as Ctrl-H, control keys, and the arrows, Home, End and Delete as
+     their escape sequences -- linenoise turns those into history and line
+     editing. (In linenoise's dumb mode an arrow prints as "[A", exactly as it
+     does from a serial terminal.) Not Escape on its own, which leaves linenoise
+     waiting for the rest of a sequence. Tab only when the page gave the
+     console every key: elsewhere Tab moves focus, as it should. */
+  const SEQ = {
+    ArrowUp: '\x1b[A', ArrowDown: '\x1b[B', ArrowRight: '\x1b[C', ArrowLeft: '\x1b[D',
+    Home: '\x1b[H', End: '\x1b[F', Delete: '\x1b[3~',
+  };
   keySource.addEventListener('keydown', (e) => {
     if (!inputOn || e.isComposing || e.metaKey || e.altKey) return;
     if (pageKeys && aimedElsewhere(e)) return;
@@ -500,6 +581,10 @@ export function mount(host, opts = {}) {
       s = '\r';                 /* what a terminal sends; the device makes it LF */
     } else if (e.key === 'Backspace') {
       s = '\x08';               /* Ctrl-H: linenoise answers it with "\b \b" */
+    } else if (SEQ[e.key] && !e.shiftKey) {
+      s = SEQ[e.key];
+    } else if (e.key === 'Tab' && pageKeys && !e.shiftKey) {
+      s = '\t';
     } else if (e.key.length === 1) {
       s = e.key;
     }
