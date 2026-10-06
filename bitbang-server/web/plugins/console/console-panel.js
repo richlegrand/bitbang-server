@@ -21,7 +21,7 @@
  * puts ws-shim into the meta-page. Either way `new WebSocket(...)` here becomes
  * a stream to the right device with nothing passed in.
  *
- * Temporary, with console.html: both move out when the server has plugins.
+ * The console plugin's, with console.html (internal/plugins/console).
  */
 
 import { foldable, FOLD_CSS } from './panel-fold.js';

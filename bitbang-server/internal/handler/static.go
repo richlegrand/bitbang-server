@@ -61,26 +61,17 @@ var stampInputs = []string{
 	"stream-shim.js",
 	// The loader a device page includes, which decides what else to fetch.
 	"bitbang.js",
-	// Temporary: leaves with settings.html when the config page becomes a plugin.
-	"settings.html",
-	// The panel settings.html mounts, and that a device page mounts too through
-	// data-bitbang-page. Here because a stamp has to cover everything the browser
-	// runtime is made of, and all of the settings rendering lives in this file
-	// now: a change to it that did not move the stamp would leave every open tab
-	// running the old copy.
-	"settings-panel.js",
-	"console.html",
-	// The same for the console: console.html mounts it, and so does a device
-	// page through data-bitbang-page="console".
-	"console-panel.js",
+	// The settings, console and OTA pages are plugins' now, and reach the stamp
+	// through NewStampCache's extra inputs -- every file a plugin registers
+	// does.
+	//
 	// Folding, and one setting's control, which both panels import.
 	"panel-fold.js",
 	"setting-control.js",
-	"ota.html",
-	// The renderers. Temporary in the same sense: they move to a plugin of
-	// their own, which is not the one settings.html goes to -- a renderer is a
-	// codec adapter, and a device sending mjpeg wants the mjpeg renderer
-	// while wanting nothing to do with any particular device's firmware.
+	// The renderers, still the core's. They belong in a plugin of their own,
+	// and not the settings or console one -- a renderer is a codec adapter, and
+	// a device sending mjpeg wants the mjpeg renderer while wanting nothing to
+	// do with any particular device's firmware.
 	"pcm-ring.js",
 	"render-mjpeg.js",
 	"render-ulaw.js",
@@ -98,9 +89,9 @@ var stampInputs = []string{
 // Reached through a StampCache rather than called per request: reading
 // 400 KB to answer every asset request would be absurd, and calling it
 // once at startup was wrong in a way nothing detected. See StampCache.
-func buildStamp(staticDir string) string {
+func buildStamp(staticDir string, inputs []string) string {
 	h := sha256.New()
-	for _, name := range stampInputs {
+	for _, name := range inputs {
 		h.Write([]byte(name))
 		b, err := os.ReadFile(filepath.Join(staticDir, name))
 		if err != nil {
@@ -149,7 +140,8 @@ var stampMaxAge = 5 * time.Second
 // same. Contents decide the stamp; metadata only decides when to read
 // them.
 type StampCache struct {
-	dir string
+	dir    string
+	inputs []string // stampInputs, then whatever the plugins registered
 
 	mu      sync.Mutex
 	stamp   string
@@ -161,9 +153,14 @@ type StampCache struct {
 // what it serves, and the client socket, which tells an open tab when the
 // stamp has moved -- one cache, so the two can never disagree about which
 // build is current.
-func NewStampCache(dir string) *StampCache {
-	c := &StampCache{dir: dir}
-	c.stamp = buildStamp(dir)
+//
+// extra are more inputs, as paths relative to dir: the files the plugins
+// registered (plugin.Registry.Files), which are as much the browser runtime as
+// anything in stampInputs.
+func NewStampCache(dir string, extra ...string) *StampCache {
+	inputs := append(append([]string(nil), stampInputs...), extra...)
+	c := &StampCache{dir: dir, inputs: inputs}
+	c.stamp = buildStamp(dir, inputs)
 	c.meta = c.readMeta()
 	c.checked = time.Now()
 	return c
@@ -174,7 +171,7 @@ func NewStampCache(dir string) *StampCache {
 // string. Measured at 39us for the fourteen inputs.
 func (c *StampCache) readMeta() string {
 	var b strings.Builder
-	for _, name := range stampInputs {
+	for _, name := range c.inputs {
 		fi, err := os.Stat(filepath.Join(c.dir, name))
 		if err != nil {
 			b.WriteString(name + ":-\n")
@@ -203,7 +200,7 @@ func (c *StampCache) Current() string {
 	/* A changed stamp is worth a line. It is the one event that reloads
 	   every open tab, so when someone asks why their session restarted
 	   this is the answer, with a timestamp. */
-	next := buildStamp(c.dir)
+	next := buildStamp(c.dir, c.inputs)
 	if next != c.stamp {
 		log.Printf("build stamp %s -> %s (web/ changed under a running server)",
 			c.stamp, next)
@@ -238,17 +235,11 @@ var allowedBitbangAssets = map[string]bool{
 	"xhr-shim.js":    true,
 	"stream-shim.js": true, // renders whatever a device streams, in its page
 	"favicon.ico":    true, // handler internally maps this to favicon.png
-	// Temporary: goes away when a plugin serves its own assets.
-	"settings.html": true, // the device-settings meta-page shell
-	// Mounted into a shadow root: by settings.html standalone, and through
-	// bitbang.js when a device page carries data-bitbang-page="settings".
-	"settings-panel.js": true,
-	"console.html":      true, // the device-console meta-page shell
-	// The same for the console, and data-bitbang-page="console".
-	"console-panel.js":   true,
-	"panel-fold.js":      true, // folding, imported by both panels
-	"setting-control.js": true, // one setting's control, imported by both panels
-	"ota.html":           true, // the device-firmware meta-page shell
+	// The meta-pages and panels -- settings, console, OTA -- are plugins',
+	// served through PluginFiles. These two are imported by both panels, so
+	// they stay here rather than belong to either.
+	"panel-fold.js":      true, // folding
+	"setting-control.js": true, // one setting's control
 	// The renderers, one per codec, fetched by the shim the first time a
 	// channel announces that codec. Served here rather than embedded in a
 	// device page, because rendering is a property of the codec and not of any
@@ -263,22 +254,39 @@ var allowedBitbangAssets = map[string]bool{
 	"render-ulaw.js":  true,
 }
 
+// IsCoreAsset reports whether the core serves name at /__bitbang__/ itself --
+// the names no plugin may register, since the core's copy would win and the
+// plugin's would be unreachable.
+func IsCoreAsset(name string) bool { return allowedBitbangAssets[name] }
+
+// PluginFiles is what the static handler needs from the plugin registry:
+// where a plugin's file is, and which meta-pages the plugins added. An
+// interface so this package does not import the plugin host.
+type PluginFiles interface {
+	// File returns the path of a served name, relative to the static
+	// directory.
+	File(name string) (string, bool)
+	MetaPages() []string
+}
+
 // metaPageNames returns the meta-page names this server can serve, sorted --
-// the .html entries above, without the extension, which is the spelling
-// someone types after the '*' in /*settings.
+// the .html entries above and the plugins' pages, without the extension, which
+// is the spelling someone types after the '*' in /*settings.
 //
-// It is derived rather than declared so that adding a shell to the map above is
-// the only step. sw.js used to keep its own copy of these three names and gate
-// on it; that list refused nothing this one does not, and it was the copy that
-// went stale when config.html was renamed. The service worker now asks for
-// <name>.html and reports whatever comes back, so this is the only authority,
-// and it is the one a plugin registering a page would extend.
-func metaPageNames() []string {
+// It is derived rather than declared so that adding a shell is the only step.
+// sw.js used to keep its own copy of these three names and gate on it; that
+// list refused nothing this one does not, and it was the copy that went stale
+// when config.html was renamed. The service worker now asks for <name>.html and
+// reports whatever comes back, so this is the only authority.
+func metaPageNames(plugins PluginFiles) []string {
 	var out []string
 	for name := range allowedBitbangAssets {
 		if ext := strings.TrimSuffix(name, ".html"); ext != name {
 			out = append(out, ext)
 		}
+	}
+	if plugins != nil {
+		out = append(out, plugins.MetaPages()...)
 	}
 	sort.Strings(out)
 	return out
@@ -287,11 +295,11 @@ func metaPageNames() []string {
 // notFoundMetaPage answers a miss under /__bitbang__/<name>.html by naming what
 // does exist. Guessing a plausible name is how someone finds out which pages
 // are real, and a bare 404 sends them to read source instead.
-func notFoundMetaPage(w http.ResponseWriter, name string) {
+func notFoundMetaPage(w http.ResponseWriter, name string, plugins PluginFiles) {
 	w.Header().Set("Content-Type", "text/plain; charset=utf-8")
 	w.WriteHeader(http.StatusNotFound)
 	fmt.Fprintf(w, "no meta-page named %q (have: %s)\n",
-		name, strings.Join(metaPageNames(), ", "))
+		name, strings.Join(metaPageNames(plugins), ", "))
 }
 
 // Static returns an http.Handler that serves the signaling server's static
@@ -313,7 +321,11 @@ func notFoundMetaPage(w http.ResponseWriter, name string) {
 //
 // The stamp cache is passed in rather than built here so the client socket can
 // share it; see NewStampCache. The directory served is the cache's own.
-func Static(stamps *StampCache, frontPagePath string) http.HandlerFunc {
+//
+// plugins answers for the names the core does not serve itself: a plugin's
+// meta-page, panel and modules are at /__bitbang__/<file> like the core's, and
+// on disk under plugins/<name>/. Nil serves the core alone.
+func Static(stamps *StampCache, frontPagePath string, plugins PluginFiles) http.HandlerFunc {
 	staticDir := stamps.dir
 	return func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodGet && r.Method != http.MethodHead {
@@ -329,6 +341,14 @@ func Static(stamps *StampCache, frontPagePath string) http.HandlerFunc {
 
 		case strings.HasPrefix(path, "/__bitbang__/"):
 			name := strings.TrimPrefix(path, "/__bitbang__/")
+			// A plugin's file, which the registry checked when it was
+			// registered: a flat name, present on disk, nobody else's.
+			if !allowedBitbangAssets[name] && !strings.ContainsRune(name, '/') && plugins != nil {
+				if rel, ok := plugins.File(name); ok {
+					serveFile(w, r, staticDir, rel, "", true)
+					return
+				}
+			}
 			// No subpaths under __bitbang__; only flat filenames.
 			if strings.ContainsRune(name, '/') || !allowedBitbangAssets[name] {
 				// A miss on a .html here is someone asking for a meta-page
@@ -338,7 +358,7 @@ func Static(stamps *StampCache, frontPagePath string) http.HandlerFunc {
 				// other miss is a runtime asset and its own bug.
 				if base, ok := strings.CutSuffix(name, ".html"); ok &&
 					!strings.ContainsRune(name, '/') {
-					notFoundMetaPage(w, base)
+					notFoundMetaPage(w, base, plugins)
 					return
 				}
 				http.NotFound(w, r)

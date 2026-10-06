@@ -13,7 +13,8 @@
  * {width:auto}, and the video beside it widens -- without the panel knowing
  * what is beside it.
  *
- * Temporary, with both panels: it moves out when the server has plugins.
+ * In the core rather than either plugin: the console's panel and the
+ * settings panel both import it, by relative path from /__bitbang__/.
  */
 
 /* The toggle's look, identical in every panel that folds -- the two buttons sit

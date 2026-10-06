@@ -7,6 +7,7 @@ import (
 	"net/http"
 
 	"bitbang-server-go/internal/metrics"
+	"bitbang-server-go/internal/plugin"
 	"bitbang-server-go/internal/wire"
 )
 
@@ -25,6 +26,11 @@ type statusResp struct {
 	Devices     int    `json:"devices"`
 	Clients     int    `json:"clients"`
 	ActiveCodes int    `json:"active_codes"`
+
+	// Every plugin and whether it came up. A plugin that failed is left out of
+	// everything it would have served, and this is where that shows: its pages
+	// 404 and nothing else says why.
+	Plugins []plugin.Status `json:"plugins"`
 
 	// Embed Snapshot inline so its JSON tags (connection_requests_total,
 	// connections_direct_total, ...) sit at the top level of the response
@@ -84,6 +90,7 @@ func (d *Deps) Status(w http.ResponseWriter, r *http.Request) {
 		MinProtocol: wire.MinProtocolVersion,
 		Devices:     d.Devices.Count(),
 		Clients:     d.Clients.Count(),
+		Plugins:     d.Plugins.Status(),
 		Snapshot:    d.Metrics.Snapshot(),
 	}
 	if d.Pairing != nil {

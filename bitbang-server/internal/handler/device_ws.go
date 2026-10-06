@@ -19,6 +19,7 @@ import (
 	"bitbang-server-go/internal/identity"
 	"bitbang-server-go/internal/metrics"
 	"bitbang-server-go/internal/pairing"
+	"bitbang-server-go/internal/plugin"
 	"bitbang-server-go/internal/ratelimit"
 	"bitbang-server-go/internal/registry"
 	"bitbang-server-go/internal/releases"
@@ -79,6 +80,10 @@ type Deps struct {
 	// from the same value the files carry. nil skips the announcement, which
 	// is what a test that never serves files wants.
 	Stamps *StampCache
+
+	// Plugins is what loaded, and how each fared, for /status. nil-safe: a
+	// test with no plugins reports none.
+	Plugins *plugin.Registry
 }
 
 // DeviceWS handles /ws/device/<uid>.

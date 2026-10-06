@@ -14,7 +14,8 @@
  * Moved out of settings-panel.js on 2026-10-01 with no change in behavior. The
  * comments that explain each decision came with it.
  *
- * Temporary, with both panels: it moves out when the server has plugins.
+ * In the core rather than either plugin: the console's panel and the
+ * settings panel both import it, by relative path from /__bitbang__/.
  */
 
 /* The theme every panel shares. Custom properties pierce a shadow boundary, so

@@ -24,7 +24,7 @@
  * device with nothing injected. That is the same reason the settings page worked
  * before ws-shim existed -- see the note in sw.js.
  *
- * Temporary, with settings.html: both move out when the server has plugins.
+ * The settings plugin's, with settings.html (internal/plugins/settings).
  */
 
 import { foldable, FOLD_CSS } from './panel-fold.js';
