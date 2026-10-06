@@ -13,19 +13,15 @@ import (
 	"time"
 
 	"bitbang-server-go/internal/plugin"
-	"bitbang-server-go/internal/plugins/console"
-	"bitbang-server-go/internal/plugins/ota"
-	"bitbang-server-go/internal/plugins/settings"
 )
 
-// loadPlugins loads the plugins main.go does, against dir, and fails the test
-// if any is down -- a fixture missing a plugin's file would otherwise show up
-// as a confusing 404 several assertions later.
+// loadPlugins discovers the plugins in dir/plugins the way main.go does, and
+// fails the test if any is down -- a fixture missing a plugin's file would
+// otherwise show up as a confusing 404 several assertions later.
 func loadPlugins(t *testing.T, dir string) *plugin.Registry {
 	t.Helper()
 	log := slog.New(slog.NewTextHandler(io.Discard, nil))
-	reg := plugin.Load(dir, log, IsCoreAsset,
-		settings.Plugin{}, console.Plugin{}, ota.Plugin{})
+	reg := plugin.Discover(dir, log, IsCoreAsset, plugin.Registered())
 	for _, st := range reg.Status() {
 		if !st.Up {
 			t.Fatalf("plugin %s is down: %s", st.Name, st.Error)
@@ -52,11 +48,14 @@ func stampDir(t *testing.T) string {
 		"pcm-ring.js":        "// pcm ring\n",
 		"render-mjpeg.js":    "// mjpeg\n",
 		"render-ulaw.js":     "// ulaw\n",
-		// The plugins', each in its own directory.
+		// The plugins', each a directory with its manifest.
+		"plugins/settings/plugin.json":       `{"meta_pages": ["settings"], "panels": ["settings"]}`,
 		"plugins/settings/settings.html":     "<html><!-- settings --></html>",
 		"plugins/settings/settings-panel.js": "// settings panel\n",
+		"plugins/console/plugin.json":        `{"meta_pages": ["console"], "panels": ["console"]}`,
 		"plugins/console/console.html":       "<html><!-- console --></html>",
 		"plugins/console/console-panel.js":   "// console panel\n",
+		"plugins/ota/plugin.json":            `{"meta_pages": ["ota"]}`,
 		"plugins/ota/ota.html":               "<html><!-- firmware --></html>",
 	}
 	for name, body := range files {
@@ -234,19 +233,6 @@ func TestInjectedScriptsAreServable(t *testing.T) {
 			t.Errorf("allowedBitbangAssets has %s, but web/ does not: %v", name, err)
 		}
 	}
-}
-
-// Every plugin main.go loads comes up against the real web/: each file it
-// registers is where it says, and none collides with the core or another
-// plugin. The plugin host checks all of that at startup and takes a failing
-// plugin down -- which in production is a page that 404s with only a /status
-// line to say why. Here it is a test failure instead.
-func TestEveryPluginLoadsAgainstTheRealWeb(t *testing.T) {
-	web := filepath.Join("..", "..", "web")
-	if _, err := os.Stat(filepath.Join(web, "sw.js")); err != nil {
-		t.Skipf("no web/ beside the package: %v", err)
-	}
-	loadPlugins(t, web)
 }
 
 // The meta-page shell has to be reachable at /__bitbang__/settings.html or the

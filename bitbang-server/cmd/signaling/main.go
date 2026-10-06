@@ -36,6 +36,12 @@
 //	                     the div is missing). Empty (default) = bare
 //	                     pair-entry page. File is re-read on every
 //	                     request — no restart needed after edits.
+//
+// Plugins are the directories under STATIC_DIR/plugins. Those with Go code are
+// linked in through plugins_gen.go, which this regenerates; run it after
+// adding or removing one, and before a build (the upload scripts do).
+//
+//go:generate go run ../plugingen -dir ../../web/plugins -import bitbang-server-go/web/plugins -out plugins_gen.go
 package main
 
 import (
@@ -56,9 +62,6 @@ import (
 	"bitbang-server-go/internal/metrics"
 	"bitbang-server-go/internal/pairing"
 	"bitbang-server-go/internal/plugin"
-	"bitbang-server-go/internal/plugins/console"
-	"bitbang-server-go/internal/plugins/ota"
-	"bitbang-server-go/internal/plugins/settings"
 	"bitbang-server-go/internal/ratelimit"
 	"bitbang-server-go/internal/registry"
 	"bitbang-server-go/internal/releases"
@@ -151,15 +154,13 @@ func main() {
 		logger.Info("TURN: no TURN server configured — devices must provide their own ICE servers")
 	}
 
-	// Everything that is not signaling. Loaded before the stamp cache, because
-	// a plugin's files are part of the browser runtime and the stamp has to
-	// cover them. A plugin that fails is reported on /status and left out; the
-	// server comes up regardless.
-	plugins := plugin.Load(cfg.StaticDir, logger, handler.IsCoreAsset,
-		settings.Plugin{},
-		console.Plugin{},
-		ota.Plugin{},
-	)
+	// Everything that is not signaling: each directory under STATIC_DIR/plugins
+	// is a plugin, and being there is what turns it on. Discovered before the
+	// stamp cache, because a plugin's files are part of the browser runtime and
+	// the stamp has to cover them. A plugin that fails is reported on /status
+	// and left out; the server comes up regardless.
+	plugins := plugin.Discover(cfg.StaticDir, logger, handler.IsCoreAsset,
+		plugin.Registered())
 
 	// One stamp cache for the files and the sockets, so what a client is told
 	// is current is always what the files it would reload are carrying.

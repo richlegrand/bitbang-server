@@ -4,3 +4,11 @@
 SERVER_SSH=user@hostname
 SERVER_SSH_KEY=/path/to/ssh/key
 SERVER_SSH_DIR=/opt/bitbang-test
+
+# Plugins to leave off this server: directory names under web/plugins/,
+# separated by spaces or commas. They are left out of what ships, and a
+# plugin whose directory isn't on the server is off -- the server itself has
+# no setting for this. Empty or unset ships every plugin in the repo. To turn
+# one off everywhere without deleting it, rename its directory to start with
+# an underscore instead.
+PLUGINS_EXCLUDE=

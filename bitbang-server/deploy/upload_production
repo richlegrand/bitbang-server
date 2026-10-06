@@ -15,6 +15,10 @@ cd "${ROOT}"
 
 source deploy/production.deploy
 
+# Link in every plugin with Go code under web/plugins. A plugin added without
+# this would be missing from the binary, and down on /status.
+go generate ./cmd/signaling
+
 # Cross-compile for linux/amd64. Static binary, no CGo runtime deps.
 echo "Building signaling-go for linux/amd64..."
 CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -o signaling-go ./cmd/signaling
@@ -27,7 +31,24 @@ CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -o bitbang-metrics-dump ./cmd/bit
 TARFILE=signaling-production.tgz
 SERVICE=signaling.service
 
+# Plugins this server goes without (PLUGINS_EXCLUDE in production.deploy).
+# Left out of the tarball, so their directories never reach web/plugins/
+# there -- which is all it takes for a plugin to be off. A name that isn't a
+# plugin stops the deploy: a typo would otherwise ship the very plugin it meant
+# to leave out.
+PLUGINS_EXCLUDE="${PLUGINS_EXCLUDE:-}"   # a .deploy from before this has none
+EXCLUDES=()
+for p in ${PLUGINS_EXCLUDE//,/ }; do
+    if [ ! -d "web/plugins/${p}" ]; then
+        echo "PLUGINS_EXCLUDE: no plugin named '${p}' in web/plugins/" >&2
+        exit 1
+    fi
+    echo "Leaving out plugin ${p}"
+    EXCLUDES+=(--exclude="web/plugins/${p}")
+done
+
 tar cvfz "${TARFILE}" \
+    ${EXCLUDES[@]+"${EXCLUDES[@]}"} \
     signaling-go \
     bitbang-metrics-dump \
     deploy/production.env \
@@ -40,6 +61,11 @@ scp -i "${SERVER_SSH_KEY}" "${TARFILE}" "${SERVER_SSH}:${SERVER_SSH_DIR}/${TARFI
 ssh "${SERVER_SSH}" -i "${SERVER_SSH_KEY}" "
     set -e
     cd ${SERVER_SSH_DIR}
+    # web/ is replaced, not unpacked over. A plugin is on because its
+    # directory is in web/plugins/, so a plugin removed from the repo has to
+    # disappear here too -- and extracting over the old tree never deleted
+    # anything, which left every moved or removed file behind.
+    rm -rf web
     tar xvfz ${TARFILE}
 
     # Move runtime env and service file to the locations systemd expects,

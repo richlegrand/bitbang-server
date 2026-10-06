@@ -24,7 +24,7 @@
  * device with nothing injected. That is the same reason the settings page worked
  * before ws-shim existed -- see the note in sw.js.
  *
- * The settings plugin's, with settings.html (internal/plugins/settings).
+ * The settings plugin's, with settings.html; both listed in plugin.json.
  */
 
 import { foldable, FOLD_CSS } from './panel-fold.js';
