@@ -244,13 +244,11 @@ export function control(s, ctx) {
            we just made and have already applied. */
         if ('rev' in j) ctx.onRev?.(j.rev);
         if ('v' in j) s.v = j.v;
-        if ('set' in j) s.set = j.set;
         if ('pv' in j) s.pv = j.pv; else delete s.pv;
         /* show() rather than reaching for the control, which is what this did
            -- three lines that asked whether input.type was a checkbox and
            wrote .value or .checked accordingly. It had no answer for a radio
-           group or for a secret's placeholder, so those two never showed a
-           value the device had quantized. The branch that built the nodes
+           group, so one never showed a value the device had quantized. The branch that built the nodes
            knows how to put a value on them; nothing else needs to guess. */
         if (show !== null) show();
         if (j.reload) ctx.onReload?.(typeof j.reload === 'string' ? j.reload : null);
@@ -444,28 +442,16 @@ export function control(s, ctx) {
     input = document.createElement('input');
     input.type = s.secret ? 'password' : 'text';
     if (s.maxlen) input.maxLength = s.maxlen;
-    const place = () => (s.set ? 'set -- leave blank to keep' : 'not set');
     /* The pending value when there is one: it is what was typed, and the field
        is where someone looks for it. Showing the value in force instead put the
        old Wi-Fi network back in the box a moment after the new one was typed,
        and kept it there until Apply had finished and the page reconnected. The
        value in force goes in the note beside it. */
     const shown = () => s.pv ?? s.v ?? '';
-    if (s.secret) {
-      input.placeholder = place();
-    } else {
-      input.value = shown();
-    }
-    input.onchange = () => {
-      if (s.secret && input.value === '') return;
-      send({ k: s.k, v: input.value });
-    };
-    /* A secret has no value to show, only whether one is set. Not clobbering
-       a half-typed credential is why sync() checks activeElement. */
-    show = () => {
-      if (s.secret) input.placeholder = place();
-      else input.value = shown();
-    };
+    input.value = shown();
+    input.onchange = () => send({ k: s.k, v: input.value });
+    /* Not clobbering a half-typed value is why sync() checks activeElement. */
+    show = () => { input.value = shown(); };
     ctl.classList.add('wide');
     ctl.appendChild(input);
   }
@@ -480,10 +466,12 @@ export function control(s, ctx) {
   if (s.rb) ctl.appendChild(note('after restart'));
   /* A string's field shows the pending value itself, so its note says what is
      in force; anything else still shows the value in force, so its note says
-     what is waiting. */
+     what is waiting. A secret's note names neither, or it would show the
+     value the box masks. */
   if (s.pv !== undefined) {
-    ctl.appendChild(note(s.t === 'str' && !s.secret ? `pending, now ${s.v || 'none'}`
-                                                    : `${s.pv} pending`));
+    ctl.appendChild(note(s.secret ? 'pending'
+                         : s.t === 'str' ? `pending, now ${s.v || 'none'}`
+                         : `${s.pv} pending`));
   }
 
   /* -- the device's refine hook, applied once for every type --
@@ -538,7 +526,7 @@ export function control(s, ctx) {
    them. They are attributes of a live input, but a slider's bound labels travel
    with them, and the case that moves a range is a mode change -- a deliberate,
    rare click where a rebuild costs nothing. */
-const SYNCED = new Set(['v', 'set', 'en', 'why', 'hide', 'busy']);
+const SYNCED = new Set(['v', 'en', 'why', 'hide', 'busy']);
 
 function sig(s) {
   const o = {};
