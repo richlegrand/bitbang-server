@@ -186,7 +186,7 @@ export function mount(host, opts = {}) {
      the time of the call rather than when this was built. */
   const ctx = {
     root, base: BASE, inflight, pending,
-    onRev: (r) => { rev = r; },
+    onRev: (r) => { learn(r); },
     onReload: (group) => reload(group),
   };
 
@@ -201,6 +201,32 @@ export function mount(host, opts = {}) {
      setting's value. */
   let rev = null;
 
+  /* Moves each time the revision does -- a write's reply, or an answer newer
+     than the last. A request notes it when it goes out; see stale().
+
+     Answers do not come back in the order they were asked for. A refetch on
+     focus that the device built before a write can land after that write's
+     reply, and absorbing it put the older state back on screen: Wi-Fi's Apply,
+     answered busy, was set not-busy a moment later by a declaration from the
+     revision before. Any setting can do the same -- a value just changed,
+     flipped back to the one before it until the next poll. */
+  let revEpoch = 0;
+
+  /* A revision the device reported. Lower than the last is still taken: a
+     device that restarted counts from zero again, and stale() is what keeps a
+     late answer from doing the same. */
+  function learn(r) {
+    if (rev === null || r > rev) revEpoch++;
+    rev = r;
+  }
+
+  /* An answer older than what is already known, to a request that went out
+     before it was known. The second half is what lets a restarted device back
+     in: everything it says is "older", but it says it to requests made after
+     the panel last learned anything. */
+  const stale = (body, epoch) =>
+    'rev' in body && rev !== null && body.rev < rev && epoch !== revEpoch;
+
   /* Only the settings this panel renders. A setting can name another panel in
      "p" -- log level is "console", a control on the log it changes -- and is
      then that panel's to show. Applied wherever a declaration arrives, not just
@@ -209,12 +235,16 @@ export function mount(host, opts = {}) {
      on every poll. */
   const mine = (list) => list.filter(s => !s.p || s.p === 'settings');
 
+  /* The declaration, or null when the answer is stale -- which a caller treats
+     as nothing to apply, as it does an unchanged poll. */
   async function load(group) {
     const url = group && SRC.startsWith('/') ? SRC + '?g=' + encodeURIComponent(group) : SRC;
+    const epoch = revEpoch;
     const r = await fetch(url);
     if (!r.ok) throw new Error(r.status + ' from ' + url);
     const body = await r.json();
-    if ('rev' in body) rev = body.rev;
+    if (stale(body, epoch)) return null;
+    if ('rev' in body) learn(body.rev);
     return mine(body.settings || []);
   }
 
@@ -225,10 +255,12 @@ export function mount(host, opts = {}) {
      fetch. After that the usual answer is a dozen bytes. */
   async function poll() {
     if (rev === null) return load(null);
+    const epoch = revEpoch;
     const r = await fetch(`${BASE}?rev=${encodeURIComponent(rev)}`);
     if (!r.ok) throw new Error(r.status + ' from ' + SRC);
     const body = await r.json();
-    if ('rev' in body) rev = body.rev;
+    if (stale(body, epoch)) return null;
+    if ('rev' in body) learn(body.rev);
     /* The device sends settings only when they are worth sending. */
     return body.settings ? mine(body.settings) : null;
   }
@@ -348,6 +380,14 @@ export function mount(host, opts = {}) {
     el.className = 'state ' + (cls || '');
   };
 
+  /* The device answered, so an error still under the panel is about a moment
+     that has passed -- the first load failing before the device was up, say.
+     Only an error: a banner saying an export worked is still true. */
+  const answered = () => {
+    const el = root.getElementById('err');
+    if (el.classList.contains('err') && el.textContent) banner('');
+  };
+
   /* The device answers a reset with the re-read declaration, because every
      value on the tab just changed -- so this needs no follow-up fetch. */
   async function resetGroup(group) {
@@ -437,6 +477,8 @@ export function mount(host, opts = {}) {
   async function reload(group) {
     try {
       const part = await load(group);
+      answered();
+      if (part === null) return;               /* stale: something newer is on screen */
       /* Values only, no rebuild -- which is the common case, since a refetch
          usually finds the same firmware declaring the same things. */
       const onScreen = group ? all.filter(s => (s.g || 'Other') === group) : all;
@@ -459,14 +501,24 @@ export function mount(host, opts = {}) {
           fresh.delete(s.k);
           return n;
         });
-        if (fresh.size > 0) { all = await load(null); render(); return; }
+        if (fresh.size > 0) {
+          const whole = await load(null);
+          if (whole !== null) { all = whole; render(); }
+          return;
+        }
         all = merged;
       } else {
         all = part;
       }
       render();
     } catch (e) {
-      root.getElementById('err').textContent = String(e);
+      /* Quiet, as a failed poll is. Every caller is a refresh -- the poll on a
+         live tab, focus, a reload a reply asked for -- and the next tick tries
+         again. It used to write here, where nothing cleared it: a reload that
+         raced Wi-Fi's Apply off the network left "504 from
+         /__bitbang/settings?g=Device" under the panel after the device was
+         back and answering. A device really gone shows at the next control
+         touched; reset and import put their own banner up after this. */
     }
   }
 
@@ -546,6 +598,14 @@ export function mount(host, opts = {}) {
     return all.some(s => (s.g || 'Other') === group && s.live);
   }
 
+  /* One poll at a time. A poll that has not been answered still holds the
+     revision it asked with, so the next one asks with the same number -- and a
+     revision that moved gets the full declaration each time. With a reply stuck
+     behind video for seconds, that was three to six 5.9 KB copies of the same
+     answer queued on the device, each one keeping the next write's reply
+     waiting longer. */
+  let polling = false;
+
   async function tick() {
     if (document.visibilityState !== 'visible') return;
     /* Folded is not merely invisible, it is uninteresting: polling the device
@@ -553,6 +613,8 @@ export function mount(host, opts = {}) {
        competing for. visibilityState cannot see this -- that is the tab's, and
        the tab is perfectly visible. */
     if (fold?.isFolded()) return;
+    if (polling) return;
+    polling = true;
     try {
       if (tabHasLive(current)) {
         /* A real fetch of this tab. reload() absorbs it without replacing nodes
@@ -562,6 +624,7 @@ export function mount(host, opts = {}) {
         return;
       }
       const next = await poll();
+      answered();
       if (!next) return;                       /* revision unmoved */
       if (absorb(all, next)) { syncRows(); return; }
       all = next;
@@ -570,10 +633,22 @@ export function mount(host, opts = {}) {
       /* Quiet on purpose. A failed poll is not worth a red line in the corner of
          a page that is otherwise fine; the next tick tries again, and a device
          that is really gone shows up the moment someone touches a control. */
+    } finally {
+      polling = false;
     }
   }
 
-  setInterval(tick, POLL_MS);
+  /* Sooner while something is busy. An Apply ends on its own, and
+     the control it disabled should come back when it does, not up to a whole
+     interval later -- which is long enough to look stuck. */
+  const BUSY_MS = 1000;
+  let last = 0;
+  setInterval(() => {
+    if (all.some(s => s.busy) || Date.now() - last >= POLL_MS) {
+      last = Date.now();
+      tick();
+    }
+  }, BUSY_MS);
   /* Coming back from hidden, catch up now rather than waiting out the interval. */
   document.addEventListener('visibilitychange', () => {
     if (document.visibilityState === 'visible') tick();

@@ -90,6 +90,10 @@ export const CONTROL_CSS = `
   button.action { cursor:pointer; padding:.35rem .9rem; }
   button.action:hover { border-color:var(--accent); }
   button.danger { border-color:var(--bad); color:var(--bad); }
+  /* Waiting, not unavailable: the work this started is still running. */
+  .ctl.busy, .ctl.busy * { cursor:wait; }
+  /* And everywhere in the panel while anything in it is -- see waiting(). */
+  :host(.bb-waiting), :host(.bb-waiting) * { cursor:wait !important; }
 
   /* A note used to lead with "-- ", which was punctuation doing a job the
      layout was already doing: .ctl's gap separates it and the dim smaller type
@@ -113,6 +117,35 @@ export const CONTROL_CSS = `
   .state.err { color:var(--bad); }
   .state.ok  { color:var(--ok); }
 `;
+
+/* Rows waiting on the device, across every panel on the page.
+
+   The wait cursor was on the busy control alone, which nobody saw: an action
+   with a confirm is pressed through a dialog, and when the dialog closes the
+   pointer is where its OK button was -- nowhere near the row. While an action
+   like Wi-Fi's Apply runs the whole page is waiting on it, so the cursor says
+   so everywhere: on the panel's host, which reaches inside its shadow root,
+   and on the document for the rest of the page.
+
+   Rows rather than a count, so a row rebuilt while busy cannot leave the
+   cursor stuck: one no longer in the document is dropped here. */
+const waitingRows = new Set();
+const WAIT_DOC_CSS = 'html.bb-waiting, html.bb-waiting * { cursor: wait !important; }';
+
+function waiting(row, root, on) {
+  if (on) waitingRows.add(row); else waitingRows.delete(row);
+  for (const r of waitingRows) if (!r.isConnected && r !== row) waitingRows.delete(r);
+
+  if (!document.getElementById('bb-waiting-css')) {
+    const st = document.createElement('style');
+    st.id = 'bb-waiting-css';
+    st.textContent = WAIT_DOC_CSS;
+    document.head.appendChild(st);
+  }
+  const mine = [...waitingRows].some(r => r.getRootNode() === root);
+  root.host?.classList.toggle('bb-waiting', mine);
+  document.documentElement.classList.toggle('bb-waiting', waitingRows.size > 0);
+}
 
 /* Absent `n`, derive from the key: underscores to spaces, first letter up. */
 export const label = s => s.n || (s.k.replace(/_/g, ' ').replace(/^./, c => c.toUpperCase()));
@@ -221,6 +254,7 @@ export function control(s, ctx) {
            knows how to put a value on them; nothing else needs to guess. */
         if (show !== null) show();
         if (j.reload) ctx.onReload?.(typeof j.reload === 'string' ? j.reload : null);
+        return j;
       }
     } catch (e) {
       say(String(e), 'err');
@@ -283,7 +317,41 @@ export function control(s, ctx) {
     b.className = 'action' + (s.confirm ? ' danger' : '');
     b.textContent = label(s);
     l.textContent = '';
-    b.onclick = () => { if (!s.confirm || confirm(s.confirm)) send({ k: s.k }); };
+    /* Busy from the click, so a slow answer cannot be pressed twice. The reply
+       says whether the work outlived it (`busy`, from the device's refine after
+       run); if so the button stays busy until a fetch says otherwise, which the
+       panel makes every second while anything is busy. Any other reply ends it
+       here.
+
+       It used to ask for a reload instead. For Wi-Fi's Apply that fetch went
+       out just before the device left the network, so it always failed. */
+    b.onclick = async () => {
+      if (s.confirm && !confirm(s.confirm)) return;
+      s.busy = true;
+      gate();
+      /* Writes first. A text field sends on change, which fires as it loses
+         focus -- to this button, on the press that clicks it. So a password
+         typed and then Apply goes out as two requests at once, and Apply
+         landing first applies without the password, or finds nothing staged.
+         The field's write has started by now (send marks it in flight before
+         its first await), so waiting for the map to empty is waiting for it. */
+      while (ctx.inflight.size || ctx.pending.size) {
+        await new Promise(r => setTimeout(r, 50));
+      }
+      const j = await send({ k: s.k });
+      if (j?.busy) {
+        /* Set here, not assumed still set from the click. The click's busy is
+           the page's guess, made before the device has heard of the press, and
+           a refetch answered before it ran is right to say not busy. This reply
+           is the device saying it is -- the first word on that that counts. */
+        s.busy = true;
+        s.en = false;
+        if (j.why) s.why = j.why;
+      } else {
+        delete s.busy;
+      }
+      gate();
+    };
     ctl.appendChild(b);
   } else if (s.t === 'bool') {
     input = document.createElement('input');
@@ -377,10 +445,16 @@ export function control(s, ctx) {
     input.type = s.secret ? 'password' : 'text';
     if (s.maxlen) input.maxLength = s.maxlen;
     const place = () => (s.set ? 'set -- leave blank to keep' : 'not set');
+    /* The pending value when there is one: it is what was typed, and the field
+       is where someone looks for it. Showing the value in force instead put the
+       old Wi-Fi network back in the box a moment after the new one was typed,
+       and kept it there until Apply had finished and the page reconnected. The
+       value in force goes in the note beside it. */
+    const shown = () => s.pv ?? s.v ?? '';
     if (s.secret) {
       input.placeholder = place();
     } else {
-      input.value = s.v ?? '';
+      input.value = shown();
     }
     input.onchange = () => {
       if (s.secret && input.value === '') return;
@@ -390,7 +464,7 @@ export function control(s, ctx) {
        a half-typed credential is why sync() checks activeElement. */
     show = () => {
       if (s.secret) input.placeholder = place();
-      else input.value = s.v ?? '';
+      else input.value = shown();
     };
     ctl.classList.add('wide');
     ctl.appendChild(input);
@@ -404,7 +478,13 @@ export function control(s, ctx) {
   }
   /* At the row, not in a banner. */
   if (s.rb) ctl.appendChild(note('after restart'));
-  if (s.pv !== undefined) ctl.appendChild(note(`${s.pv} pending`));
+  /* A string's field shows the pending value itself, so its note says what is
+     in force; anything else still shows the value in force, so its note says
+     what is waiting. */
+  if (s.pv !== undefined) {
+    ctl.appendChild(note(s.t === 'str' && !s.secret ? `pending, now ${s.v || 'none'}`
+                                                    : `${s.pv} pending`));
+  }
 
   /* -- the device's refine hook, applied once for every type --
 
@@ -419,8 +499,10 @@ export function control(s, ctx) {
      rather than silence. */
   const why = note('');
   const gate = () => {
-    const off = s.en === false;
+    const off = s.en === false || !!s.busy;
     for (const el of ctl.querySelectorAll('input,select,button')) el.disabled = off;
+    ctl.classList.toggle('busy', !!s.busy);
+    waiting(div, ctx.root, !!s.busy);
     why.textContent = off && s.why ? s.why : '';
     /* Hidden is the stronger form and the device has to ask for it by name.
        Greying is preferred: a control that vanishes leaves someone hunting for
@@ -456,7 +538,7 @@ export function control(s, ctx) {
    them. They are attributes of a live input, but a slider's bound labels travel
    with them, and the case that moves a range is a mode change -- a deliberate,
    rare click where a rebuild costs nothing. */
-const SYNCED = new Set(['v', 'set', 'en', 'why', 'hide']);
+const SYNCED = new Set(['v', 'set', 'en', 'why', 'hide', 'busy']);
 
 function sig(s) {
   const o = {};

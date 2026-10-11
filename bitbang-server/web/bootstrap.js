@@ -1158,6 +1158,11 @@ class BitBangConnection {
                 this.pendingRequests.delete(streamId);
                 responsePort.postMessage({ type: 'proxy_error', message: 'Request timeout' });
             }, 30000);
+            /* Kept on the entry too, which is the one other code clears: it
+               held the first timer's id for good, so after a reset, clearing
+               req.timeout cleared a timer that had already been replaced. */
+            const req = this.pendingRequests.get(streamId);
+            if (req) req.timeout = timeout;
         };
         resetTimeout();
 
@@ -2248,6 +2253,24 @@ class BitBangConnection {
             s.iframe.postMessage({ type: 'ws_closed', streamId, code: 1006, reason: '' }, '*');
         }
         this.wsStreams.clear();
+
+        // The same for requests, which this left out -- though the comment on
+        // their timeout in handleProxyRequest counted on "data channel close"
+        // to end them. One sent on the channel just closed can never be
+        // answered, and waited out its own 30 s timeout instead. A settings
+        // poll sent as Wi-Fi's Apply took the device off the network held the
+        // panel's polling that long, since the panel waits for its outstanding
+        // poll before sending another: the page had reconnected, and still
+        // showed the device busy for 14 s more (2026-10-10). Ended here, the
+        // caller hears at once and its next request goes out on the new
+        // channel.
+        for (const [, req] of this.pendingRequests) {
+            clearTimeout(req.timeout);
+            try { req.responsePort.postMessage({ type: 'proxy_error', message: 'Connection lost' }); } catch (e) {}
+            // An upload says so on its own channel as well, as failUpload does.
+            if (req.isUpload) this.progressChannel?.postMessage({ type: 'uploadFailed' });
+        }
+        this.pendingRequests.clear();
     }
 
     // The text is a parameter because this strip says two things: that the
