@@ -1308,9 +1308,16 @@ async function proxyToDevice(event) {
 
                 // Detect HTML navigation responses for shim injection
                 const ct = headers?.['Content-Type'] || headers?.['content-type'] || '';
-                const isNav = event.request?.mode === 'navigate'
+                // A download is a navigation too, so without this a saved
+                // .html file would come out with our script tags in front of
+                // it. The CLI's file browser hands its downloads to the
+                // browser this way, and other devices' apps can do the same.
+                const disposition = headers?.['Content-Disposition']
+                    || headers?.['content-disposition'] || '';
+                const isAttachment = /^\s*attachment\b/i.test(disposition);
+                const isNav = !isAttachment && (event.request?.mode === 'navigate'
                     || event.request?.destination === 'document'
-                    || event._isNavigate;
+                    || event._isNavigate);
 
                 const stream = new ReadableStream({
                     start(controller) {
