@@ -295,6 +295,11 @@ const RECONNECT_MAX_BACKOFF_MS = 10000;     // cap on the delay between attempts
 const RECONNECT_TIMEOUT_MS = 20000;  // per attempt: WS + offer + DC verify + ready
 const RECONNECT_SETTLE_MS = 2000;    // after offline→online, let the network settle
 
+// How often to tell the service worker it is busy while a proxied request is
+// open (keepWorkerAlive). sw.js holds itself for KEEPALIVE_HOLD_MS (25s) per
+// keepalive, so this has to come round well inside that.
+const SW_KEEPALIVE_MS = 10000;
+
 // What the top strip says when the device has reset and the page is reloading
 // because of it. Shown before the reload and again on the reloaded page until
 // it has a connection, so it is one message that stays up across the reload
@@ -478,6 +483,11 @@ class BitBangConnection {
         this.streamNameMap = {};      // from offer: { "0": "webcam", ... }
         this.resolvedStreams = {};    // name -> MediaStream
         this.pendingRequests = new Map();  // streamId -> request state
+        this.workerKeptAliveAt = 0;   // last keepalive sent (keepWorkerAlive)
+        // Backstop for keepWorkerAlive, which otherwise runs on arriving
+        // frames: an upload sends and receives nothing until it finishes, and
+        // a stalled response receives nothing either.
+        setInterval(() => this.keepWorkerAlive(), SW_KEEPALIVE_MS);
         this.connectResolve = null;   // resolved when device sends 'ready'
         this.nextStreamId = 1;        // streamId 0 is reserved for control
         this.wsStreams = new Map();    // streamId -> { iframe } for WebSocket bridging
@@ -1120,6 +1130,32 @@ class BitBangConnection {
         });
 
         await navigator.serviceWorker.ready;
+    }
+
+    // Tell the service worker it is still busy, at most every SW_KEEPALIVE_MS
+    // and only while a proxied request is open.
+    //
+    // The worker streams every proxied response, but its bytes come from here
+    // over a MessagePort, and the browser does not count port traffic as the
+    // worker doing anything. Firefox stopped one inside 45s of quiet, and the
+    // response did not fail -- it ended short, as if complete. Chromium kept
+    // it alive through 330s (measured 2026-10-18), but nothing promises that.
+    // A posted message is an event, which is the one thing that counts.
+    //
+    // Called on every arriving frame rather than only from a timer, because a
+    // download usually runs in a tab nobody is looking at, and a hidden tab's
+    // timers can be held to one wake-up a minute; frames are not throttled.
+    // The constructor's interval covers a request with no frames arriving.
+    keepWorkerAlive() {
+        if (this.pendingRequests.size === 0) return;
+        const now = Date.now();
+        if (now - this.workerKeptAliveAt < SW_KEEPALIVE_MS) return;
+        this.workerKeptAliveAt = now;
+        // The registration's worker rather than .controller, which Chrome can
+        // drop from a page that is still very much alive (see proxyToDevice).
+        navigator.serviceWorker.ready
+            .then((reg) => reg.active?.postMessage({ type: 'keepalive' }))
+            .catch(() => {});
     }
 
     handleProxyRequest(data, responsePort) {
@@ -2328,6 +2364,7 @@ class BitBangConnection {
                 console.log('Received frame for unknown stream:', frame.streamId);
                 return;
             }
+            this.keepWorkerAlive();
 
             if (frame.flags & FLAG_SYN) {
                 // Metadata frame - send headers to SW, it will create the stream

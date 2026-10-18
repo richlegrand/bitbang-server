@@ -158,12 +158,33 @@ function rememberClientSession(event, sessionId) {
 //   get_cookies      ws-shim.js      { sessionId, path }; reply on port:
 //                                      { cookies } (no type)
 //   cookie_write     xhr-shim.js     { sessionId, value }
+//   keepalive        bootstrap.js    {}, while a proxied request is open
 //
 // And the other direction, worker -> bootstrap.js, for each request it
 // proxies (proxyToDevice): proxy_request, then on that request's own port
 // upload_chunk / upload_end from the worker, and proxy_headers,
 // proxy_chunk, proxy_end or proxy_error back from bootstrap.js.
+
+// How long one keepalive holds the worker. bootstrap.js sends one at most
+// every 10s while data is moving (SW_KEEPALIVE_MS there), so 25s leaves room
+// for a late one -- a hidden tab's timers can run late -- while staying well
+// under Chrome's 5-minute cap on any single event.
+const KEEPALIVE_HOLD_MS = 25000;
+
 self.addEventListener('message', async (event) => {
+    // bootstrap.js sends this every SW_KEEPALIVE_MS while it has a request
+    // open. A response this worker streams is fed over a MessagePort, and
+    // port traffic is not an event: nothing else tells the browser the
+    // worker is busy. Firefox stops it inside 45s of quiet and the response
+    // ends short, as if complete (keepWorkerAlive in bootstrap.js has the
+    // measurements). Each keepalive holds the worker a little longer than
+    // the gap to the next, so the holds overlap. Before any await: waitUntil
+    // is only accepted while the event is being dispatched.
+    if (event.data?.type === 'keepalive') {
+        event.waitUntil(new Promise(r => setTimeout(r, KEEPALIVE_HOLD_MS)));
+        return;
+    }
+
     // Answered on the port the page supplied, so it works before we
     // control the page (a claim may not have landed yet).
     if (event.data?.type === 'get_build') {
