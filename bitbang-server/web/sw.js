@@ -162,14 +162,32 @@ function rememberClientSession(event, sessionId) {
 //
 // And the other direction, worker -> bootstrap.js, for each request it
 // proxies (proxyToDevice): proxy_request, then on that request's own port
-// upload_chunk / upload_end from the worker, and proxy_headers,
-// proxy_chunk, proxy_end or proxy_error back from bootstrap.js.
+// upload_chunk / upload_end, proxy_consumed { bytes } and proxy_cancel from
+// the worker, and proxy_headers, proxy_chunk, proxy_end, proxy_error and
+// upload_credit { max } back from bootstrap.js.
 
 // How long one keepalive holds the worker. bootstrap.js sends one at most
 // every 10s while data is moving (SW_KEEPALIVE_MS there), so 25s leaves room
 // for a late one -- a hidden tab's timers can run late -- while staying well
 // under Chrome's 5-minute cap on any single event.
 const KEEPALIVE_HOLD_MS = 25000;
+
+// Flow between this worker and bootstrap.js, per proxied request (see
+// proxyToDevice).
+//
+// UPLOAD_CREDIT: how much of a request body may be handed over beyond what
+// bootstrap.js has sent on. bootstrap.js has the same constant and raises the
+// limit with upload_credit.
+//
+// CONSUMED_REPORT_BYTES: how much of a response the reader takes before it is
+// reported back as consumed. bootstrap.js returns credit to the device a half
+// window (512 KiB) at a time, so this only has to be well under that.
+//
+// BUFFERED_BODY_PIECE: the size a body that had to be read whole (no
+// Request.body: Firefox) is handed over in.
+const UPLOAD_CREDIT = 1 << 20;
+const CONSUMED_REPORT_BYTES = 64 * 1024;
+const BUFFERED_BODY_PIECE = 256 * 1024;
 
 self.addEventListener('message', async (event) => {
     // bootstrap.js sends this every SW_KEEPALIVE_MS while it has a request
@@ -1209,32 +1227,25 @@ async function proxyToDevice(event) {
         contentLength
     }, [channel.port2]);
 
-    // -- Stream request body (if any) --
-    if (hasBody) {
-        if (bufferedBody !== null) {
-            if (bufferedBody.byteLength > 0) {
-                // bootstrap.js splits this into MAX_CHUNK frames and applies
-                // backpressure, so one message is fine however large it is.
-                channel.port1.postMessage(
-                    { type: 'upload_chunk', data: bufferedBody }, [bufferedBody.buffer]);
-            }
-        } else if (event.request.body) {
-            const reader = event.request.body.getReader();
-            try {
-                while (true) {
-                    const { done, value } = await reader.read();
-                    if (done) break;
-                    channel.port1.postMessage({ type: 'upload_chunk', data: value }, [value.buffer]);
-                }
-            } finally {
-                reader.releaseLock();
-            }
-        }
-        channel.port1.postMessage({ type: 'upload_end' });
-    }
+    // How much of the body this worker may hand over beyond what bootstrap.js
+    // has put on the data channel. It starts at UPLOAD_CREDIT and bootstrap.js
+    // raises it (upload_credit) as pieces go out. Before, the whole body was
+    // read as fast as it could be and queued in bootstrap.js, so an upload
+    // over a slow link sat in the tab's memory.
+    const upload = { allowed: UPLOAD_CREDIT, sent: 0, wake: null, stopped: false, reader: null };
+    const wakeUpload = () => { const w = upload.wake; upload.wake = null; w?.(); };
+    const stopUpload = () => {
+        upload.stopped = true;
+        wakeUpload();
+        upload.reader?.cancel().catch(() => {});
+    };
 
     // -- Stream response back to browser --
-    return new Promise((resolve) => {
+    //
+    // The handler goes on the port before the body is sent, so an answer the
+    // device gives while the upload is still going -- a 413, a reset -- is
+    // acted on rather than queued behind a loop that only ends with the body.
+    const response = new Promise((resolve) => {
         let streamController;
         let resolved = false;
         let timeout;
@@ -1246,8 +1257,58 @@ async function proxyToDevice(event) {
             }, 30000);
         }
 
+        // The response body is pulled, not pushed. Chunks wait here until the
+        // reader asks for one, and each one handed over is reported back as
+        // consumed, which is the credit a v4 session returns to the device.
+        // So a reader that stops -- a paused download, a slow disk, a page
+        // that reads at its own pace -- stops the device instead of filling
+        // this worker. Before, every chunk was enqueued the moment it came,
+        // and the stream's queue held whatever the reader had not taken.
+        const pending = [];      // arrived, not yet taken by the reader
+        let ended = false;       // proxy_end arrived
+        let waiting = null;      // resolves the reader's outstanding pull
+        let unreported = 0;      // consumed bytes not yet reported
+        const report = (now) => {
+            if (unreported > 0 && (now || unreported >= CONSUMED_REPORT_BYTES)) {
+                channel.port1.postMessage({ type: 'proxy_consumed', bytes: unreported });
+                unreported = 0;
+            }
+        };
+        // Hand the reader one chunk if there is one, or close if that was
+        // all of them. Reported at once when nothing is left behind it, so
+        // the last credit before a lull is never held back.
+        const give = (controller) => {
+            if (pending.length > 0) {
+                const chunk = pending.shift();
+                controller.enqueue(chunk);
+                unreported += chunk.byteLength;
+                report(pending.length === 0);
+                return true;
+            }
+            if (ended) {
+                try { controller.close(); } catch (e) {}
+                return true;
+            }
+            return false;
+        };
+        const answerPull = () => {
+            if (waiting && streamController && give(streamController)) {
+                const w = waiting;
+                waiting = null;
+                w();
+            }
+        };
+
         channel.port1.onmessage = (msg) => {
             const { type, status, headers, data, message } = msg.data;
+
+            if (type === 'upload_credit') {
+                if (msg.data.max > upload.allowed) {
+                    upload.allowed = msg.data.max;
+                    wakeUpload();
+                }
+                return;
+            }
 
             if (type === 'proxy_headers') {
                 if (timeout) clearTimeout(timeout);
@@ -1393,8 +1454,22 @@ async function proxyToDevice(event) {
                             // settings-panel.js already had the first one.
                             controller.enqueue(new TextEncoder().encode(shims));
                         }
-                    }
-                });
+                    },
+                    // Called when the reader wants a chunk -- with a high-
+                    // water mark of 0, only then. Waits for one to arrive if
+                    // none is here yet.
+                    pull(controller) {
+                        if (give(controller)) return;
+                        return new Promise((r) => { waiting = r; });
+                    },
+                    // The reader is gone: a download cancelled in the browser,
+                    // a media element done with a range. bootstrap.js stops the
+                    // device sending the rest (in a v4 session; v3 cannot).
+                    cancel() {
+                        pending.length = 0;
+                        channel.port1.postMessage({ type: 'proxy_cancel' });
+                    },
+                }, { highWaterMark: 0 });
 
                 // CORS headers for fonts with crossorigin attributes
                 if (!headers['access-control-allow-origin']) {
@@ -1405,11 +1480,16 @@ async function proxyToDevice(event) {
                 const nullBodyStatus = (status === 204 || status === 304);
                 resolve(new Response(nullBodyStatus ? null : stream, { status, headers }));
             } else if (type === 'proxy_chunk') {
-                try { streamController?.enqueue(data); } catch (e) {}
+                pending.push(data);
+                answerPull();
             } else if (type === 'proxy_end') {
-                try { streamController?.close(); } catch (e) {}
+                ended = true;
+                answerPull();
             } else if (type === 'proxy_error') {
                 if (timeout) clearTimeout(timeout);
+                stopUpload();
+                pending.length = 0;
+                if (waiting) { const w = waiting; waiting = null; w(); }
                 if (!resolved) {
                     resolve(new Response(`BitBang: ${message}`, { status: 500 }));
                 } else {
@@ -1418,4 +1498,45 @@ async function proxyToDevice(event) {
             }
         };
     });
+
+    // -- Stream request body (if any) --
+    if (hasBody) {
+        // Hand over one piece once the credit allows; false if the upload
+        // was stopped (the device refused it, or the channel went) while
+        // waiting.
+        const post = async (piece) => {
+            while (!upload.stopped && upload.sent >= upload.allowed) {
+                await new Promise((r) => { upload.wake = r; });
+            }
+            if (upload.stopped) return false;
+            upload.sent += piece.byteLength;
+            channel.port1.postMessage({ type: 'upload_chunk', data: piece }, [piece.buffer]);
+            return true;
+        };
+        if (bufferedBody !== null) {
+            // Already all in memory (no Request.body here), so slicing it buys
+            // nothing in this worker -- but it keeps bootstrap.js to the same
+            // credit as a streamed body. Copies, since each is transferred.
+            for (let off = 0; off < bufferedBody.byteLength; off += BUFFERED_BODY_PIECE) {
+                if (!(await post(bufferedBody.slice(off, off + BUFFERED_BODY_PIECE)))) break;
+            }
+        } else if (event.request.body) {
+            const reader = event.request.body.getReader();
+            upload.reader = reader;
+            try {
+                while (!upload.stopped) {
+                    const { done, value } = await reader.read();
+                    if (done) break;
+                    if (!(await post(value))) break;
+                }
+            } catch (e) {
+                // Cancelled by stopUpload, or the page went away.
+            } finally {
+                try { reader.releaseLock(); } catch (e) {}
+            }
+        }
+        if (!upload.stopped) channel.port1.postMessage({ type: 'upload_end' });
+    }
+
+    return response;
 }

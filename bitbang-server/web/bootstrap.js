@@ -239,6 +239,20 @@ const FLAG_FIN = 0x0004;
 const FLAG_DAT = 0x0000;
 const FLAG_MORE = 0x0002;  // non-final fragment of a chunked WS message
 
+// The SWSP version offered in `connect`. v4 is per-stream flow control
+// (~/bitbang/swsp.md section 6): each stream may have 1 MiB in flight in
+// each direction, and the receiver raises that with window_update as it
+// consumes. A listener that speaks less negotiates down, and the session
+// runs exactly as v3 did. The window and threshold are the Go side's
+// (internal/protocol/swsp.go) and are protocol constants, not tuning.
+const SWSP_VERSION = 4;
+const STREAM_WINDOW = 1 << 20;
+const STREAM_WINDOW_UPDATE_AT = STREAM_WINDOW / 2;
+// What the service worker may hand over of a request body beyond what has
+// gone onto the data channel. Both sides start with it implicitly; sw.js
+// has the matching constant.
+const UPLOAD_CREDIT = 1 << 20;
+
 // Stream chunk header, little-endian:
 //
 //    0  u32  frame id      monotonic per stream, never reused
@@ -436,6 +450,75 @@ async function sha256Base64(bytes) {
     return bytesToBase64(new Uint8Array(hash));
 }
 
+// One stream's SWSP v4 credit, both directions. Cumulative counts, as on the
+// wire: a window_update names the total the peer may send, so a duplicate or
+// late one is a no-op rather than extra credit. The Go connector's stream
+// (internal/client/session.go) keeps the same numbers.
+class StreamCredit {
+    constructor() {
+        this.sendLimit = STREAM_WINDOW;  // the SYN opens both directions
+        this.sent = 0;
+        this.receiveLimit = STREAM_WINDOW;
+        this.received = 0;
+        this.consumed = 0;
+        this.lastUpdate = 0;
+        this.overrun = false;            // logged once, see arrived()
+        this.closed = false;
+        this.waiters = [];               // senders waiting for credit
+    }
+
+    // Resolves true once `bytes` may be sent, false if the stream ended first.
+    // Free frames (SYN, empty FIN) never wait.
+    async reserve(bytes) {
+        while (!this.closed && this.sent + bytes > this.sendLimit) {
+            await new Promise(r => this.waiters.push(r));
+        }
+        if (this.closed) return false;
+        this.sent += bytes;
+        return true;
+    }
+
+    raiseSendLimit(max) {
+        if (max <= this.sendLimit) return;
+        this.sendLimit = max;
+        this._wake();
+    }
+
+    close() {
+        this.closed = true;
+        this._wake();
+    }
+
+    _wake() {
+        const w = this.waiters;
+        this.waiters = [];
+        for (const r of w) r();
+    }
+
+    // Bytes arrived. A peer sending past what it was granted is a protocol
+    // violation, and the Go side resets the stream for it; here it is logged
+    // and the data kept, since dropping it would corrupt the stream and every
+    // peer that implements v4 stays inside the window anyway.
+    arrived(bytes, streamId) {
+        this.received += bytes;
+        if (this.received > this.receiveLimit && !this.overrun) {
+            this.overrun = true;
+            console.warn(`[Bootstrap] stream ${streamId}: peer sent past its window ` +
+                `(${this.received} > ${this.receiveLimit})`);
+        }
+    }
+
+    // Bytes consumed. Returns the new receive limit to announce, or 0 when
+    // the last announcement still has half a window to run.
+    consume(bytes) {
+        this.consumed += bytes;
+        if (this.consumed - this.lastUpdate < STREAM_WINDOW_UPDATE_AT) return 0;
+        this.lastUpdate = this.consumed;
+        this.receiveLimit = this.consumed + STREAM_WINDOW;
+        return this.receiveLimit;
+    }
+}
+
 // Buffer ICE candidates that arrive (or are produced) before the remote
 // description is set, then drain them in arrival order. Used by both the
 // direct (BitBangConnection) and pair (PairingFlow) handshakes — the
@@ -483,6 +566,8 @@ class BitBangConnection {
         this.streamNameMap = {};      // from offer: { "0": "webcam", ... }
         this.resolvedStreams = {};    // name -> MediaStream
         this.pendingRequests = new Map();  // streamId -> request state
+        this.negotiatedVersion = 0;   // SWSP version of this transport, from 'ready'
+        this.streamCredit = new Map(); // streamId -> StreamCredit, v4 sessions only
         this.workerKeptAliveAt = 0;   // last keepalive sent (keepWorkerAlive)
         // Backstop for keepWorkerAlive, which otherwise runs on arriving
         // frames: an upload sends and receives nothing until it finishes, and
@@ -858,6 +943,7 @@ class BitBangConnection {
             seen: 0,
         };
         this.benchStreams.set(streamId, this.benchVideo);
+        this.openCredit(streamId);
         this.dataChannel.send(this.createFrame(streamId, FLAG_SYN, JSON.stringify({ bench: true })));
         console.log(`[bench] run started on stream ${streamId}`);
         this.pollIceDuringBench(streamId);
@@ -1158,6 +1244,121 @@ class BitBangConnection {
             .catch(() => {});
     }
 
+    // Send frames on a WebSocket-style stream, behind whatever it is already
+    // sending. ws.send() returns at once, so in a v4 session one send can be
+    // waiting for credit while the page sends the next; the chain keeps them
+    // in order, and a close behind the data before it. What waits here is
+    // what a real WebSocket would count in bufferedAmount.
+    queueOnStream(ws, streamId, frames) {
+        ws.sendChain = (ws.sendChain || Promise.resolve()).then(async () => {
+            for (const [flags, payload] of frames) {
+                if (!(await this.sendOnStream(streamId, flags, payload))) return;
+            }
+        });
+        return ws.sendChain;
+    }
+
+    // -- SWSP v4 flow control ----------------------------------------------
+    //
+    // Before v4 nothing told the device to slow down for a browser: every
+    // frame was handed on the moment it arrived, so whatever the final reader
+    // could not keep up with piled up in this tab -- a whole file, for the
+    // download that prompted this. In a v4 session every stream has credit
+    // in each direction (StreamCredit), granted back as the bytes are
+    // consumed, so a slow reader slows the device instead.
+    //
+    // Gated on the session, not on the stream type: a listener that
+    // negotiated v4 enforces its receive window on every stream and resets
+    // one that overruns it, so every send has to go through sendOnStream. A
+    // v2/v3 session -- Python, ESP32, Go before 0.5.0 -- skips all of this.
+
+    get flowControl() { return this.negotiatedVersion >= 4; }
+
+    // Start a stream's credit. Called as its SYN goes out: the SYN is what
+    // opens the initial window in both directions.
+    openCredit(streamId) {
+        if (this.flowControl) this.streamCredit.set(streamId, new StreamCredit());
+    }
+
+    // Send a frame once the stream's credit allows it. Resolves false if the
+    // stream or the channel ended first, so a caller knows to stop.
+    async sendOnStream(streamId, flags, payload) {
+        if (this.flowControl) {
+            const credit = this.streamCredit.get(streamId);
+            if (!credit) return false;
+            const bytes = (flags & FLAG_SYN) ? 0 : payload.byteLength;
+            if (bytes > 0 && !(await credit.reserve(bytes))) return false;
+        }
+        if (this.dataChannel?.readyState !== 'open') return false;
+        this.dataChannel.send(this.createFrame(streamId, flags, payload));
+        return true;
+    }
+
+    // A frame arrived. consumedNow says whether delivering it was consuming
+    // it: true for a stream whose reader cannot be slowed (a WebSocket's
+    // onmessage), false for an http response, whose bytes count only once
+    // the worker reports the reader took them (onConsumed).
+    onArrived(frame, consumedNow) {
+        if (frame.flags & FLAG_SYN) return;
+        const credit = this.streamCredit.get(frame.streamId);
+        if (!credit) return;
+        credit.arrived(frame.payload.byteLength, frame.streamId);
+        if (consumedNow) this.onConsumed(frame.streamId, frame.payload.byteLength);
+    }
+
+    onConsumed(streamId, bytes) {
+        const credit = this.streamCredit.get(streamId);
+        if (!credit || credit.closed || bytes <= 0) return;
+        const max = credit.consume(bytes);
+        if (max) this.sendControl({ type: 'window_update', stream_id: streamId, max_bytes: max });
+    }
+
+    // Forget a stream's credit, releasing anything waiting on it.
+    dropCredit(streamId) {
+        const credit = this.streamCredit.get(streamId);
+        if (!credit) return;
+        credit.close();
+        this.streamCredit.delete(streamId);
+    }
+
+    // End a stream in both directions, for when its reader has gone: a
+    // cancelled download, a request that timed out. Without it the device
+    // would keep sending a stream nobody reads until its credit ran out, and
+    // hold it open after. v2/v3 have no way to say this.
+    resetStream(streamId, code, message) {
+        if (!this.flowControl) return;
+        this.dropCredit(streamId);
+        this.sendControl({ type: 'stream_reset', stream_id: streamId, code, message });
+    }
+
+    sendControl(msg) {
+        if (this.dataChannel?.readyState !== 'open') return;
+        this.dataChannel.send(this.createFrame(0, FLAG_SYN, JSON.stringify(msg)));
+    }
+
+    // The device ended one stream -- its target went away, or this side
+    // broke the stream's rules. Everything else on the session continues.
+    onStreamReset(msg) {
+        const streamId = msg.stream_id;
+        const why = msg.message || msg.code || 'stream reset by device';
+        console.warn(`[Bootstrap] stream ${streamId} reset by device: ${why}`);
+        this.dropCredit(streamId);
+
+        const req = this.pendingRequests.get(streamId);
+        if (req) {
+            clearTimeout(req.timeout);
+            this.pendingRequests.delete(streamId);
+            req.responsePort.postMessage({ type: 'proxy_error', message: why });
+            if (req.isUpload) this.progressChannel.postMessage({ type: 'uploadFailed' });
+        }
+        const ws = this.wsStreams.get(streamId);
+        if (ws) {
+            this.wsStreams.delete(streamId);
+            ws.iframe.postMessage({ type: 'ws_closed', streamId, code: 1011, reason: why }, '*');
+        }
+        this.benchStreams.delete(streamId);
+    }
+
     handleProxyRequest(data, responsePort) {
         const { method, url, headers, hasBody, contentLength } = data;
         if (this.debug) console.log(`[Bootstrap] Received proxy request: ${method} ${new URL(url).pathname}, DC state: ${this.dataChannel?.readyState}`);
@@ -1186,12 +1387,14 @@ class BitBangConnection {
         // Initial 30s timeout to catch "device not responding". Cleared once
         // response headers arrive (SYN). After that we rely on FIN / data
         // channel close to signal end -- inactivity is normal during streaming
-        // when the consumer (e.g. video player) backpressures the channel.
+        // when the consumer (e.g. video player) backpressures the channel,
+        // which in a v4 session it really does.
         let timeout;
         const resetTimeout = () => {
             clearTimeout(timeout);
             timeout = setTimeout(() => {
                 this.pendingRequests.delete(streamId);
+                this.resetStream(streamId, 'timeout', 'no response within 30s');
                 responsePort.postMessage({ type: 'proxy_error', message: 'Request timeout' });
             }, 30000);
             /* Kept on the entry too, which is the one other code clears: it
@@ -1224,12 +1427,31 @@ class BitBangConnection {
             }
         }
 
+        // Besides the upload, the worker's end of this request's port says
+        // how much of the response its reader has taken (proxy_consumed),
+        // which is the credit a v4 session grants back, and that the reader
+        // has gone (proxy_cancel).
+        let onUpload = null;  // set below for a request with a body
+        responsePort.onmessage = (event) => {
+            const msg = event.data;
+            if (msg.type === 'proxy_consumed') {
+                this.onConsumed(streamId, msg.bytes);
+            } else if (msg.type === 'proxy_cancel') {
+                this.cancelRequest(streamId);
+            } else if (onUpload) {
+                onUpload(msg);
+            }
+        };
+
+        this.openCredit(streamId);
+
         if (hasBody) {
             // Send SYN frame with metadata, then stream body chunks as they arrive
             const synFrame = this.createFrame(streamId, FLAG_SYN, JSON.stringify(requestMeta));
             try {
                 this.dataChannel.send(synFrame);
             } catch (e) {
+                this.dropCredit(streamId);
                 responsePort.postMessage({ type: 'proxy_error', message: 'Failed to start upload' });
                 this.progressChannel.postMessage({ type: 'uploadFailed' });
                 return;
@@ -1239,8 +1461,13 @@ class BitBangConnection {
             let bytesSent = 0;
             let lastProgress = 0;
             let processingChain = Promise.resolve();
+            let failed = false;
 
+            // Once: the chunks queued behind the one that failed would each
+            // say so again.
             const failUpload = (msg) => {
+                if (failed) return;
+                failed = true;
                 this.pendingRequests.delete(streamId);
                 responsePort.postMessage({ type: 'proxy_error', message: msg });
                 this.progressChannel.postMessage({ type: 'uploadFailed' });
@@ -1248,12 +1475,13 @@ class BitBangConnection {
 
             const isOpen = () => this.dataChannel?.readyState === 'open';
 
-            responsePort.onmessage = (event) => {
+            onUpload = (msg) => {
                 processingChain = processingChain.then(async () => {
+                    if (failed) return;
                     if (!isOpen()) return failUpload('Connection lost');
 
-                    if (event.data.type === 'upload_chunk') {
-                        const data = event.data.data;
+                    if (msg.type === 'upload_chunk') {
+                        const data = msg.data;
 
                         for (let i = 0; i < data.byteLength; i += MAX_CHUNK) {
                             // Backpressure: wait while buffer is full
@@ -1262,11 +1490,23 @@ class BitBangConnection {
                             }
                             if (!isOpen()) return failUpload('Connection lost');
 
+                            // And in a v4 session for the device's credit,
+                            // which is what a slow target looks like from
+                            // here. False means the stream ended meanwhile:
+                            // the device reset it, or the channel went.
                             const chunk = data.subarray(i, Math.min(i + MAX_CHUNK, data.byteLength));
-                            this.dataChannel.send(this.createFrame(streamId, FLAG_DAT, chunk));
+                            if (!(await this.sendOnStream(streamId, FLAG_DAT, chunk))) {
+                                return failUpload(isOpen() ? 'Upload stopped by device' : 'Connection lost');
+                            }
                         }
 
                         bytesSent += data.byteLength;
+                        // Let the worker hand over more. Without this it read
+                        // the whole body as fast as it could and every chunk
+                        // queued here, so an upload over a slow link sat in
+                        // the tab's memory -- for every listener, v4 or not.
+                        responsePort.postMessage({ type: 'upload_credit', max: bytesSent + UPLOAD_CREDIT });
+
                         const now = Date.now();
                         if (now - lastProgress > 100) {
                             lastProgress = now;
@@ -1276,10 +1516,10 @@ class BitBangConnection {
                             });
                         }
 
-                    } else if (event.data.type === 'upload_end') {
+                    } else if (msg.type === 'upload_end') {
                         if (!isOpen()) return failUpload('Connection lost');
                         this.progressChannel.postMessage({ type: 'uploadComplete' });
-                        this.dataChannel.send(this.createFrame(streamId, FLAG_FIN, new Uint8Array(0)));
+                        await this.sendOnStream(streamId, FLAG_FIN, new Uint8Array(0));
                     }
                 });
             };
@@ -1287,6 +1527,22 @@ class BitBangConnection {
             // No body - send SYN|FIN together
             const frame = this.createFrame(streamId, FLAG_SYN | FLAG_FIN, JSON.stringify(requestMeta));
             this.dataChannel.send(frame);
+        }
+    }
+
+    // The response's reader went away: a download cancelled in the browser,
+    // a media element that has what it needs. A v4 session tells the device,
+    // which stops reading its target; v2/v3 cannot, so the rest of the
+    // response is dropped as it arrives instead of being handed to nobody.
+    cancelRequest(streamId) {
+        const req = this.pendingRequests.get(streamId);
+        if (!req) return;
+        clearTimeout(req.timeout);
+        if (this.flowControl) {
+            this.pendingRequests.delete(streamId);
+            this.resetStream(streamId, 'cancelled', 'the reader went away');
+        } else {
+            req.cancelled = true;
         }
     }
 
@@ -2307,6 +2563,13 @@ class BitBangConnection {
             if (req.isUpload) this.progressChannel?.postMessage({ type: 'uploadFailed' });
         }
         this.pendingRequests.clear();
+
+        // Credit belongs to the channel it was granted on. Senders still
+        // waiting for some are released, and see the stream as ended; the
+        // next transport negotiates its version afresh.
+        for (const [, credit] of this.streamCredit) credit.close();
+        this.streamCredit.clear();
+        this.negotiatedVersion = 0;
     }
 
     // The text is a parameter because this strip says two things: that the
@@ -2344,9 +2607,14 @@ class BitBangConnection {
                 return;
             }
 
-            // WebSocket stream -- forward to iframe
+            // WebSocket stream -- forward to iframe. A WebSocket's reader cannot
+            // be slowed, so handing a frame on is consuming it; a fragment
+            // counts as it joins reassembly, or a message larger than the
+            // window could never complete.
             const ws = this.wsStreams.get(frame.streamId);
             if (ws) {
+                this.onArrived(frame, true);
+                if (frame.flags & FLAG_FIN) this.dropCredit(frame.streamId);
                 this.handleWSFrame(frame, ws);
                 return;
             }
@@ -2354,6 +2622,8 @@ class BitBangConnection {
             // Transport benchmark -- see startBench()
             const bench = this.benchStreams.get(frame.streamId);
             if (bench) {
+                this.onArrived(frame, true);
+                if (frame.flags & FLAG_FIN) this.dropCredit(frame.streamId);
                 this.handleBenchFrame(frame, bench);
                 return;
             }
@@ -2365,6 +2635,16 @@ class BitBangConnection {
                 return;
             }
             this.keepWorkerAlive();
+            // Not consumed yet: the worker reports that as its reader takes
+            // the bytes (proxy_consumed).
+            this.onArrived(frame, false);
+
+            // Cancelled in a v2/v3 session, which cannot stop the device: the
+            // rest goes nowhere.
+            if (req.cancelled) {
+                if (frame.flags & FLAG_FIN) this.pendingRequests.delete(frame.streamId);
+                return;
+            }
 
             if (frame.flags & FLAG_SYN) {
                 // Metadata frame - send headers to SW, it will create the stream
@@ -2411,6 +2691,7 @@ class BitBangConnection {
 
                 req.responsePort.postMessage({ type: 'proxy_end' });
                 this.pendingRequests.delete(frame.streamId);
+                this.dropCredit(frame.streamId);
             } else if (!(frame.flags & FLAG_SYN) && frame.payload.byteLength > 0) {
                 // Data chunk - use transferable to avoid copy
                 req.bytesReceived += frame.payload.byteLength;
@@ -2470,11 +2751,29 @@ class BitBangConnection {
             return;
         }
 
+        // v4 flow control. Both arrive often -- a window_update for every
+        // half megabyte a stream moves -- so they come first.
+        if (msg.type === 'window_update') {
+            if (this.flowControl && msg.max_bytes > 0) {
+                this.streamCredit.get(msg.stream_id)?.raiseSendLimit(msg.max_bytes);
+            }
+            return;
+        }
+        if (msg.type === 'stream_reset') {
+            if (this.flowControl) this.onStreamReset(msg);
+            return;
+        }
+
         if (msg.type === 'ready') {
             // `server_version` tells us which SWSP version the listener
             // is speaking. v2 listeners send just {type:'ready'} —
             // serverVersion defaults to 2.
             this.serverVersion = msg.server_version || 2;
+            // The version this session runs, which the listener fixed at
+            // the first connect. A listener that predates negotiated_version
+            // speaks the lower of the two.
+            this.negotiatedVersion = msg.negotiated_version
+                || Math.min(this.serverVersion, SWSP_VERSION);
             // routing tells us how to interpret the first segment of the
             // URL fragment's device path. "target-prefix" (bitbangproxy)
             // means the first segment is a LAN target that isolates
@@ -2489,9 +2788,9 @@ class BitBangConnection {
                 this.target = '';
             }
             if (this.debug) {
-                console.log('[Bootstrap] Device ready (server v' + this.serverVersion + ', routing=' + this.routing + ', target=' + JSON.stringify(this.target) + ')');
+                console.log('[Bootstrap] Device ready (server v' + this.serverVersion + ', SWSP v' + this.negotiatedVersion + ', routing=' + this.routing + ', target=' + JSON.stringify(this.target) + ')');
             } else {
-                console.log('[Bootstrap] Device ready');
+                console.log('[Bootstrap] Device ready (SWSP v' + this.negotiatedVersion + ')');
             }
             if (this.connectResolve) {
                 this.connectResolve();
@@ -2813,7 +3112,7 @@ class BitBangConnection {
         const connectMsg = JSON.stringify({
             type: 'connect',
             path: this.devicePath,
-            version: 3,
+            version: SWSP_VERSION,
         });
         this.dataChannel.send(this.createFrame(0, FLAG_SYN, connectMsg));
 
@@ -3001,11 +3300,13 @@ class BitBangConnection {
         this.connectResolve = navigateAfterAuth;
 
         // Send connect with the new path. Matches the initial-connect
-        // payload — no caps advertisement.
+        // payload — no caps advertisement. The listener fixed the SWSP
+        // version at the first connect and keeps it, which is what lets
+        // streams already open keep their flow-control accounting.
         const connectMsg = JSON.stringify({
             type: 'connect',
             path,
-            version: 3,
+            version: SWSP_VERSION,
         });
         this.dataChannel.send(this.createFrame(0, FLAG_SYN, connectMsg));
     }
@@ -3078,6 +3379,7 @@ class BitBangConnection {
                 iframe.contentWindow.postMessage({
                     type: 'ws_assign', openId: msg.openId, streamId,
                 }, '*');
+                this.openCredit(streamId);
                 this.dataChannel.send(this.createFrame(streamId, FLAG_SYN, JSON.stringify(syn)));
                 // Tell the iframe the WS is open now. Listener handlers
                 // typically don't send a SYN ack on the success path —
@@ -3099,6 +3401,7 @@ class BitBangConnection {
                 pathname: msg.pathname,
                 cookies: msg.cookies || '',
             });
+            this.openCredit(streamId);
             this.dataChannel.send(this.createFrame(streamId, FLAG_SYN, synPayload));
             if (this.debug) console.log(`[Bootstrap] ws SYN sent to device, streamId=${streamId}`);
 
@@ -3118,7 +3421,7 @@ class BitBangConnection {
                         ? new Uint8Array(msg.data)
                         : new Uint8Array(msg.data);
                 }
-                this.dataChannel.send(this.createFrame(msg.streamId, FLAG_DAT, payload));
+                this.queueOnStream(ws, msg.streamId, [[FLAG_DAT, payload]]);
                 return;
             }
 
@@ -3140,18 +3443,23 @@ class BitBangConnection {
             // Chunk at SWSP_CHUNK_SIZE (the data-channel message limit). Non-final
             // chunks carry FLAG_MORE so the device reassembles them into one WS
             // message (the type byte rides in the first chunk).
+            const frames = [];
             for (let off = 0; off < payload.length; off += SWSP_CHUNK_SIZE) {
                 const end = off + SWSP_CHUNK_SIZE;
                 const flags = end >= payload.length ? FLAG_DAT : (FLAG_DAT | FLAG_MORE);
-                this.dataChannel.send(this.createFrame(
-                    msg.streamId, flags, payload.subarray(off, Math.min(end, payload.length))));
+                frames.push([flags, payload.subarray(off, Math.min(end, payload.length))]);
             }
+            this.queueOnStream(ws, msg.streamId, frames);
 
         } else if (msg.type === 'ws_close') {
             const ws = this.wsStreams.get(msg.streamId);
             if (!ws) return;
             this.wsStreams.delete(msg.streamId);
-            this.dataChannel.send(this.createFrame(msg.streamId, FLAG_FIN, new Uint8Array(0)));
+            // Behind whatever the page sent before closing, then the stream's
+            // credit is done with.
+            const streamId = msg.streamId;
+            this.queueOnStream(ws, streamId, [[FLAG_FIN, new Uint8Array(0)]])
+                .then(() => this.dropCredit(streamId));
             // The stream is forgotten, so whatever the device answers is
             // dropped. The app's close event comes from here, carrying the
             // code it asked to close with; without it the socket sat in
