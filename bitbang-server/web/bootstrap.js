@@ -309,6 +309,15 @@ const RECONNECT_MAX_BACKOFF_MS = 10000;     // cap on the delay between attempts
 const RECONNECT_TIMEOUT_MS = 20000;  // per attempt: WS + offer + DC verify + ready
 const RECONNECT_SETTLE_MS = 2000;    // after offline→online, let the network settle
 
+// A relayed session on a visible page renews its TURN credential this long
+// before it expires, through the same soft reconnect: a fresh request, so a
+// fresh credential through the server's capacity check. Ahead of the expiry
+// rather than at it, because the relay ends the allocation when the
+// credential runs out, and renewing then means renewing a dropped connection.
+const TURN_RENEW_LEAD_MS = 30_000;
+// How often a hidden page that is due to renew looks again, until expiry.
+const TURN_RENEW_RECHECK_MS = 5000;
+
 // How often to tell the service worker it is busy while a proxied request is
 // open (keepWorkerAlive). sw.js holds itself for KEEPALIVE_HOLD_MS (25s) per
 // keepalive, so this has to come round well inside that.
@@ -628,6 +637,7 @@ class BitBangConnection {
         this._turnExpiryMs = null;
         this._turnUnavailable = false;
         this._turnEnded = false;
+        this._renewing = false;         // the reconnect in progress renews TURN
         // Soft-reconnect state.
         this._transportReady = false;   // one-time setup (SW reg, iframe) done
         this._reconnecting = false;     // a reconnect loop is in progress
@@ -1679,6 +1689,18 @@ class BitBangConnection {
         if (this._turnUnavailable) {
             this._print('Relay server (TURN) is at capacity. Connection may fail — please try again later.');
         }
+        // A renewal is a reconnect the session did not need yet. Relay-only
+        // with the relay full, this attempt cannot connect and neither can
+        // the next few minutes of retries, so end now with the message the
+        // expiry would have shown.
+        if (this._renewing && this._turnUnavailable) {
+            const flags = parseUrlFlags();
+            if (flags.relay && !flags.norelay) {
+                console.warn('[Bootstrap] relay full at renewal; ending session');
+                this.showReloadScreen(this._endedMessage());
+                return;
+            }
+        }
         this._turnExpiryMs = null;
         this._extractTurnExpiry(msg.ice_servers);
         this.iceServers = Array.isArray(msg.ice_servers) ? msg.ice_servers : [];
@@ -2159,9 +2181,17 @@ class BitBangConnection {
         }
     }
 
-    // Schedule the title-change warning at expiry-60s and the reload screen
-    // at expiry. Both use absolute deltas from now, derived from the epoch
-    // expiry the server embedded in the TURN credential username.
+    // Schedule what happens as the TURN credential runs out, from the epoch
+    // expiry the server embedded in its username. TURN_RENEW_LEAD_MS before
+    // it, a visible page renews: a soft reconnect, which brings a fresh
+    // credential and arms this again. A hidden page keeps looking until the
+    // expiry and renews if someone comes back; otherwise it ends as it always
+    // has -- the title warns from expiry-60s, the reload screen comes at
+    // expiry -- so a tab nobody is looking at hands its relay slot back.
+    //
+    // A credential that arrives with less than the lead left ends as before
+    // too, rather than renewing straight away: a server whose TTL is shorter
+    // than the lead would otherwise renew in a loop.
     //
     // Cleared first because this can run twice on a relayed connection, and
     // in practice does: the relay monitor's first tick and _onFirstConnected
@@ -2174,12 +2204,17 @@ class BitBangConnection {
         this._clearTurnEndTimers();
         const now = Date.now();
         const warnAt = this._turnExpiryMs - 60_000 - now;
+        const renewAt = this._turnExpiryMs - TURN_RENEW_LEAD_MS - now;
         const endAt = this._turnExpiryMs - now;
+        const warn = () => {
+            if (!this._turnPrevTitle) this._turnPrevTitle = document.title;
+            document.title = '⚠ Relay ending soon — bitba.ng';
+        };
         if (warnAt > 0) {
             this._turnWarnTimer = setTimeout(() => {
-                if (this._turnEnded || !this._usingRelay) return;
-                if (!this._turnPrevTitle) this._turnPrevTitle = document.title;
-                document.title = '⚠ Relay ending soon — bitba.ng';
+                // A visible page renews before anything ends; no warning.
+                if (this._turnEnded || !this._usingRelay || !document.hidden) return;
+                warn();
             }, warnAt);
         }
         // Re-check the live path before tearing the page down. The monitor
@@ -2202,12 +2237,48 @@ class BitBangConnection {
                          'selected pairs:', await this._describeSelectedPairs(this.pc));
             this.showReloadScreen(this._endedMessage());
         };
-        if (endAt > 0) {
+        // The same check before renewing: a session that went direct has
+        // nothing to renew.
+        const renewOrEnd = async () => {
+            if (this._turnEnded || this._reconnecting) return;
+            if (!(await this._isUsingRelay(this.pc))) {
+                this._usingRelay = false;
+                this._clearTurnEndTimers();
+                return;
+            }
+            if (this._turnEnded || this._reconnecting) return;
+            if (!document.hidden) {
+                this._renewTurn();
+                return;
+            }
+            // Hidden after the warning was due, the page has not warned yet.
+            warn();
+            const left = this._turnExpiryMs - Date.now();
+            this._turnEndTimer = left > TURN_RENEW_RECHECK_MS
+                ? setTimeout(renewOrEnd, TURN_RENEW_RECHECK_MS)
+                : setTimeout(endNow, Math.max(0, left));
+        };
+        if (renewAt > 0) {
+            this._turnEndTimer = setTimeout(renewOrEnd, renewAt);
+        } else if (endAt > 0) {
             this._turnEndTimer = setTimeout(endNow, endAt);
         } else {
             // Already past expiry by the time we got here — check and fire.
             endNow();
         }
+    }
+
+    // Renew the relay credential before it runs out, through the soft
+    // reconnect. _renewing lets the offer handler tell a renewal that finds
+    // the relay full from a reconnect that should keep trying.
+    _renewTurn() {
+        console.log('[Bootstrap] renewing the relay credential before it expires');
+        if (this._turnPrevTitle) {
+            document.title = this._turnPrevTitle;
+            this._turnPrevTitle = null;
+        }
+        this._renewing = true;
+        this._reconnectLoop();
     }
 
     _endedMessage() {
@@ -2299,6 +2370,7 @@ class BitBangConnection {
                 await this._reconnectOnce();
                 console.log(`[Bootstrap] reconnected on attempt ${attempt}`);
                 this._reconnecting = false;
+                this._renewing = false;
                 this._hideReconnecting();
                 return;
             } catch (e) {
@@ -2311,6 +2383,7 @@ class BitBangConnection {
 
         // Window closed (or a terminal screen owns the page) — fall back.
         this._reconnecting = false;
+        this._renewing = false;
         this._hideReconnecting();
         if (this._turnEnded) return;
         this._turnEnded = true;
