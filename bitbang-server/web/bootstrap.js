@@ -2162,7 +2162,16 @@ class BitBangConnection {
     // Schedule the title-change warning at expiry-60s and the reload screen
     // at expiry. Both use absolute deltas from now, derived from the epoch
     // expiry the server embedded in the TURN credential username.
+    //
+    // Cleared first because this can run twice on a relayed connection, and
+    // in practice does: the relay monitor's first tick and _onFirstConnected
+    // race to see the path turn relayed, and each arms. Only the second pair
+    // of handles was kept, so the first pair could not be cancelled -- not
+    // by a soft reconnect, not by the path going direct -- and ended the
+    // session at the expiry of the credential it was armed from, however
+    // many fresh ones had arrived since.
     _armTurnEndTimers() {
+        this._clearTurnEndTimers();
         const now = Date.now();
         const warnAt = this._turnExpiryMs - 60_000 - now;
         const endAt = this._turnExpiryMs - now;
