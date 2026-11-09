@@ -29,11 +29,13 @@
     var path = location.pathname;
     if (path.indexOf(PREFIX) === 0) {
         var cleanPath = path.slice(PREFIX.length);
+        var targetSeg = '';
         // Strip the target segment (e.g. /192.168.2.1:8000)
         // Target contains a dot or colon in the first segment
         if (cleanPath.length > 1) {
             var seg = cleanPath.slice(1).split('/')[0];
             if (seg.indexOf('.') !== -1 || seg.indexOf(':') !== -1) {
+                targetSeg = '/' + seg;
                 cleanPath = cleanPath.slice(1 + seg.length) || '/';
             }
         }
@@ -42,6 +44,28 @@
             // preserving location.hash is enough — location.search should
             // be empty on the top URL by design.
             history.replaceState(null, '', cleanPath + location.hash);
+
+            // Put the prefix back as the page leaves. The stripped URL is
+            // what this frame's history entry now holds, and back reloads
+            // an entry from its URL: without this, back from any full
+            // navigation out of this page requests bare `/` (or whatever
+            // path the app was on), which carries no session for the SW to
+            // route by -- so bitba.ng's own page loads inside the iframe and
+            // hangs on "loading...". Seen going back from /*settings;
+            // confirmed in Chromium and Firefox, and that this fixes both.
+            //
+            // pagehide, because the document is still active there and the
+            // entry is still this page's. The current path, not the one
+            // stripped above, since an SPA may have moved since. state is
+            // kept for the router that put it there.
+            addEventListener('pagehide', function () {
+                var p = location.pathname;
+                if (p.indexOf('/__device__/') === 0) return;
+                try {
+                    history.replaceState(history.state, '',
+                        PREFIX + targetSeg + p + location.search + location.hash);
+                } catch (e) {}
+            });
         }
     }
 
