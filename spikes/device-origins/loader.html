@@ -1,0 +1,47 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>start</title>
+<p id="t">starting</p>
+<script>
+// The iframe's way in: /__bb/start#<device path>. The server serves this on a
+// first visit (no worker yet); afterwards the worker serves its cached copy,
+// with no network. Either way it does the same three things:
+//   1. make sure the worker controls this origin
+//   2. get a fresh port from the parent -- the worker may hold a dead one
+//      from a previous top page -- and wait for the worker to confirm it
+//   3. replace itself with the device path
+(function () {
+    var TOP = 'http://bb.localhost:__PORT__';
+    var sw = navigator.serviceWorker;
+    var target = location.hash.slice(1) || '/';
+    var gotOk = null;
+    sw.addEventListener('message', function (e) {
+        var m = e.data || {};
+        if (m.type === 'need_port' && parent !== window) {
+            parent.postMessage({ type: 'need_port', why: 'start ' + m.why }, TOP);
+        } else if (m.type === 'port_ok' && gotOk) {
+            gotOk();
+        }
+    });
+    addEventListener('message', function (e) {
+        if (e.origin !== TOP || !e.data || e.data.type !== 'port' || !e.ports[0]) return;
+        sw.ready.then(function (reg) { reg.active.postMessage({ type: 'port' }, [e.ports[0]]); });
+    });
+    sw.startMessages();
+    if (parent === window) {
+        document.getElementById('t').textContent = 'not framed: nothing to do';
+        return;
+    }
+    sw.register('/sw.js').then(function () { return sw.ready; }).then(function () {
+        if (sw.controller) return;
+        return new Promise(function (r) { sw.addEventListener('controllerchange', r, { once: true }); });
+    }).then(function () {
+        return new Promise(function (r) {
+            gotOk = r;
+            parent.postMessage({ type: 'need_port', why: 'start' }, TOP);
+        });
+    }).then(function () {
+        location.replace(target);
+    });
+})();
+</script>
