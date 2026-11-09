@@ -48,6 +48,10 @@ func stampDir(t *testing.T) string {
 		"pcm-ring.js":        "// pcm ring\n",
 		"render-mjpeg.js":    "// mjpeg\n",
 		"render-ulaw.js":     "// ulaw\n",
+		// A label host's own (label.go).
+		"label-sw.js":      "const BUILD = '" + buildPlaceholder + "';\n",
+		"label-start.html": "<html><!-- start " + buildPlaceholder + " --></html>",
+		"device-shim.js":   "// device shim\n",
 		// The plugins', each a directory with its manifest.
 		"plugins/settings/plugin.json":       `{"meta_pages": ["settings"], "panels": ["settings"]}`,
 		"plugins/settings/settings.html":     "<html><!-- settings --></html>",

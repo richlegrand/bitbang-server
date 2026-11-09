@@ -41,6 +41,10 @@ const buildPlaceholder = "__BB_BUILD__"
 var stampedAssets = map[string]bool{
 	"bootstrap.js": true,
 	"sw.js":        true,
+	// A label origin's worker and start page (label.go). Stamped so a label
+	// worker can tell it is behind the bootstrap that framed it.
+	"label-sw.js":      true,
+	"label-start.html": true,
 }
 
 // stampInputs are the files whose contents define a build. Every asset
@@ -75,6 +79,11 @@ var stampInputs = []string{
 	"pcm-ring.js",
 	"render-mjpeg.js",
 	"render-ulaw.js",
+	// What a label host serves (label.go): its worker, its start page, and
+	// the shim injected into every device page.
+	"label-sw.js",
+	"label-start.html",
+	"device-shim.js",
 }
 
 // buildStamp hashes the on-disk bytes of every stamp input, with their
@@ -209,8 +218,14 @@ func (c *StampCache) Current() string {
 	return c.stamp
 }
 
-// serveStamped writes a stamped asset with the build value spliced in.
+// serveStamped writes a stamped script with the build value spliced in.
 func serveStamped(w http.ResponseWriter, staticDir, name, stamp string) {
+	serveStampedAs(w, staticDir, name, stamp, "text/javascript; charset=utf-8")
+}
+
+// serveStampedAs is serveStamped for any content type -- the label start page
+// is HTML.
+func serveStampedAs(w http.ResponseWriter, staticDir, name, stamp, contentType string) {
 	b, err := os.ReadFile(filepath.Join(staticDir, name))
 	if err != nil {
 		http.Error(w, "internal error", http.StatusInternalServerError)
@@ -218,7 +233,7 @@ func serveStamped(w http.ResponseWriter, staticDir, name, stamp string) {
 	}
 	out := strings.Replace(string(b), buildPlaceholder, stamp, 1)
 	w.Header().Set("Cache-Control", "no-cache, no-store, must-revalidate")
-	w.Header().Set("Content-Type", "text/javascript; charset=utf-8")
+	w.Header().Set("Content-Type", contentType)
 	_, _ = w.Write([]byte(out))
 }
 

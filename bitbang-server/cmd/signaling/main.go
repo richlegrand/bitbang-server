@@ -210,9 +210,22 @@ func main() {
 
 	mux.Handle("/", handler.Static(stamps, cfg.FrontPagePath, plugins))
 
+	// A device origin, <label>.<this host>, gets only its start page and the
+	// assets a device page loads -- never signaling, /status or a bootstrap
+	// page. Decided by Host before any route, so nothing above is reachable
+	// from a label. See internal/handler/label.go.
+	label := handler.Label(stamps, plugins)
+	root := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if _, ok := handler.LabelHost(r.Host); ok {
+			label(w, r)
+			return
+		}
+		mux.ServeHTTP(w, r)
+	})
+
 	srv := &http.Server{
 		Addr:    cfg.Bind,
-		Handler: requestLogger(logger, mux, cfg.TrustProxyHeaders),
+		Handler: requestLogger(logger, root, cfg.TrustProxyHeaders),
 		// No ReadTimeout/WriteTimeout because WebSocket upgrades need
 		// long-lived connections. Idle timeout protects against slow
 		// HTTP clients on non-WS endpoints.
