@@ -50,10 +50,12 @@ func TestLabelServesOnlyItsOwnFiles(t *testing.T) {
 	h := Label(stamps, loadPlugins(t, dir))
 	const host = "abcdefghijklmnop.test.bitba.ng"
 
-	// Every response, whatever it is, may only be framed by the parent.
+	// Every response, whatever it is, may only be framed by the parent, with
+	// the label origin itself allowed in between (the content frame's parent
+	// is the connection frame).
 	check := func(path string, rec *httptest.ResponseRecorder) {
 		t.Helper()
-		if got := rec.Header().Get("Content-Security-Policy"); got != "frame-ancestors test.bitba.ng" {
+		if got := rec.Header().Get("Content-Security-Policy"); got != "frame-ancestors 'self' test.bitba.ng" {
 			t.Errorf("%s: CSP = %q", path, got)
 		}
 	}
@@ -100,6 +102,41 @@ func TestLabelServesOnlyItsOwnFiles(t *testing.T) {
 	rec = labelGet(t, h, http.MethodPost, host, "/login")
 	if rec.Code != http.StatusOK || !strings.Contains(rec.Body.String(), "<!-- start ") {
 		t.Errorf("POST /login: %d %q", rec.Code, rec.Body.String())
+	}
+}
+
+// A label URL loaded top-level -- a link opened in a new tab -- gets the page
+// that says to open the device from its link, never the start page, which
+// would try to connect with nothing to connect with.
+func TestLabelTopLevelLoad(t *testing.T) {
+	dir := stampDir(t)
+	stamps := NewStampCache(dir, loadPlugins(t, dir).Files()...)
+	h := Label(stamps, loadPlugins(t, dir))
+	const host = "abcdefghijklmnop.test.bitba.ng"
+
+	for _, path := range []string{"/", "/settings", "/__bb/start"} {
+		req := httptest.NewRequest(http.MethodGet, "http://"+host+path, nil)
+		req.Host = host
+		req.Header.Set("Sec-Fetch-Dest", "document")
+		rec := httptest.NewRecorder()
+		h.ServeHTTP(rec, req)
+		body := rec.Body.String()
+		if rec.Code != http.StatusOK || !strings.Contains(body, "<!-- top-level -->") || strings.Contains(body, "<!-- start ") {
+			t.Errorf("%s top-level: %d %q", path, rec.Code, body)
+		}
+		if !strings.Contains(body, `href="//test.bitba.ng/"`) {
+			t.Errorf("%s top-level: no link to the parent: %q", path, body)
+		}
+	}
+
+	// Framed, the same paths get the start page.
+	req := httptest.NewRequest(http.MethodGet, "http://"+host+"/settings", nil)
+	req.Host = host
+	req.Header.Set("Sec-Fetch-Dest", "iframe")
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+	if !strings.Contains(rec.Body.String(), "<!-- start ") {
+		t.Errorf("framed /settings: %q", rec.Body.String())
 	}
 }
 
