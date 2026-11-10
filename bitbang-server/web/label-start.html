@@ -1,0 +1,51 @@
+<!DOCTYPE html>
+<!-- start __BB_BUILD__ -->
+<!--
+    The connection frame: https://<label>.<host>/__bb/start, framed by
+    bitba.ng's page. See connection.js, and bitbang-docs/device-origins.md.
+
+    A label host serves this page for every path it is asked for (label.go),
+    so a content frame that reaches the network before the label worker
+    controls the origin gets this page too. It is never meant to be seen
+    there, nor top-level: the server answers a top-level load with its own
+    page, and connection.js shows the same words if one gets through.
+-->
+<html>
+<head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>BitBang</title>
+    <style>
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+        }
+
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+            background: #fff;
+            color: #333;
+            min-height: 100vh;
+        }
+
+        #connection-ui {
+            padding: 12px 16px;
+            font-family: "SF Mono", "Menlo", "Monaco", "Consolas", monospace;
+            font-size: 13px;
+            color: #333;
+            line-height: 1.6;
+        }
+
+        .error {
+            color: #c00;
+        }
+    </style>
+</head>
+<body>
+    <div id="connection-ui">
+        <div id="status"></div>
+    </div>
+    <script src="/__bitbang__/connection.js"></script>
+</body>
+</html>

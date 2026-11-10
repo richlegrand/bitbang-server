@@ -51,6 +51,7 @@ func stampDir(t *testing.T) string {
 		// A label host's own (label.go).
 		"label-sw.js":      "const BUILD = '" + buildPlaceholder + "';\n",
 		"label-start.html": "<html><!-- start " + buildPlaceholder + " --></html>",
+		"connection.js":    "const BUILD = '" + buildPlaceholder + "';\n",
 		"device-shim.js":   "// device shim\n",
 		// The plugins', each a directory with its manifest.
 		"plugins/settings/plugin.json":       `{"meta_pages": ["settings"], "panels": ["settings"]}`,

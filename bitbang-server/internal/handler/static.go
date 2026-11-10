@@ -41,10 +41,12 @@ const buildPlaceholder = "__BB_BUILD__"
 var stampedAssets = map[string]bool{
 	"bootstrap.js": true,
 	"sw.js":        true,
-	// A label origin's worker and start page (label.go). Stamped so a label
-	// worker can tell it is behind the bootstrap that framed it.
+	// A label origin's worker, start page and connection script (label.go).
+	// Stamped so each can tell when it is behind the server, as bootstrap.js
+	// and sw.js do.
 	"label-sw.js":      true,
 	"label-start.html": true,
+	"connection.js":    true,
 }
 
 // stampInputs are the files whose contents define a build. Every asset
@@ -79,10 +81,12 @@ var stampInputs = []string{
 	"pcm-ring.js",
 	"render-mjpeg.js",
 	"render-ulaw.js",
-	// What a label host serves (label.go): its worker, its start page, and
-	// the shim injected into every device page.
+	// What a label host serves (label.go): its worker, its start page and
+	// the connection script that page runs, and the shim injected into every
+	// device page.
 	"label-sw.js",
 	"label-start.html",
+	"connection.js",
 	"device-shim.js",
 }
 

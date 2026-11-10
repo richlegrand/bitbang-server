@@ -65,6 +65,7 @@ func LabelHost(host string) (parent string, ok bool) {
 // which keeps the access code. The label origin gets the connection half
 // only, which has nothing to connect with until that page sends a proof.
 var labelAssets = map[string]bool{
+	"connection.js":      true, // the connection frame's script, loaded by the start page
 	"label-sw.js":        true, // the label worker; root scope via the header below
 	"device-shim.js":     true, // injected into every device page
 	"ws-shim.js":         true,

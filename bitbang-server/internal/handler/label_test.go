@@ -83,7 +83,7 @@ func TestLabelServesOnlyItsOwnFiles(t *testing.T) {
 	}
 
 	// What a device page loads, including a plugin's page.
-	for _, name := range []string{"device-shim.js", "ws-shim.js", "stream-shim.js", "bitbang.js", "render-mjpeg.js", "settings.html", "console-panel.js"} {
+	for _, name := range []string{"connection.js", "device-shim.js", "ws-shim.js", "stream-shim.js", "bitbang.js", "render-mjpeg.js", "settings.html", "console-panel.js"} {
 		rec := labelGet(t, h, http.MethodGet, host, "/__bitbang__/"+name)
 		if rec.Code != http.StatusOK {
 			t.Errorf("%s: %d", name, rec.Code)
@@ -144,7 +144,7 @@ func TestParentDoesNotServeLabelFiles(t *testing.T) {
 	dir := stampDir(t)
 	stamps := NewStampCache(dir)
 	h := Static(stamps, "", nil)
-	for _, name := range []string{"label-sw.js", "label-start.html", "device-shim.js"} {
+	for _, name := range []string{"label-sw.js", "label-start.html", "connection.js", "device-shim.js"} {
 		rec := labelGet(t, h, http.MethodGet, "test.bitba.ng", "/__bitbang__/"+name)
 		if rec.Code != http.StatusNotFound {
 			t.Errorf("parent served %s: %d", name, rec.Code)
