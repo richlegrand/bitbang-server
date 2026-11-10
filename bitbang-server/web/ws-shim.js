@@ -5,8 +5,9 @@
  * over the BitBang SWSP data channel. Loaded into the device iframe
  * before the app's own scripts.
  *
- * Communication with the bootstrap parent uses postMessage. The whole
- * vocabulary, with bootstrap.js's handleWSShimMessage as the other end:
+ * Communication with the parent -- the connection frame, same origin as this
+ * page -- uses postMessage. The whole vocabulary, with connection.js's
+ * handleWSShimMessage as the other end:
  *
  *   iframe -> parent  ws_open    { openId, pathname, protocols, cookies }
  *                     ws_send    { streamId, data, isText }
@@ -20,6 +21,9 @@
 (function() {
     const NativeWebSocket = window.WebSocket;
     const parent = window.parent;
+    // The connection frame is this page's own origin. Addressed to it, so a
+    // page framed anywhere else posts its sockets to no one.
+    const ORIGIN = location.origin;
 
     // Sockets the bootstrap has given a stream, by streamId.
     const sockets = new Map();
@@ -32,16 +36,17 @@
     let nextOpenId = 1;
 
     // The cookie mirror that used to be here -- a BroadcastChannel listener
-    // writing jar updates into document.cookie -- is in xhr-shim.js now, with
-    // the rest of the mirror. See the note there for why it had to move: from
-    // here its writes went through the setter that forwards to the jar, and
-    // came back without their expiry.
+    // writing jar updates into document.cookie -- is in device-shim.js now,
+    // with the rest of the mirror. See the note there for why it had to move:
+    // from here its writes went through the setter that forwards to the jar,
+    // and came back without their expiry.
 
-    // Ask the SW for the current cookie header for a given path. The SW
-    // jar is the source of truth; document.cookie is a best-effort mirror.
+    // Ask the worker for the current cookie header for a given path. Its jar
+    // is the source of truth; document.cookie is a best-effort mirror. The
+    // worker serves this origin's one device, so the path is all it needs.
     function getCookiesFromSW(path) {
         const sw = navigator.serviceWorker?.controller;
-        if (!sw || !window.__bbSessionId) return Promise.resolve('');
+        if (!sw) return Promise.resolve('');
         return new Promise((resolve) => {
             const channel = new MessageChannel();
             const timeout = setTimeout(() => resolve(''), 1000);
@@ -49,11 +54,7 @@
                 clearTimeout(timeout);
                 resolve(e.data?.cookies || '');
             };
-            sw.postMessage({
-                type: 'get_cookies',
-                sessionId: window.__bbSessionId,
-                path,
-            }, [channel.port2]);
+            sw.postMessage({ type: 'get_cookies', path }, [channel.port2]);
         });
     }
 
@@ -70,7 +71,7 @@
             // Closed while it waited: the app has already had its close
             // event, so all that's left is to give the stream back.
             if (ws._readyState === NativeWebSocket.CLOSED) {
-                parent.postMessage({ type: 'ws_close', streamId, code: 1000, reason: '' }, '*');
+                parent.postMessage({ type: 'ws_close', streamId, code: 1000, reason: '' }, ORIGIN);
                 return;
             }
             ws._streamId = streamId;
@@ -134,20 +135,15 @@
             this.binaryType = 'blob';
             this._readyState = NativeWebSocket.CONNECTING;
 
-            // Parse URL to get pathname, stripping /__device__ prefix
+            // The device path. This origin is the device's, so a page's
+            // ws://<here>/path is just /path; the connection frame adds a
+            // proxied app's target.
             let pathname;
             try {
                 const parsed = new URL(url, window.location.href);
                 pathname = parsed.pathname + parsed.search;
             } catch (e) {
                 pathname = url;
-            }
-            // Strip /__device__/<sessionId> prefix from the path
-            const devPrefix = '/__device__/';
-            if (pathname.startsWith(devPrefix)) {
-                const rest = pathname.slice(devPrefix.length);
-                const slashIdx = rest.indexOf('/');
-                pathname = slashIdx >= 0 ? rest.slice(slashIdx) : '/';
             }
 
             this.url = url;
@@ -162,7 +158,7 @@
                 if (this._readyState === NativeWebSocket.CLOSED) return;
                 opening.set(openId, this);
                 log('ws_open posted', pathname, 'cookies.len=' + cookies.length);
-                parent.postMessage({ type: 'ws_open', openId, pathname, protocols, cookies }, '*');
+                parent.postMessage({ type: 'ws_open', openId, pathname, protocols, cookies }, ORIGIN);
             });
         }
 
@@ -178,7 +174,7 @@
                 streamId: this._streamId,
                 data,
                 isText
-            }, '*');
+            }, ORIGIN);
         }
 
         close(code, reason) {
@@ -191,7 +187,7 @@
                 if (this._streamId !== undefined) {
                     sockets.delete(this._streamId);
                     parent.postMessage({ type: 'ws_close', streamId: this._streamId,
-                                         code: 1000, reason: '' }, '*');
+                                         code: 1000, reason: '' }, ORIGIN);
                 }
                 failLater(this);
                 return;
@@ -203,7 +199,7 @@
                 streamId: this._streamId,
                 code: code || 1000,
                 reason: reason || ''
-            }, '*');
+            }, ORIGIN);
         }
 
         // Sends are posted to the bootstrap, not queued here, so nothing is

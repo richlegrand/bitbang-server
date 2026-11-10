@@ -3462,7 +3462,9 @@ class BitBangConnection {
             }, '*');
             const synPayload = JSON.stringify({
                 type: 'websocket',
-                pathname: msg.pathname,
+                // The device's path: a proxied app's target goes back on, as
+                // for HTTP (handleProxyRequest).
+                pathname: this.targetPrefix() + msg.pathname,
                 cookies: msg.cookies || '',
             });
             this.openCredit(streamId);
