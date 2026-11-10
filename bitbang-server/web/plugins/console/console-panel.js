@@ -108,19 +108,22 @@ const STYLE = `
   #log { flex:1; min-height:0; overflow:auto; margin:0; padding:.6rem 1rem;
          white-space:pre-wrap; word-break:break-word; }
   :host([data-bb-embedded]) #log { padding:.4rem .75rem; }
-  /* Typing: the log takes focus and shows where the next character lands. */
+  /* Typing: the log takes focus and shows where the next character lands. No
+     focus ring: the cursor is the cue, as in a terminal. */
   #log.typing { cursor:text; }
-  #log.typing:focus { outline:1px solid var(--accent); outline-offset:-1px; }
-  /* The cursor: the character under it in inverse, blinking. renderTail marks
-     it only while there is input to aim, and it shows only while keys will
-     reach the device.
+  #log.typing:focus { outline:none; }
+  /* The cursor: renderTail marks it only while there is input to aim. A
+     hollow box while keys would go elsewhere; the character under it in
+     inverse, blinking, only while keys will reach the device -- the log
+     focused, or with page keys, this document focused.
 
      The glyph's color is set with text-fill-color and color is left alone:
      currentColor is the element's own color, so setting color to the
      background as well made the block and the character both the background
      -- a cursor nobody could see (2026-10-02). */
+  #log.typing .cur { outline:1px solid currentColor; outline-offset:-1px; }
   #log.typing:focus .cur,
-  :host([data-bb-keys]) #log.typing .cur { background:currentColor;
+  :host([data-bb-keys][data-bb-focused]) #log.typing .cur { outline:none; background:currentColor;
          -webkit-text-fill-color:Canvas; animation:cursor 1s steps(1) infinite; }
   @keyframes cursor { 50% { background:transparent; -webkit-text-fill-color:currentColor; } }
   .drop { color:var(--bad); }
@@ -199,6 +202,15 @@ export function mount(host, opts = {}) {
   const noToolbar = opts.toolbar === 'none';
   if (!title) host.setAttribute('data-bb-embedded', '');
   if (pageKeys) host.setAttribute('data-bb-keys', 'page');
+  /* Page keys are heard on this document, so they reach the device only while
+     it has focus. In bootstrap's iframe a click on the page around it, or
+     anywhere else, takes them away; the cursor says so. */
+  if (pageKeys) {
+    const focused = (on) => host.toggleAttribute('data-bb-focused', on);
+    addEventListener('focus', () => focused(true));
+    addEventListener('blur', () => focused(false));
+    focused(document.hasFocus());
+  }
   if (noToolbar) host.setAttribute('data-bb-toolbar', 'none');
 
   const root = host.attachShadow({ mode: 'open' });
