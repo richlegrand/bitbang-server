@@ -3217,12 +3217,14 @@ class BitBangConnection {
 
         // The device says on 'ready' whether its first path segment is a LAN
         // target. bitba.ng's page had to decide that before it could pick
-        // this origin, since the target is part of the label, and it
-        // guesses on a first visit. If it guessed wrong this origin is the
-        // wrong one: tell it, and it remembers the device's routing and
-        // reloads into the right origin. Once per device per browser.
+        // this origin, since the target is part of the label, and on a first
+        // visit it applies the CLI's rule (targetFor in bootstrap.js). A
+        // device that routes the whole path itself, given a target, is in the
+        // wrong origin: tell the page, which remembers the device's routing
+        // and reloads into the right one. Once per device per browser. (The
+        // CLI with no target is its own pages, at the CLI's root: right.)
         toTop({ type: 'routing', routing: this.routing });
-        if ((this.routing === 'target-prefix') !== !!this.target) {
+        if (this.routing !== 'target-prefix' && this.target) {
             console.warn('[Connection] routing', this.routing, 'but target',
                          JSON.stringify(this.target), '-- bitba.ng\'s page will reload');
             return;
