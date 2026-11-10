@@ -109,6 +109,7 @@ function persistedMap(cacheName, key, { revive = (v) => v, forSave = (v) => v } 
 //
 //   get_build         page -> worker   reply on port: build { build }
 //   config            connection.js    { debug, noCookieJar }
+//   alive             connection.js    {}, every minute (sweepSessionCookies)
 //   get_cookies       ws-shim.js       { path }; reply on port: { cookies }
 //                                      (no type)
 //   cookie_write      device-shim.js   { value }
@@ -159,6 +160,10 @@ self.addEventListener('message', async (event) => {
     }
     if (type === 'config') {
         config = { debug: !!event.data.debug, noCookieJar: !!event.data.noCookieJar };
+        return;
+    }
+    if (type === 'alive') {
+        keepAlive(event, noteAlive());
         return;
     }
     if (type === 'get_cookies') {
@@ -234,9 +239,10 @@ function pruneCookieJar() {
 // gone. Cookies with an explicit expiry survive, exactly as they would in a
 // normal browser, so "remember me" still works.
 //
-// Called when a connection frame starts and finds no other (fetch handler),
-// never on a page going away: a refresh is a page going away and a new one
-// starting, and dropping then would log people out on every reload.
+// Called when a connection frame starts, finds no other, and none has been
+// alive for a while (sweepSessionCookies) -- never on a page going away: a
+// refresh is a page going away and a new one starting, and dropping then
+// would log people out on every reload.
 function dropSessionCookies() {
     let changed = false;
     for (const [key, cookies] of [...cookieJar]) {
@@ -522,7 +528,13 @@ self.addEventListener('fetch', (event) => {
         if (url.pathname === START_PATH && req.mode === 'navigate') {
             event.waitUntil(sweepSessionCookies(event));
         }
-        return;      // the network, untouched
+        // A navigation is answered, from the network, rather than left to
+        // fall through: Firefox leaves a page this worker declined to answer
+        // uncontrolled, and a connection frame that isn't controlled waits
+        // for a controller that never comes, then reloads itself for nothing.
+        // Measured Nov 9; Chromium and WebKit control it either way.
+        if (req.mode === 'navigate') event.respondWith(fetch(req));
+        return;      // a subresource: the network, untouched
     }
 
     if (req.mode === 'navigate' && FRAME_DESTINATIONS.has(req.destination)) {
@@ -578,13 +590,41 @@ async function attributable(event) {
     return req.method === 'GET';
 }
 
+// Session cookies end with the device's last tab -- but a reload is a tab
+// ending and another starting, and must not log anyone out. So "the last tab
+// closed" is measured, not inferred: connection frames say they are alive
+// every ALIVE_EVERY_MS (connection.js), and the time is kept here. A frame
+// starting with no other open, more than SESSION_GAP_MS after the last sign
+// of one, is a new session. A reload, or a tab closed and reopened within a
+// few minutes, keeps them -- as a browser restoring its session would.
+const SESSION_GAP_MS = 5 * 60 * 1000;
+const ALIVE_CACHE = 'bitbang-cookies';
+const ALIVE_KEY = '/__bitbang__/alive';
+
+function noteAlive() {
+    return caches.open(ALIVE_CACHE)
+        .then(c => c.put(ALIVE_KEY, new Response(String(Date.now()))))
+        .catch(() => {});
+}
+
+async function lastAlive() {
+    try {
+        const r = await (await caches.open(ALIVE_CACHE)).match(ALIVE_KEY);
+        return r ? Number(await r.text()) || 0 : 0;
+    } catch {
+        return 0;
+    }
+}
+
 async function sweepSessionCookies(event) {
     const all = await self.clients.matchAll({ type: 'window', includeUncontrolled: true });
     const others = all.filter(c => c.id !== event.resultingClientId
         && new URL(c.url).pathname === START_PATH);
-    if (others.length > 0) return;
-    await cookieJarReady;
-    if (dropSessionCookies()) await saveCookieJar();
+    if (others.length === 0 && Date.now() - await lastAlive() > SESSION_GAP_MS) {
+        await cookieJarReady;
+        if (dropSessionCookies()) await saveCookieJar();
+    }
+    await noteAlive();
 }
 
 // pickConnection finds the connection frame to carry a request: this origin's
@@ -927,7 +967,12 @@ async function proxyToDevice(event) {
 
                         // Inject shims + cookie sync into HTML navigation responses
                         if (ct.includes('text/html') && isNav) {
-                            let cookieSync = '';
+                            // The jar's cookies, for device-shim.js to mirror
+                            // into document.cookie as it starts -- not written
+                            // here, because where the browser won't keep
+                            // cookies in this frame the shim keeps the mirror
+                            // itself, and only it knows which.
+                            const cookieSync = [];
                             if (!session?.noCookieJar) {
                                 const jar = cookieJar.get(jarKey);
                                 if (jar && jar.length > 0) {
@@ -938,13 +983,11 @@ async function proxyToDevice(event) {
                                         if (!isMirrorable(c)) continue;
                                         // Expiry included, as the other two
                                         // mirror sources in device-shim.js
-                                        // do. This one runs before that file
-                                        // installs the forwarding setter, so
-                                        // it never echoed -- it just made
-                                        // every mirrored cookie a session one.
+                                        // do. Without it every mirrored
+                                        // cookie would be a session one.
                                         const exp = c.expires !== null
                                             ? ';expires=' + new Date(c.expires).toUTCString() : '';
-                                        cookieSync += `document.cookie=${jsonForScript(c.name + '=' + c.value + ';path=' + c.path + exp)};`;
+                                        cookieSync.push(c.name + '=' + c.value + ';path=' + c.path + exp);
                                     }
                                 }
                             }
@@ -953,7 +996,7 @@ async function proxyToDevice(event) {
                                 ? '<script src="https://cdn.jsdelivr.net/npm/eruda" onload="eruda.init();eruda.position({x:innerWidth-60,y:innerHeight-60})"></script>'
                                 : '';
                             const shims = '<!DOCTYPE html>'
-                                + `<script>window.__bbJarKey=${jsonForScript(jarKey)};window.__bbDebug=${!!session?.debug};${cookieSync}</script>`
+                                + `<script>window.__bbJarKey=${jsonForScript(jarKey)};window.__bbDebug=${!!session?.debug};window.__bbCookies=${jsonForScript(cookieSync)};</script>`
                                 + eruda
                                 + '<script src="/__bitbang__/device-shim.js"></script>'
                                 + '<script src="/__bitbang__/ws-shim.js"></script>';

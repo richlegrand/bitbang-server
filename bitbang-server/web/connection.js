@@ -434,6 +434,11 @@ const DEVICE_RESET_TEXT = 'Device reset, reloading...';
 // Carries that across the reload. Read and cleared by the page that arrives.
 const DEVICE_RESET_KEY = 'bb-device-reset';
 
+// How often this frame tells the worker it is alive, which keeps the device's
+// session cookies (sweepSessionCookies in label-sw.js; its SESSION_GAP_MS is
+// several of these).
+const ALIVE_EVERY_MS = 60 * 1000;
+
 // Redialing the signaling socket after it drops under a live session. The
 // first attempt waits a second, because the usual cause is the server
 // restarting and that takes a moment; after that it backs off, since each
@@ -592,6 +597,7 @@ class BitBangConnection {
         console.log('[Connection] ctor', this.sessionId);
         this.candidateQueue = new CandidateQueue();
         this.remoteDescriptionSet = false;
+        this.answerSent = false;          // local candidates wait for it
         // Upload progress, for whichever device page started the upload
         // (ota.html, the CLI's file browser). The whole vocabulary:
         // uploadProgress { loaded, total }, uploadComplete (all bytes
@@ -1753,8 +1759,9 @@ class BitBangConnection {
             sdp: this.pc.localDescription.sdp,
             encrypted_request: encryptedRequest,
         }));
+        this.answerSent = true;
 
-        // Flush buffered local candidates
+        // Flush buffered local candidates, now that they follow the answer.
         this.candidateQueue.drainLocal(m => this.ws.send(JSON.stringify(m)));
 
         // Reassurance banner: if the connection still isn't up after
@@ -1873,8 +1880,12 @@ class BitBangConnection {
         };
 
         pc.onicecandidate = (event) => {
-            if (event.candidate) {
-                const cand = event.candidate.candidate || '';
+            // Firefox ends gathering with a candidate whose string is empty,
+            // as well as the null event. Nothing to trickle, and bitbang-python
+            // (aiortc's candidate_from_sdp) fails on it, which costs the device
+            // its signaling socket for a few seconds.
+            if (event.candidate && event.candidate.candidate) {
+                const cand = event.candidate.candidate;
                 if (this.debug) {
                     // SDP candidate line: candidate:foundation comp proto prio addr port typ <type> ...
                     const m = cand.match(/typ (\S+)/);
@@ -1892,8 +1903,14 @@ class BitBangConnection {
                 // has never heard of. Queued instead, which for a session whose
                 // own socket is gone means dropped at the next teardown -- the
                 // only honest thing to do with it.
+                //
+                // And not before the answer. The answer waits on bitba.ng's
+                // page for its proof, and a browser that gathers quickly
+                // (Firefox) has candidates before that round trip is done.
+                // Sent first, they reach a device that has no answer to put
+                // them on; pion shrugs, aiortc fails the session.
                 if (this.ws?.readyState === WebSocket.OPEN && !this.ws.bbControl
-                        && this.remoteDescriptionSet) {
+                        && this.answerSent) {
                     this.ws.send(JSON.stringify(msg));
                 } else {
                     this.candidateQueue.pushLocal(msg);
@@ -2622,6 +2639,7 @@ class BitBangConnection {
         this.pc = null;
         this.ws = null;
         this.remoteDescriptionSet = false;
+        this.answerSent = false;
         this.deviceVerified = false;
         this.connectResolve = null;
         this.candidateQueue = new CandidateQueue();
@@ -3238,6 +3256,13 @@ class BitBangConnection {
             debug: this.debug,
             noCookieJar: this.noCookieJar,
         });
+        // While this tab is open, the device's session cookies are in use:
+        // the worker drops them only once no tab has said so for a few
+        // minutes (sweepSessionCookies in label-sw.js).
+        const alive = () => navigator.serviceWorker.ready
+            .then(r => r.active?.postMessage({ type: 'alive' })).catch(() => {});
+        alive();
+        setInterval(alive, ALIVE_EVERY_MS);
 
         // Listen for messages from the content frame. Besides the ws_*
         // traffic (handleWSShimMessage), a device page can post:

@@ -34,7 +34,7 @@
     // on requests to the device, and it is persisted. document.cookie is a
     // mirror, kept so app code that reads cookies directly -- a CSRF token, a
     // preference -- sees current values. Three things write the mirror: the
-    // preamble the service worker injects ahead of this file, X-BB-Set-Cookie on
+    // jar the service worker hands this file in its preamble, X-BB-Set-Cookie on
     // each fetch or XHR response, and a broadcast from the service worker
     // whenever the jar changes, which is what keeps other tabs current.
     //
@@ -55,11 +55,65 @@
 
     var nativeCookie = Object.getOwnPropertyDescriptor(Document.prototype, 'cookie');
 
+    // Whether this browser keeps cookies written here. WebKit can refuse
+    // document.cookie in a frame whose host differs from the top page's, even
+    // a same-site one, until that host has been visited top-level -- and a
+    // label host never is. Measured, by writing a probe and reading it back.
+    var nativeKeeps = (function() {
+        if (!nativeCookie || !nativeCookie.set || !nativeCookie.get) return false;
+        try {
+            nativeCookie.set.call(document, '__bb_probe=1;path=/');
+            var kept = /(?:^|;\s*)__bb_probe=1(?:;|$)/.test(nativeCookie.get.call(document));
+            nativeCookie.set.call(document, '__bb_probe=;path=/;expires=Thu, 01 Jan 1970 00:00:00 GMT');
+            return kept;
+        } catch (e) {
+            return false;
+        }
+    })();
+
+    // Where the browser won't keep them, the mirror is kept here instead, and
+    // document.cookie reads it: name -> { value, path, expires }. The mirror
+    // is a convenience for app code that reads cookies itself; requests carry
+    // the jar's cookies whatever happens here.
+    var shadow = {};
+
+    function shadowSet(str) {
+        var parts = String(str).split(';');
+        var eq = parts[0].indexOf('=');
+        if (eq < 0) return;
+        var name = parts[0].slice(0, eq).trim();
+        var value = parts[0].slice(eq + 1).trim();
+        var path = '/', expires = null;
+        for (var i = 1; i < parts.length; i++) {
+            var a = parts[i].trim(), k = a.split('=')[0].toLowerCase(), v = a.slice(a.indexOf('=') + 1);
+            if (k === 'path' && v) path = v;
+            else if (k === 'max-age') expires = Date.now() + (parseInt(v, 10) || 0) * 1000;
+            else if (k === 'expires' && expires === null) {
+                var t = Date.parse(v);
+                if (!isNaN(t)) expires = t;
+            }
+        }
+        if (value === '' || (expires !== null && expires <= Date.now())) delete shadow[name];
+        else shadow[name] = { value: value, path: path, expires: expires };
+    }
+
+    function shadowGet() {
+        var now = Date.now(), here = location.pathname, out = [];
+        for (var name in shadow) {
+            var c = shadow[name];
+            if (c.expires !== null && c.expires <= now) continue;
+            if (here.indexOf(c.path) !== 0) continue;
+            out.push(name + '=' + c.value);
+        }
+        return out.join('; ');
+    }
+
     // Write the mirror without forwarding. Where the forwarding setter could
     // not be installed, document.cookie is native anyway, so either path is
     // right.
     function mirrorCookie(str) {
-        if (nativeCookie && nativeCookie.set) nativeCookie.set.call(document, str);
+        if (!nativeKeeps) shadowSet(str);
+        else if (nativeCookie && nativeCookie.set) nativeCookie.set.call(document, str);
         else document.cookie = str;
     }
 
@@ -76,6 +130,13 @@
                 mirrorCookie(list[i]);
             }
         } catch (e) {}
+    }
+
+    // The jar as it stood when this page was served, from the worker's
+    // preamble. Before the forwarding setter below, so none of it echoes back.
+    var initial = window.__bbCookies;
+    if (initial && initial.length) {
+        for (var ci = 0; ci < initial.length; ci++) mirrorCookie(initial[ci]);
     }
 
     // The broadcast. A BroadcastChannel is per origin, so only this device's
@@ -105,9 +166,12 @@
     try {
         if (nativeCookie && nativeCookie.configurable && nativeCookie.set && nativeCookie.get) {
             Object.defineProperty(document, 'cookie', {
-                get: function() { return nativeCookie.get.call(document); },
+                get: function() {
+                    return nativeKeeps ? nativeCookie.get.call(document) : shadowGet();
+                },
                 set: function(value) {
-                    nativeCookie.set.call(document, value);
+                    if (nativeKeeps) nativeCookie.set.call(document, value);
+                    else shadowSet(value);
                     var sw = navigator.serviceWorker && navigator.serviceWorker.controller;
                     if (sw && window.__bbJarKey) {
                         sw.postMessage({ type: 'cookie_write', value: String(value) });
