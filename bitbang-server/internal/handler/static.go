@@ -63,7 +63,6 @@ var stampInputs = []string{
 	"bootstrap.js",
 	"sw.js",
 	"ws-shim.js",
-	"xhr-shim.js",
 	"stream-shim.js",
 	// The loader a device page includes, which decides what else to fetch.
 	"bitbang.js",
@@ -251,7 +250,6 @@ var allowedBitbangAssets = map[string]bool{
 	// split; this cannot, because it is compiled into firmware.
 	"bitbang.js":     true,
 	"ws-shim.js":     true,
-	"xhr-shim.js":    true,
 	"stream-shim.js": true, // renders whatever a device streams, in its page
 	"favicon.ico":    true, // handler internally maps this to favicon.png
 	// The meta-pages and panels -- settings, console, OTA -- are plugins',

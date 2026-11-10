@@ -1045,6 +1045,30 @@ class DeviceTab {
 }
 
 
+// retireOldWorker removes what the old runtime left in this origin: its
+// service worker, which carried every device's requests from here, and the
+// storage it kept -- every device's access code among it, and one cookie jar
+// for all devices. Unregistering leaves storage behind, so the caches go by
+// name. sw.js does the same when a browser fetches it; this covers a browser
+// that hasn't yet. Not awaited: nothing on this page needs a worker, and this
+// page has none of its own to keep.
+function retireOldWorker() {
+    navigator.serviceWorker?.getRegistrations?.()
+        .then((regs) => {
+            for (const r of regs) {
+                r.unregister().then((gone) => {
+                    if (gone) console.log('[Bootstrap] unregistered the old service worker');
+                }).catch(() => {});
+            }
+        })
+        .catch(() => {});
+    if (typeof caches !== 'undefined') {
+        for (const name of ['bitbang-sessions', 'bitbang-cookies', 'bitbang-active-session']) {
+            caches.delete(name).catch(() => {});
+        }
+    }
+}
+
 // Initialize. Only top-level: bitba.ng's page is never framed. (Nothing frames
 // it now that device pages live in their own origins; the check stays because
 // a framed copy would answer nobody's connection frame and connect nothing.)
@@ -1054,6 +1078,8 @@ class DeviceTab {
         console.warn('[Bootstrap] Skipping init — running inside a frame, not top-level');
         return;
     }
+
+    retireOldWorker();
 
     const pathParts = window.location.pathname.split('/').filter(Boolean);
 

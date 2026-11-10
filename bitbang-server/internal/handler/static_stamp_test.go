@@ -40,7 +40,6 @@ func stampDir(t *testing.T) string {
 		"bootstrap.js":       "const BUILD = '" + buildPlaceholder + "';\n",
 		"sw.js":              "const BUILD = '" + buildPlaceholder + "';\n",
 		"ws-shim.js":         "// ws shim\n",
-		"xhr-shim.js":        "// xhr shim\n",
 		"stream-shim.js":     "// stream shim\n",
 		"bitbang.js":         "// loader\n",
 		"panel-fold.js":      "// panel fold\n",
@@ -198,35 +197,39 @@ func TestStampedAssetsAreNotCacheable(t *testing.T) {
 	}
 }
 
-// Every asset the service worker injects into a device page has to be
-// servable, and every servable asset has to exist.
+// Every asset the label worker injects into a device page has to be
+// servable by a label host, and every servable asset has to exist.
 //
 // This is the failure it exists for, and it has happened: a new shim is added,
-// its <script src> goes into sw.js, and allowedBitbangAssets is not updated.
-// The tag 404s inside an iframe, nothing renders, and there is no error
-// anywhere a person is looking. The same for a name in the whitelist whose
+// its <script src> goes into the worker, and the list of what is served is
+// not updated. The tag 404s inside an iframe, nothing renders, and there is
+// no error anywhere a person is looking. The same for a listed name whose
 // file was never added or was later renamed.
+//
+// Device pages are served in their own origins now (label.go), so the list
+// that matters is labelAssets; the label start page's own script is checked
+// the same way.
 //
 // Reads the real web/ rather than a fixture, because a fixture would agree
 // with whatever the test itself wrote.
 func TestInjectedScriptsAreServable(t *testing.T) {
 	web := filepath.Join("..", "..", "web")
-	sw, err := os.ReadFile(filepath.Join(web, "sw.js"))
-	if err != nil {
-		t.Skipf("no web/ beside the package: %v", err)
-	}
-
 	re := regexp.MustCompile(`<script src=\\?"/__bitbang__/([^"\\]+)`)
-	found := re.FindAllStringSubmatch(string(sw), -1)
-	if len(found) == 0 {
-		t.Fatal("no injected /__bitbang__/ script tags found in sw.js -- " +
-			"either the injection moved or this pattern stopped matching it")
-	}
-	for _, m := range found {
-		name := m[1]
-		if !allowedBitbangAssets[name] {
-			t.Errorf("sw.js injects %s, which allowedBitbangAssets does not serve: "+
-				"it will 404 inside the device page", name)
+	for _, injector := range []string{"label-sw.js", "label-start.html"} {
+		src, err := os.ReadFile(filepath.Join(web, injector))
+		if err != nil {
+			t.Skipf("no web/ beside the package: %v", err)
+		}
+		found := re.FindAllStringSubmatch(string(src), -1)
+		if len(found) == 0 {
+			t.Fatalf("no /__bitbang__/ script tags found in %s -- "+
+				"either the injection moved or this pattern stopped matching it", injector)
+		}
+		for _, m := range found {
+			if !labelAssets[m[1]] {
+				t.Errorf("%s loads %s, which a label host does not serve: "+
+					"it will 404 inside the device page", injector, m[1])
+			}
 		}
 	}
 
@@ -236,6 +239,11 @@ func TestInjectedScriptsAreServable(t *testing.T) {
 		}
 		if _, err := os.Stat(filepath.Join(web, name)); err != nil {
 			t.Errorf("allowedBitbangAssets has %s, but web/ does not: %v", name, err)
+		}
+	}
+	for name := range labelAssets {
+		if _, err := os.Stat(filepath.Join(web, name)); err != nil {
+			t.Errorf("labelAssets has %s, but web/ does not: %v", name, err)
 		}
 	}
 }
@@ -393,8 +401,8 @@ func TestStampFollowsAChangeUnderARunningHandler(t *testing.T) {
 
 	// A shim changes, which is the case that carries no stamp of its own
 	// and so relies entirely on this.
-	if err := os.WriteFile(filepath.Join(dir, "xhr-shim.js"),
-		[]byte("// xhr shim, revised\n"), 0o644); err != nil {
+	if err := os.WriteFile(filepath.Join(dir, "device-shim.js"),
+		[]byte("// device shim, revised\n"), 0o644); err != nil {
 		t.Fatal(err)
 	}
 
@@ -417,7 +425,7 @@ func TestStampIgnoresATouchThatChangedNothing(t *testing.T) {
 	// Moved by an hour rather than rewritten, so the mtime definitely
 	// differs and the contents definitely do not -- which forces the path
 	// where the sweep decides to rehash and the hash says nothing changed.
-	path := filepath.Join(dir, "xhr-shim.js")
+	path := filepath.Join(dir, "device-shim.js")
 	later := time.Now().Add(time.Hour)
 	if err := os.Chtimes(path, later, later); err != nil {
 		t.Fatal(err)
