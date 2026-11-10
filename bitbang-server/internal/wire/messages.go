@@ -198,6 +198,13 @@ type Offer struct {
 	// through an offer. So a missed DeviceUp costs latency and the check
 	// still happens.
 	DeviceBoot string `json:"device_boot,omitempty"`
+
+	// Challenge is the device's, fresh for this offer: 16 random bytes,
+	// standard base64. The browser puts it in its encrypted payload, and the
+	// device accepts that payload once (bitbang-docs/device-origins.md, "The
+	// device challenge"). Passed through untouched; a device that sends
+	// none (older firmware and CLIs) leaves it empty.
+	Challenge string `json:"challenge,omitempty"`
 }
 
 // PairInit is sent by a connector to a pairing endpoint with a 6-digit

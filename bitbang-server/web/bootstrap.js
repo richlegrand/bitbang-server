@@ -691,6 +691,9 @@ const FRAME_SANDBOX = 'allow-scripts allow-forms allow-same-origin allow-popups 
 const LABEL_SECRET_KEY = 'bb-label-secret';
 const ROUTING_KEY_PREFIX = 'bb-routing:';
 const PIN_KEY_PREFIX = '__bb_pin_';
+// localStorage: that a device has sent a challenge, so a proof without one is
+// refused for it from then on (answerProve).
+const CHALLENGE_KEY_PREFIX = 'bb-challenge:';
 
 // A challenge as devices send it: 16 bytes, standard base64.
 const CHALLENGE_RE = /^[A-Za-z0-9+/]{22}==$/;
@@ -869,7 +872,23 @@ class DeviceTab {
                 key = imported.key;
                 this.pubkeys.set(msg.device_pubkey, key);
             }
+            // A device that has sent a challenge once always does: it is a
+            // property of its firmware, not of one offer. So a request for a
+            // challenge-less proof for such a device is a downgrade -- the
+            // connection frame, or a script driving it, asking for a
+            // payload the device would accept again and again -- and is
+            // refused. Remembered per uid in this origin's storage, where
+            // the label origin can't reach it.
+            const speaksChallenge = (() => {
+                try { return localStorage.getItem(CHALLENGE_KEY_PREFIX + this.uid) === '1'; } catch { return false; }
+            })();
+            if (challenge && !speaksChallenge) {
+                try { localStorage.setItem(CHALLENGE_KEY_PREFIX + this.uid, '1'); } catch { /* unavailable */ }
+            }
             if (!challenge) {
+                if (speaksChallenge) {
+                    return fail('this device issues challenges; refusing a payload without one');
+                }
                 // An installed CLI, which predates the challenge. Its payload
                 // can be replayed by whoever captures it, as always.
                 console.warn('[Bootstrap] device sent no challenge; payload is replayable');

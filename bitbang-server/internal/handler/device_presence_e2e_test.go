@@ -176,3 +176,41 @@ func TestAnOfferCarriesTheBootIdentity(t *testing.T) {
 		t.Errorf("device_boot = %v, want cccc3333", offer["device_boot"])
 	}
 }
+
+// The device's challenge reaches the browser untouched. The server rebuilds an
+// offer from wire.Offer rather than forwarding its bytes, so a field it does
+// not know is dropped -- and a device that issues a challenge would then get
+// back only payloads without one.
+func TestAnOfferCarriesTheDeviceChallenge(t *testing.T) {
+	srv, _, teardown := testServer(t)
+	defer teardown()
+
+	uid, pub := newTestIdentity(t)
+	dev := dialWS(t, srv, "/ws/device/"+uid)
+	defer dev.Close()
+	if err := dev.WriteJSON(map[string]any{
+		"type": "register", "protocol": 3, "public_key": pub,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	readMsg(t, dev, "registered")
+
+	cli := dialWS(t, srv, "/ws/client/"+uid)
+	defer cli.Close()
+	if err := cli.WriteJSON(map[string]any{"type": "request"}); err != nil {
+		t.Fatal(err)
+	}
+	req := readMsg(t, dev, "request")
+	clientID, _ := req["client_id"].(string)
+
+	const challenge = "AAECAwQFBgcICQoLDA0ODw=="
+	if err := dev.WriteJSON(map[string]any{
+		"type": "offer", "sdp": "v=0", "client_id": clientID, "challenge": challenge,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	offer := readMsg(t, cli, "offer")
+	if offer["challenge"] != challenge {
+		t.Errorf("challenge = %v, want %s", offer["challenge"], challenge)
+	}
+}
