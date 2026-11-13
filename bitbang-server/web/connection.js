@@ -1861,17 +1861,277 @@ class SocketBridge {
     }
 }
 
+// The device's icon, as the tab's. Watches the content frame's <link
+// rel="icon"> (and friends) and sends the icon to bitba.ng's page as a data
+// URL: that page can't fetch from this origin -- a request it makes is its
+// own, so this origin's worker never sees it, and the label host would answer
+// with the start page.
+//
+// Here rather than in device-shim.js, where the address tracking is: the
+// shim's fetches are the device page's, under the device's own CSP, and a
+// connect-src that leaves out 'self' would cost the tab its icon. From here
+// nothing of the device's applies, and nothing is missed by starting on load:
+// the first scan sees whatever the page named while it parsed.
+//
+// The MutationObserver has no timeout, so an app that sets its icon late (an
+// SPA bootstrap seconds after load) is still picked up, and attribute changes
+// cover one that swaps the href in place. It is attached per page load, so
+// observers don't accumulate across navigations; the icon itself is kept
+// across them, as a tab keeps one.
+class IconWatcher {
+    constructor(debug) {
+        this.href = null;     // the href last sent up, so a no-op change sends nothing
+        this.set = false;     // a page has named an icon (the fallback stays out)
+        // Fires on every DOM mutation in the device page, so only with !debug.
+        this.dbg = debug ? (...args) => console.log('[favicon]', ...args) : () => {};
+    }
+
+    // A page loaded in the frame.
+    watch(iframe) {
+        try {
+            const doc = iframe.contentDocument;
+            if (doc) {
+                this.dbg('initial scan;', iframe.contentWindow.location.href);
+                const scan = () => this.apply(this.best(doc), iframe.contentWindow.location.href);
+                scan();
+                new MutationObserver(scan).observe(doc.head || doc.documentElement, {
+                    childList: true, subtree: true,
+                    attributes: true, attributeFilter: ['href', 'rel', 'sizes'],
+                });
+            } else {
+                this.dbg('no iframe.contentDocument');
+            }
+        } catch (e) {
+            this.dbg('initial scan threw:', String(e));
+        }
+
+        // Fallback: /favicon.ico, used only if no page has named an icon by
+        // the time it arrives, so it never replaces a real one.
+        if (!this.set) {
+            IconWatcher.dataURL(fetch('/favicon.ico'), true).then((url) => {
+                if (!url || this.set) return;
+                this.dbg('static probe applied');
+                this.send(url);
+            }).catch((e) => this.dbg('static probe error:', String(e)));
+        }
+    }
+
+    // The <link> to use: rel="icon" beats "shortcut icon" beats
+    // apple-touch-icon, and the larger declared size wins a tie. Keeps an
+    // apple-touch-icon from replacing the tab icon on an app that ships both.
+    best(doc) {
+        const rank = (rel) => {
+            rel = (rel || '').toLowerCase();
+            if (rel === 'icon') return 3;
+            if (rel === 'shortcut icon') return 2;
+            if (rel.includes('apple-touch-icon')) return 1;
+            return 0;
+        };
+        const size = (link) => {
+            const s = link.getAttribute('sizes');
+            if (!s || s.toLowerCase() === 'any') return 0;
+            return parseInt(s.split(/[x ]/i)[0], 10) || 0;
+        };
+        const all = [...doc.querySelectorAll('link[rel]')];
+        const candidates = all.filter(l => rank(l.rel) > 0 && l.getAttribute('href'));
+        candidates.sort((a, b) => rank(b.rel) - rank(a.rel) || size(b) - size(a));
+        const winner = candidates[0]?.getAttribute('href') || null;
+        this.dbg('scan:', all.length, 'links,', candidates.length, 'candidates, winner:', winner);
+        return winner;
+    }
+
+    // Fetch the icon here, through the worker, from the device, and send it
+    // up. An icon on another origin (a CDN) is left alone.
+    apply(rawHref, base) {
+        if (!rawHref || rawHref === this.href) return;
+        this.href = rawHref;
+        if (rawHref.startsWith('data:')) {
+            this.send(rawHref);
+            return;
+        }
+        let u;
+        try { u = new URL(rawHref, base); } catch { return; }
+        if (u.origin !== location.origin && u.protocol !== 'blob:') return;
+        IconWatcher.dataURL(fetch(u.href), false).then((url) => {
+            if (url && rawHref === this.href) this.send(url);
+        }).catch((e) => this.dbg('icon fetch failed:', String(e)));
+    }
+
+    // Larger than any tab icon needs; a device that serves a huge one keeps
+    // bitba.ng's.
+    send(dataURL) {
+        if (typeof dataURL !== 'string' || dataURL.length > 256 * 1024) return;
+        this.set = true;
+        toTop({ type: 'icon', href: dataURL });
+    }
+
+    // A response as a data URL, or null for a failed one (or, with
+    // imageOnly, one that isn't an image).
+    static async dataURL(responsePromise, imageOnly) {
+        const r = await responsePromise;
+        if (!r.ok) return null;
+        const blob = await r.blob();
+        if (imageOnly && !/^image\//.test(blob.type)) return null;
+        return new Promise((resolve) => {
+            const reader = new FileReader();
+            reader.onload = () => resolve(reader.result);
+            reader.onerror = () => resolve(null);
+            reader.readAsDataURL(blob);
+        });
+    }
+}
+
+// The content frame, #device-frame, where the device's pages render. Owns the
+// element and its address -- the device path, query and fragment, the part
+// bitba.ng's address bar shows after the code -- and what each page load
+// tells bitba.ng's page: where the frame is, its title, its icon.
+//
+// For a proxied app (routing "target-prefix") the path never carries the
+// target: this origin belongs to one target, which ProxyRequests puts back
+// on every request and report() on every address bitba.ng's page shows.
+//
+// hooks: {
+//   targetPrefix()  '/<target>', or '' for a device that routes the whole path
+//   loaded(iframe)  a page loaded: wire its streams, take the connection UI down
+//   name()          the device's name, the title for a page without one
+// }
+class ContentFrame {
+    constructor({ devicePath, deviceSearch, deviceHash }, hooks, debug) {
+        this.path = devicePath || '/';
+        this.search = deviceSearch || '';
+        this.hash = deviceHash || '';
+        this.hooks = hooks;
+        this.debug = debug;
+        this.el = null;
+        this.icons = new IconWatcher(debug);
+    }
+
+    get address() { return this.path + this.search + this.hash; }
+
+    // Whether a message came from the page in the frame.
+    isFrom(source) { return !!this.el && source === this.el.contentWindow; }
+
+    show() { if (this.el) this.el.style.display = ''; }
+    hide() { if (this.el) this.el.style.display = 'none'; }
+
+    create() {
+        const iframe = this.el = document.createElement('iframe');
+        iframe.id = 'device-frame';
+        // The same sandbox bitba.ng's page puts on this frame, which a nested
+        // frame inherits anyway: no top navigation, so a device page that
+        // tries to bust out of its frame can't take the tab. Popups are
+        // allowed only so the shim's own bb-open path is not the sole way a
+        // download or a link in a new tab can work; they are caught and sent
+        // to bitba.ng's page where the shim can see them.
+        iframe.sandbox = 'allow-scripts allow-forms allow-same-origin allow-popups allow-modals allow-downloads';
+        // A cross-origin frame gets only what its parent's allow= lists, and
+        // this one only what bitba.ng's page gave this frame (FRAME_ALLOW in
+        // bootstrap.js, which must match).
+        iframe.allow = 'autoplay; fullscreen; clipboard-read; clipboard-write; picture-in-picture; camera; microphone';
+        iframe.scrolling = 'yes';
+        iframe.style.cssText = `
+            position: fixed; top: 0; left: 0;
+            width: 100%; height: 100%;
+            border: none; z-index: 1; background: #fff;
+        `;
+        iframe.onload = () => this.onLoad();
+        // The device's own path: this origin is the device's, so nothing is
+        // prefixed and nothing needs stripping. The content frame's address
+        // is the address an app would have on the LAN.
+        iframe.src = this.address;
+        document.body.appendChild(iframe);
+    }
+
+    // Move the frame, keeping the connection.
+    go(path, search = '', hash = '') {
+        this.path = path;
+        this.search = search;
+        this.hash = hash;
+        if (this.el) this.el.src = this.address;
+        if (this.debug) console.log('[Connection] frame ->', this.address);
+    }
+
+    onLoad() {
+        const iframe = this.el;
+        // Constrain the page's body to the viewport so modal height
+        // calculations use the visible area, not the content height.
+        //
+        // border-box matters as much as the height does. Without it a page
+        // that puts padding on body -- which the settings page does, 2rem top
+        // and bottom -- is one viewport tall *plus* that padding, so it
+        // overflows by about 4rem and always shows a scrollbar with roughly
+        // 90% of itself visible. Only html and body are touched, so a page's
+        // own box model below that is its own business.
+        try {
+            const doc = iframe.contentDocument;
+            const s = doc.createElement('style');
+            s.textContent = 'html, body { height: 100% !important; '
+                          + 'box-sizing: border-box !important; '
+                          + 'overflow: auto !important; }';
+            doc.head.appendChild(s);
+        } catch (e) {}
+
+        this.hooks.loaded(iframe);
+
+        let title = '';
+        try { title = iframe.contentDocument?.title || ''; } catch (e) {}
+        setTopTitle(title || this.hooks.name() || 'BitBang');
+
+        this.icons.watch(iframe);
+        // Moves within the page are device-shim.js's to tell (bb-location),
+        // and a document without the shim -- an image, a text file -- has
+        // no moves to make.
+        this.report();
+    }
+
+    // Tell bitba.ng's page where the frame is, so the address bar follows it
+    // and refresh and bookmarks land back on the same page. The path goes up
+    // whole, target included, as the address bar shows it; bitba.ng's page
+    // puts it after the code and flags.
+    //
+    // The frame is this origin's, so its location is just its location: no
+    // prefix to strip, no target to guess back. Read here rather than taken
+    // from a message, so what goes up is where the frame actually is.
+    report() {
+        let loc;
+        try { loc = this.el.contentWindow.location; } catch (e) { return; }
+        if (this.debug) console.log('[Connection] frame at', loc.href);
+        // A frame that has left this origin (a link to a LAN address the
+        // browser can't reach anyway) has no device path to report.
+        if (loc.origin !== location.origin) return;
+        this.path = loc.pathname || '/';
+        this.search = loc.search;
+        this.hash = loc.hash;
+        toTop({
+            type: 'location',
+            path: this.hooks.targetPrefix() + this.path,
+            search: loc.search,
+            hash: loc.hash,
+        });
+    }
+
+    // bitba.ng's page asks for a path in this origin: the address bar was
+    // edited to one, or it was moved to a meta-page (/*settings). The path is
+    // a whole device path, as report() sends them. A path for another target
+    // never arrives here: bitba.ng's page reloads into that target's origin.
+    navigateTo(msg) {
+        if (!this.el || typeof msg.path !== 'string') return;
+        const tp = this.hooks.targetPrefix();
+        let path = msg.path;
+        if (tp) {
+            if (path !== tp && !path.startsWith(tp + '/')) return;
+            path = path.slice(tp.length) || '/';
+        }
+        this.go(path,
+                typeof msg.search === 'string' ? msg.search : '',
+                typeof msg.hash === 'string' ? msg.hash : '');
+    }
+}
+
 class BitBangConnection {
     constructor({ uid, target, devicePath, deviceSearch, deviceHash }) {
         this.uid = uid;
-        // The content frame's path. For a proxied app (routing
-        // "target-prefix") it never carries the target: this origin belongs
-        // to one target, which ProxyRequests.start puts back on every request
-        // and reportLocation on every address the top page shows.
-        this.devicePath = devicePath || '/';
         this.target = target || '';
-        this.deviceSearch = deviceSearch || '';
-        this.deviceHash = deviceHash || '';
         // Streams this page has asked the device for. Cleared when the data
         // channel opens, since the device knows nothing of a previous one.
         this.subscribedStreams = new Set();
@@ -1924,6 +2184,15 @@ class BitBangConnection {
         }, this.debug);
         this.sockets = new SocketBridge(this.swsp, {
             targetPrefix: () => this.targetPrefix(),
+        }, this.debug);
+        // The content frame, made once the first connection is up.
+        this.frame = new ContentFrame({ devicePath, deviceSearch, deviceHash }, {
+            targetPrefix: () => this.targetPrefix(),
+            loaded: (iframe) => {
+                this.wireStreams(iframe);
+                if (this.connectionUI) this.connectionUI.style.display = 'none';
+            },
+            name: () => this.deviceName,
         }, this.debug);
         this.relay = new RelayMonitor({
             pc: () => this.pc,
@@ -3304,7 +3573,7 @@ class BitBangConnection {
             // opposite of the truth. showReloadScreen is the existing
             // terminal path (relay expiry uses it): it marks the session
             // ended so nothing retries, hides the iframe, and offers Reload.
-            if (document.getElementById('device-frame')) {
+            if (this.frame.el) {
                 this.showReloadScreen(msg.message || 'The device ended this session');
             } else {
                 this._printError(msg.message || 'Connection refused');
@@ -3328,8 +3597,7 @@ class BitBangConnection {
                 const stream = event.streams[0];
                 this.resolvedStreams['camera'] = stream;
                 if (this.debug) console.log('[Connection] video track received');
-                const iframe = document.getElementById('device-frame');
-                if (iframe) this.wireStreams(iframe);
+                if (this.frame.el) this.wireStreams(this.frame.el);
             };
             pc.onicecandidate = (event) => {
                 if (event.candidate) {
@@ -3355,8 +3623,7 @@ class BitBangConnection {
         this._sessionEnded = true;
         this.reconnector.cancel();
         this._hideReconnecting();
-        const iframe = document.getElementById('device-frame');
-        if (iframe) iframe.style.display = 'none';
+        this.frame.hide();
         if (this.connectionUI) {
             this.connectionUI.className = '';
             this.connectionUI.innerHTML = `
@@ -3398,7 +3665,7 @@ class BitBangConnection {
     }
 
     async _sendConnectAndAwaitReady() {
-        this.sendConnect(this.targetPrefix() + this.devicePath);
+        this.sendConnect(this.targetPrefix() + this.frame.path);
 
         // The hold timer is armed in _onFirstConnected (which runs at DTLS-up,
         // before this point), so the wait is concurrent with device app boot.
@@ -3474,6 +3741,9 @@ class BitBangConnection {
         // traffic (SocketBridge.onPageMessage), a device page can post:
         //   bb-navigate  { path }                 move the iframe to a path
         //   bb-open-cap  { path, newTab = true }  open /<uid>#<code><path>
+        // and device-shim.js posts:
+        //   bb-open      { path, newTab }         a link or popup for a new tab
+        //   bb-location  {}                       the page moved within itself
         //
         // Kebab-case, unlike the rest of the browser's messages, because
         // device pages send these and we don't ship all of them: the CLI's
@@ -3481,9 +3751,10 @@ class BitBangConnection {
         // CLI already installed has to keep working against a new server.
         // Never rename them.
         window.addEventListener('message', (event) => {
-            const iframe = document.getElementById('device-frame');
-            if (!iframe || event.source !== iframe.contentWindow) return;
-            if (event.data?.type === 'bb-navigate') {
+            if (!this.frame.isFrom(event.source)) return;
+            if (event.data?.type === 'bb-location') {
+                this.frame.report();
+            } else if (event.data?.type === 'bb-navigate') {
                 this.handleNavigateRequest(event.data.path);
             } else if (event.data?.type === 'bb-open-cap' || event.data?.type === 'bb-open') {
                 // The device page asks to land on /<uid>#<code><path>: in a
@@ -3501,7 +3772,7 @@ class BitBangConnection {
                 if (event.data.type === 'bb-open') path = this.targetPrefix() + path;
                 toTop({ type: 'open', path, newTab: event.data.newTab !== false });
             } else {
-                this.sockets.onPageMessage(event.data, iframe.contentWindow);
+                this.sockets.onPageMessage(event.data, event.source);
             }
         });
 
@@ -3509,7 +3780,7 @@ class BitBangConnection {
         // network, a label host answers every path with this page.
         await this.waitForController();
 
-        this.createIframe();
+        this.frame.create();
     }
 
     // The target as a path prefix, '/<target>', or '' for a device that
@@ -3580,271 +3851,16 @@ class BitBangConnection {
             return;
         }
         const framePath = path.slice(tp.length) || '/';
+        // Now, so a reconnect before 'ready' asks for this path.
+        this.frame.path = framePath;
 
-        const iframe = document.getElementById('device-frame');
-        this.devicePath = framePath;
-
-        // Set up a resolve callback for the auth flow
-        const navigateAfterAuth = () => {
-            if (iframe) {
-                iframe.src = framePath;
-                iframe.style.display = '';
-            }
+        // On 'ready', which follows a PIN if the path wants one.
+        this.connectResolve = () => {
+            this.frame.go(framePath);
+            this.frame.show();
             if (this.connectionUI) this.connectionUI.style.display = 'none';
         };
-        this.connectResolve = navigateAfterAuth;
         this.sendConnect(path);
-    }
-
-    createIframe() {
-        const iframe = document.createElement('iframe');
-        iframe.id = 'device-frame';
-        // The same sandbox bitba.ng's page puts on this frame, which a nested
-        // frame inherits anyway: no top navigation, so a device page that
-        // tries to bust out of its frame can't take the tab. Popups are
-        // allowed only so the shim's own bb-open path is not the sole way a
-        // download or a link in a new tab can work; they are caught and sent
-        // to bitba.ng's page where the shim can see them.
-        iframe.sandbox = 'allow-scripts allow-forms allow-same-origin allow-popups allow-modals allow-downloads';
-        // A cross-origin frame gets only what its parent's allow= lists, and
-        // this one only what bitba.ng's page gave this frame (FRAME_ALLOW in
-        // bootstrap.js, which must match).
-        iframe.allow = 'autoplay; fullscreen; clipboard-read; clipboard-write; picture-in-picture; camera; microphone';
-        iframe.scrolling = 'yes';
-        iframe.style.cssText = `
-            position: fixed; top: 0; left: 0;
-            width: 100%; height: 100%;
-            border: none; z-index: 1; background: #fff;
-        `;
-
-        iframe.onload = () => {
-            // Constrain the iframe body to the viewport so modal height
-            // calculations use the visible area, not the content height.
-            //
-            // border-box matters as much as the height does. Without it a page
-            // that puts padding on body -- which the settings page does, 2rem
-            // top and bottom -- is one viewport tall *plus* that padding, so it
-            // overflows by about 4rem and always shows a scrollbar with
-            // roughly 90% of itself visible. Only html and body are touched,
-            // so a page's own box model below that is its own business.
-            try {
-                const doc = iframe.contentDocument;
-                const s = doc.createElement('style');
-                s.textContent = 'html, body { height: 100% !important; '
-                              + 'box-sizing: border-box !important; '
-                              + 'overflow: auto !important; }';
-                doc.head.appendChild(s);
-            } catch (e) {}
-
-            this.wireStreams(iframe);
-            if (this.connectionUI) this.connectionUI.style.display = 'none';
-
-            let iframeTitle = '';
-            try { iframeTitle = iframe.contentDocument?.title || ''; } catch (e) {}
-            setTopTitle(iframeTitle || this.deviceName || "BitBang");
-
-            // Favicon forwarding. Watches the iframe's <link rel="icon">
-            // (and friends) and sends the icon to bitba.ng's page, which
-            // shows it as the tab's. As a data URL: bitba.ng's page can't
-            // fetch from this origin -- a request it makes is its own, so
-            // this origin's worker never sees it, and the label host would
-            // answer with the start page.
-            //
-            //   applyDeviceFavicon  fetches the icon here, through the
-            //                       worker, and sends it up. No-ops for
-            //                       cross-origin hrefs (rare but possible
-            //                       for icons on a CDN).
-            //
-            //   findBestIcon        picks a <link>: rel="icon" beats
-            //                       "shortcut icon" beats apple-touch-icon;
-            //                       larger declared size wins ties. Guards
-            //                       against `apple-touch-icon` clobbering
-            //                       the tab icon on apps that ship both.
-            //
-            // The MutationObserver has NO timeout — apps that init their
-            // favicon late (SPA bootstraps that run seconds after
-            // iframe.onload) still get picked up. Attribute mutations on
-            // href/rel/sizes also trigger it, covering apps that swap the
-            // href in place. Observer is re-attached per iframe.onload,
-            // so it doesn't accumulate across full navigations.
-            // Favicon diagnostics. These fire on every DOM mutation in the
-            // proxied app, so they are gated behind the debug flag rather
-            // than left on -- silent in normal operation, recoverable with
-            // the !debug URL flag when the favicon misbehaves.
-            const dbg = this.debug
-                ? (...args) => console.log('[favicon]', ...args)
-                : () => {};
-
-            // The href last sent up, so a mutation that changes nothing sends
-            // nothing. Per frame, not per page load: bitba.ng's page keeps
-            // the icon across the content frame's navigations, as a tab does.
-            const applyDeviceFavicon = (rawHref) => {
-                if (!rawHref || rawHref === this._iconHref) return;
-                this._iconHref = rawHref;
-                if (rawHref.startsWith('data:')) {
-                    sendIcon(rawHref);
-                    return;
-                }
-                let u;
-                try { u = new URL(rawHref, iframe.contentWindow.location.href); }
-                catch { return; }
-                if (u.origin !== window.location.origin && u.protocol !== 'blob:') return;
-                // Through this origin's worker, from the device.
-                fetch(u.href).then(r => (r.ok ? r.blob() : null)).then((blob) => {
-                    if (!blob || rawHref !== this._iconHref) return;
-                    const reader = new FileReader();
-                    reader.onload = () => sendIcon(reader.result);
-                    reader.readAsDataURL(blob);
-                }).catch((e) => dbg('icon fetch failed:', String(e)));
-            };
-            // Larger than any tab icon needs; a device that serves a huge one
-            // keeps bitba.ng's.
-            const sendIcon = (dataURL) => {
-                if (typeof dataURL !== 'string' || dataURL.length > 256 * 1024) return;
-                this._iconSet = true;
-                toTop({ type: 'icon', href: dataURL });
-            };
-
-            const findBestIcon = (doc) => {
-                if (!doc) return null;
-                const rank = (rel) => {
-                    rel = (rel || '').toLowerCase();
-                    if (rel === 'icon') return 3;
-                    if (rel === 'shortcut icon') return 2;
-                    if (rel.includes('apple-touch-icon')) return 1;
-                    return 0;
-                };
-                const sizeArea = (link) => {
-                    const s = link.getAttribute('sizes');
-                    if (!s || s.toLowerCase() === 'any') return 0;
-                    const [w] = s.split(/[x ]/i);
-                    return parseInt(w, 10) || 0;
-                };
-                const all = [...doc.querySelectorAll('link[rel]')];
-                const candidates = all.filter(l => rank(l.rel) > 0 && l.getAttribute('href'));
-                candidates.sort((a, b) => rank(b.rel) - rank(a.rel) || sizeArea(b) - sizeArea(a));
-                const winner = candidates[0]?.getAttribute('href') || null;
-                dbg('scan:', all.length, 'links,', candidates.length, 'candidates, winner:', winner);
-                return winner;
-            };
-
-            try {
-                const doc = iframe.contentDocument;
-                if (doc) {
-                    dbg('initial scan;', iframe.contentWindow.location.href);
-                    applyDeviceFavicon(findBestIcon(doc));
-                    new MutationObserver(() => {
-                        applyDeviceFavicon(findBestIcon(doc));
-                    }).observe(doc.head || doc.documentElement, {
-                        childList: true, subtree: true,
-                        attributes: true, attributeFilter: ['href', 'rel', 'sizes'],
-                    });
-                } else {
-                    dbg('no iframe.contentDocument');
-                }
-            } catch (e) {
-                dbg('initial scan threw:', String(e));
-            }
-
-            // Fallback: /favicon.ico, used only if no page has named an icon
-            // by the time it arrives, so it never replaces a real one.
-            if (!this._iconSet) {
-                fetch('/favicon.ico').then(r => (r.ok ? r.blob() : null)).then((blob) => {
-                    if (!blob || this._iconSet || !/^image\//.test(blob.type)) return;
-                    dbg('static probe applied');
-                    const reader = new FileReader();
-                    reader.onload = () => { if (!this._iconSet) sendIcon(reader.result); };
-                    reader.readAsDataURL(blob);
-                }).catch((e) => dbg('static probe error:', String(e)));
-            }
-
-            // Report the content frame's location to bitba.ng's page after
-            // every navigation, so refresh and bookmarks land back on the
-            // same page. Same origin as this frame, so its location is
-            // readable and its history hookable. Re-attach per load: a full
-            // navigation gives the iframe a fresh window/history.
-            //
-            // hashchange/popstate cover real hash writes and back/forward.
-            // But SPA routers (Jellyfin's React-Router hash history, etc.)
-            // navigate via history.pushState — which fires NEITHER event even
-            // when it changes the hash — so we also wrap pushState/replaceState
-            // to catch forward in-app navigation.
-            // Swallow errors: this runs inside the iframe's own pushState, so
-            // a throw here (e.g. the browser's replaceState rate limit) must
-            // not break the app's routing.
-            const sync = (src) => {
-                if (this.debug) { try { console.log('[Connection] iframe nav', src, '->', iframe.contentWindow.location.href); } catch (e) {} }
-                try { this.reportLocation(); } catch (e) {}
-            };
-            try {
-                const win = iframe.contentWindow;
-                win.addEventListener('hashchange', () => sync('hashchange'));
-                win.addEventListener('popstate', () => sync('popstate'));
-                for (const m of ['pushState', 'replaceState']) {
-                    const orig = win.history[m];
-                    win.history[m] = function (...args) {
-                        const r = orig.apply(this, args);
-                        sync(m);
-                        return r;
-                    };
-                }
-            } catch (e) {}
-
-            sync('load');
-        };
-
-        // The device's own path: this origin is the device's, so nothing is
-        // prefixed and nothing needs stripping. The content frame's address
-        // is the address an app would have on the LAN.
-        iframe.src = this.devicePath + this.deviceSearch + this.deviceHash;
-        document.body.appendChild(iframe);
-    }
-
-    // Tell bitba.ng's page where the content frame is, so the address bar
-    // follows it and refresh and bookmarks land back on the same page. The
-    // path goes up whole, target included, as the address bar shows it;
-    // bitba.ng's page puts it after the code and flags.
-    //
-    // The content frame is this origin's, so its location is just its
-    // location: no prefix to strip, no target to guess back.
-    reportLocation() {
-        const iframe = document.getElementById('device-frame');
-        if (!iframe) return;
-        let loc;
-        try { loc = iframe.contentWindow.location; } catch (e) { return; }
-        // A frame that has left this origin (a link to a LAN address the
-        // browser can't reach anyway) has no device path to report.
-        if (loc.origin !== location.origin) return;
-        this.devicePath = loc.pathname || '/';
-        this.deviceSearch = loc.search;
-        this.deviceHash = loc.hash;
-        toTop({
-            type: 'location',
-            path: this.targetPrefix() + this.devicePath,
-            search: loc.search,
-            hash: loc.hash,
-        });
-    }
-
-    // bitba.ng's page asks for a path in this origin: the address bar was
-    // edited to one, or it was moved to a meta-page (/*settings). The path is
-    // a whole device path, as reportLocation sends them. Answered by moving
-    // the content frame, keeping the connection. A path for another target
-    // never arrives here: bitba.ng's page reloads into that target's origin.
-    navigateTo(msg) {
-        const iframe = document.getElementById('device-frame');
-        if (!iframe || typeof msg.path !== 'string') return;
-        const tp = this.targetPrefix();
-        let path = msg.path;
-        if (tp) {
-            if (path !== tp && !path.startsWith(tp + '/')) return;
-            path = path.slice(tp.length) || '/';
-        }
-        this.devicePath = path;
-        this.deviceSearch = typeof msg.search === 'string' ? msg.search : '';
-        this.deviceHash = typeof msg.hash === 'string' ? msg.hash : '';
-        iframe.src = this.devicePath + this.deviceSearch + this.deviceHash;
-        if (this.debug) console.log('[Connection] navigate in place ->', iframe.src);
     }
 
     // Tell the device whether this page wants a stream.
@@ -4008,7 +4024,7 @@ class BitBangConnection {
     window.__bitbangConnection = connection;
     fromTop((msg) => {
         if (msg.type === 'pin') connection.onTopPIN(msg);
-        else if (msg.type === 'navigate') connection.navigateTo(msg);
+        else if (msg.type === 'navigate') connection.frame.navigateTo(msg);
     });
     // Taken down in onDataChannelReady once the first connection is up.
     if (deviceReset) connection._showReconnecting(DEVICE_RESET_TEXT);

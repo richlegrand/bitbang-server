@@ -18,6 +18,8 @@
  *      top-level has nothing to connect with (label.go).
  *   4. The label worker kept in place: a page's own worker registration is a
  *      no-op, and unregistering ours is refused.
+ *   5. Moves within the page (pushState, a hash write, back) told to the
+ *      connection frame (bb-location), so bitba.ng's address bar follows.
  *
  * None of this is a security boundary. Device script can undo any of it, and
  * nothing it gains by doing so reaches past its own device.
@@ -343,4 +345,32 @@
     // "open from your link" page.
     window.addEventListener('click', onLinkActivate);
     window.addEventListener('auxclick', onLinkActivate);
+
+    // -- The address ---------------------------------------------------------
+    //
+    // bitba.ng's address bar follows this frame, so refresh and bookmarks
+    // land back on the same page. The connection frame reports where the
+    // frame is on every load (ContentFrame.report); a move within the page
+    // is told it here, as bb-location, and it reads the address itself.
+    //
+    // hashchange and popstate cover hash writes and back/forward. A router
+    // moves with history.pushState and replaceState, which fire neither, so
+    // those are wrapped too -- here, before the page's own scripts run. The
+    // connection frame used to wrap them on load, which missed a router that
+    // had already kept its own reference to pushState, as a bundled one may:
+    // it moved, and the address bar stayed where it was.
+    function moved() {
+        try { window.parent.postMessage({ type: 'bb-location' }, location.origin); } catch (e) {}
+    }
+    window.addEventListener('hashchange', moved);
+    window.addEventListener('popstate', moved);
+    ['pushState', 'replaceState'].forEach(function(m) {
+        var orig = history[m];
+        if (typeof orig !== 'function') return;
+        history[m] = function() {
+            var r = orig.apply(this, arguments);
+            moved();
+            return r;
+        };
+    });
 })();
