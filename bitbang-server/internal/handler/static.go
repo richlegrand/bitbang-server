@@ -61,6 +61,8 @@ var stampedAssets = map[string]bool{
 var stampInputs = []string{
 	"bootstrap.html",
 	"bootstrap.js",
+	// Loaded by bitba.ng's page, the connection frame and the label worker.
+	"runtime-common.js",
 	"sw.js",
 	"ws-shim.js",
 	"stream-shim.js",
@@ -246,6 +248,9 @@ func serveStampedAs(w http.ResponseWriter, staticDir, name, stamp, contentType s
 var allowedBitbangAssets = map[string]bool{
 	"sw.js":        true,
 	"bootstrap.js": true,
+	// What bitba.ng's page shares with a label host's (labelAssets has it
+	// too), loaded by bootstrap.html before bootstrap.js.
+	"runtime-common.js": true,
 	// The one asset a device page names. Everything behind it can be renamed or
 	// split; this cannot, because it is compiled into firmware.
 	"bitbang.js":     true,

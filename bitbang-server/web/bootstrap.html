@@ -24,21 +24,15 @@
          the request goes straight to bitbang-server's static.go,
          which maps favicon.ico → favicon.png. -->
     <link rel="icon" type="image/png" href="/__bitbang__/favicon.ico">
+    <script src="/__bitbang__/runtime-common.js"></script>
     <script>
         // !debug (fragment flag, see CONVENTIONS.md) loads eruda -- a floating
         // console/network/storage panel for mobile, where browser DevTools
         // aren't available. Loaded async so it doesn't block the connection
-        // sequence. Parsed inline here because this runs before bootstrap.js
-        // — grammar: `#<code>!debug[,other-flags][/device-url]`.
+        // sequence, and from here rather than bootstrap.js so it is up before
+        // anything there runs.
         (function () {
-            const frag = location.hash ? location.hash.slice(1) : '';
-            let i = 0;
-            while (i < frag.length && /[A-Za-z0-9_-]/.test(frag[i])) i++;
-            if (frag[i] !== '!') return;
-            let j = i + 1;
-            while (j < frag.length && frag[j] !== '/') j++;
-            const flags = frag.slice(i + 1, j).split(',');
-            if (!flags.includes('debug')) return;
+            if (!parseUrlFlags().debug) return;
             const s = document.createElement('script');
             // An exact version, with its hash: a changed file is refused
             // rather than run with the access code in this page's URL.

@@ -25,47 +25,9 @@
 // handler.buildStamp).
 const BUILD = '__BB_BUILD__';
 
-// Parse Bitbang URL flags from the fragment. Grammar (see CONVENTIONS.md
-// "URL and credential terms"):
-//
-//   fragment  = <code> [ '!' <flag-list> ] [ '/' <device-URL> ]
-//   flag-list = <flag> [ ',' <flag> ]*
-//   flag      = <name> [ '=' <value> ]
-//
-// Flags live in the fragment, so the signaling server never sees them.
-// Returns { debug, nocookiejar, relay, norelay, msg_timeout } — booleans
-// are true when the flag is present, msg_timeout carries the parsed value
-// or undefined. Reads window.location.hash every call so callers see the
-// current state (URL fragment can change via history.replaceState).
-function parseUrlFlags() {
-    const frag = window.location.hash ? window.location.hash.slice(1) : '';
-    let i = 0;
-    while (i < frag.length && /[A-Za-z0-9_-]/.test(frag[i])) i++;
-    if (frag[i] !== '!') return {};
-    let j = i + 1;
-    while (j < frag.length && frag[j] !== '/') j++;
-    const out = {};
-    for (const tok of frag.slice(i + 1, j).split(',')) {
-        if (!tok) continue;
-        const eq = tok.indexOf('=');
-        if (eq >= 0) out[tok.slice(0, eq)] = tok.slice(eq + 1);
-        else out[tok] = true;
-    }
-    return out;
-}
-
-// Read the raw '!<flag-list>' segment from the current URL fragment (with
-// leading '!'), or '' if no flag section is present. Used to preserve the flag
-// tail verbatim in the address bar, and to hand it to the connection frame.
-function readUrlFlagString() {
-    const frag = window.location.hash ? window.location.hash.slice(1) : '';
-    let i = 0;
-    while (i < frag.length && /[A-Za-z0-9_-]/.test(frag[i])) i++;
-    if (frag[i] !== '!') return '';
-    let j = i + 1;
-    while (j < frag.length && frag[j] !== '/') j++;
-    return frag.slice(i, j);
-}
+// The fragment's grammar and its parser (parseFragment, parseUrlFlags),
+// extractDTLSFingerprint and CandidateQueue are in runtime-common.js, which
+// bootstrap.html loads first.
 
 // --- Bidirectional verify helpers ----------------------------------------
 //
@@ -120,19 +82,6 @@ function bytesToBase64Url(bytes) {
 async function uidFromPubkeyDer(derBytes) {
     const hash = await crypto.subtle.digest('SHA-256', derBytes);
     return bytesToBase64Url(new Uint8Array(hash).slice(0, 16));
-}
-
-// extractDTLSFingerprint pulls "a=fingerprint:sha-256 AA:BB:..." out of an
-// SDP and normalizes to uppercase. The device runs the same parse on its end
-// (peer/verify.go) so the strings compare directly.
-function extractDTLSFingerprint(sdp) {
-    const lines = (sdp || '').split('\n');
-    for (const raw of lines) {
-        const line = raw.replace(/\r$/, '');
-        const m = /^a=fingerprint:sha-256\s+([0-9A-Fa-f:]+)\s*$/.exec(line);
-        if (m) return m[1].toUpperCase();
-    }
-    return '';
 }
 
 // A SHA-256 DTLS fingerprint as SDP writes it, "AB:CD:...", 32 pairs.
@@ -205,24 +154,6 @@ async function sha256Base64(bytes) {
     return bytesToBase64(new Uint8Array(hash));
 }
 
-
-// Buffer ICE candidates that arrive (or are produced) before the remote
-// description is set, then drain them in arrival order. Used by the pair
-// (PairingFlow) handshake here; connection.js has its own copy for the direct
-// one. The readiness gate lives at the call site.
-class CandidateQueue {
-    constructor() { this.local = []; this.remote = []; }
-    pushLocal(msg)  { this.local.push(msg); }
-    pushRemote(c)   { this.remote.push(c); }
-    drainLocal(send) {
-        for (const m of this.local) send(m);
-        this.local.length = 0;
-    }
-    drainRemote(add) {
-        for (const c of this.remote) add(c);
-        this.remote.length = 0;
-    }
-}
 
 // ============================================================================
 // Pairing (code exchange) — the browser connector side.
@@ -619,31 +550,11 @@ function showBookmarkModal() {
 // pair-code/empty-path routing first.
 function parseDeviceURL() {
     const uid = window.location.pathname.split('/').filter(Boolean)[0];
-
-    const frag = window.location.hash ? window.location.hash.slice(1) : '';
-    let i = 0;
-    while (i < frag.length && /[A-Za-z0-9_-]/.test(frag[i])) i++;
-    const code = frag.slice(0, i);
-    // Skip the optional !<flag-list> — it ends at the first '/' (which
-    // starts the device URL) or at end-of-fragment.
-    if (frag[i] === '!') {
-        while (i < frag.length && frag[i] !== '/') i++;
-    }
-    const rest = frag.slice(i);            // '' or `/path?query#hash`
-
-    let devicePath = '/', deviceSearch = '', deviceHash = '';
-    if (rest) {
-        const h = rest.indexOf('#');
-        deviceHash = h >= 0 ? rest.slice(h) : '';
-        const beforeHash = h >= 0 ? rest.slice(0, h) : rest;
-        const q = beforeHash.indexOf('?');
-        deviceSearch = q >= 0 ? beforeHash.slice(q) : '';
-        devicePath = (q >= 0 ? beforeHash.slice(0, q) : beforeHash) || '/';
-    }
-    devicePath = stripDeviceScheme(devicePath);
+    const f = parseFragment(window.location.hash);
+    let devicePath = stripDeviceScheme(f.devicePath);
     if (/^\/[^/]+:\d+$/.test(devicePath)) devicePath += '/';
 
-    return { uid, code, devicePath, deviceSearch, deviceHash };
+    return { uid, code: f.head, devicePath, deviceSearch: f.deviceSearch, deviceHash: f.deviceHash };
 }
 
 // Strip an explicit http/https scheme from the device path.
@@ -774,12 +685,14 @@ class DeviceTab {
     constructor({ uid, code, devicePath, deviceSearch, deviceHash }) {
         this.uid = uid;
         this.code = code || '';
-        this.flagStr = readUrlFlagString();
+        // The flags as typed, to hand to the connection frame and keep in
+        // the address bar.
+        this.flagStr = parseFragment(location.hash).flagString;
         this.debug = !!parseUrlFlags().debug;
         this.target = targetFor(uid, devicePath);
         // The content frame's path is the device path without the target:
         // the label origin belongs to that target alone.
-        const tp = this.target ? '/' + this.target : '';
+        const tp = targetPrefix(this.target);
         this.framePath = (devicePath || '/').slice(tp.length) || '/';
         this.deviceSearch = deviceSearch || '';
         this.deviceHash = deviceHash || '';
@@ -945,7 +858,7 @@ class DeviceTab {
     // the content frame moves, and the connection stays.
     onHashChange() {
         const p = parseDeviceURL();
-        if (p.code !== this.code || readUrlFlagString() !== this.flagStr) {
+        if (p.code !== this.code || parseFragment(location.hash).flagString !== this.flagStr) {
             location.reload();
             return;
         }

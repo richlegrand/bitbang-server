@@ -263,71 +263,22 @@ const STATUS = {
 // agent withholds relay nomination), and the connector trickles all
 // candidates immediately. See bitbang/CONVENTIONS.md "Favoring direct on
 // slow & embedded devices".
-//
-// Parse Bitbang URL flags from the fragment. Grammar (see CONVENTIONS.md
-// "URL and credential terms"):
-//
-//   fragment  = <code> [ '!' <flag-list> ] [ '/' <device-URL> ]
-//   flag-list = <flag> [ ',' <flag> ]*
-//   flag      = <name> [ '=' <value> ]
-//
-// Flags live in the fragment, so the signaling server never sees them.
-// Returns { debug, nocookiejar, relay, norelay, msg_timeout } — booleans
-// are true when the flag is present, msg_timeout carries the parsed value
-// or undefined. Reads window.location.hash every call so callers see the
-// current state (URL fragment can change via history.replaceState).
-function parseUrlFlags() {
-    const frag = window.location.hash ? window.location.hash.slice(1) : '';
-    let i = 0;
-    while (i < frag.length && /[A-Za-z0-9_-]/.test(frag[i])) i++;
-    // This frame's own URL has an @<target> after the uid (parseStartURL).
-    if (frag[i] === '@') {
-        while (i < frag.length && frag[i] !== '!' && frag[i] !== '/') i++;
-    }
-    if (frag[i] !== '!') return {};
-    let j = i + 1;
-    while (j < frag.length && frag[j] !== '/') j++;
-    const out = {};
-    for (const tok of frag.slice(i + 1, j).split(',')) {
-        if (!tok) continue;
-        const eq = tok.indexOf('=');
-        if (eq >= 0) out[tok.slice(0, eq)] = tok.slice(eq + 1);
-        else out[tok] = true;
-    }
-    return out;
-}
 
 // parseStartURL reads this frame's own URL, which bitba.ng's page built:
 //
 //     /__bb/start#<uid>[@<target>][!flags][/path]
 //
 // The path is the content frame's: for a proxied app, without its target,
-// which this frame puts back on every request (handleProxyRequest).
+// which this frame puts back on every request (handleProxyRequest). The
+// grammar and its parser, parseFragment, are runtime-common.js's, as are
+// parseUrlFlags, extractDTLSFingerprint, CandidateQueue and UPLOAD_CREDIT;
+// label-start.html loads it first.
 function parseStartURL() {
-    const frag = window.location.hash ? window.location.hash.slice(1) : '';
-    let i = 0;
-    while (i < frag.length && /[A-Za-z0-9_-]/.test(frag[i])) i++;
-    const uid = frag.slice(0, i);
-    let target = '';
-    if (frag[i] === '@') {
-        const start = ++i;
-        while (i < frag.length && frag[i] !== '!' && frag[i] !== '/') i++;
-        target = decodeURIComponent(frag.slice(start, i));
-    }
-    if (frag[i] === '!') {
-        while (i < frag.length && frag[i] !== '/') i++;
-    }
-    const rest = frag.slice(i);
-    let devicePath = '/', deviceSearch = '', deviceHash = '';
-    if (rest) {
-        const h = rest.indexOf('#');
-        deviceHash = h >= 0 ? rest.slice(h) : '';
-        const beforeHash = h >= 0 ? rest.slice(0, h) : rest;
-        const q = beforeHash.indexOf('?');
-        deviceSearch = q >= 0 ? beforeHash.slice(q) : '';
-        devicePath = (q >= 0 ? beforeHash.slice(0, q) : beforeHash) || '/';
-    }
-    return { uid, target, devicePath, deviceSearch, deviceHash };
+    const f = parseFragment(window.location.hash);
+    return {
+        uid: f.head, target: f.target,
+        devicePath: f.devicePath, deviceSearch: f.deviceSearch, deviceHash: f.deviceHash,
+    };
 }
 
 // Override via !msg_timeout=N (seconds, float-OK). Defaults to 3 seconds.
@@ -351,10 +302,6 @@ const FLAG_MORE = 0x0002;  // non-final fragment of a chunked WS message
 const SWSP_VERSION = 4;
 const STREAM_WINDOW = 1 << 20;
 const STREAM_WINDOW_UPDATE_AT = STREAM_WINDOW / 2;
-// What the service worker may hand over of a request body beyond what has
-// gone onto the data channel. Both sides start with it implicitly;
-// label-sw.js has the matching constant.
-const UPLOAD_CREDIT = 1 << 20;
 
 // Stream chunk header, little-endian:
 //
@@ -459,20 +406,8 @@ const SIGNAL_REDIAL_MAX_MS = 30000;
 // and this frame rejects the channel.
 //
 // All of the payload is made by bitba.ng's page (askProof), which checks the
-// key against the uid first. This frame only reads its own fingerprint.
-
-// extractDTLSFingerprint pulls "a=fingerprint:sha-256 AA:BB:..." out of an
-// SDP and normalizes to uppercase. The device runs the same parse on its end
-// (peer/verify.go) so the strings compare directly.
-function extractDTLSFingerprint(sdp) {
-    const lines = (sdp || '').split('\n');
-    for (const raw of lines) {
-        const line = raw.replace(/\r$/, '');
-        const m = /^a=fingerprint:sha-256\s+([0-9A-Fa-f:]+)\s*$/.exec(line);
-        if (m) return m[1].toUpperCase();
-    }
-    return '';
-}
+// key against the uid first. This frame only reads its own fingerprint
+// (extractDTLSFingerprint, in runtime-common.js).
 
 // One stream's SWSP v4 credit, both directions. Cumulative counts, as on the
 // wire: a window_update names the total the peer may send, so a duplicate or
@@ -540,25 +475,6 @@ class StreamCredit {
         this.lastUpdate = this.consumed;
         this.receiveLimit = this.consumed + STREAM_WINDOW;
         return this.receiveLimit;
-    }
-}
-
-// Buffer ICE candidates that arrive (or are produced) before the remote
-// description is set, then drain them in arrival order. Used by both the
-// direct (BitBangConnection) and pair (PairingFlow) handshakes — the
-// readiness gate lives at the call site because each flow tracks
-// remote-description state and ws-open state differently.
-class CandidateQueue {
-    constructor() { this.local = []; this.remote = []; }
-    pushLocal(msg)  { this.local.push(msg); }
-    pushRemote(c)   { this.remote.push(c); }
-    drainLocal(send) {
-        for (const m of this.local) send(m);
-        this.local.length = 0;
-    }
-    drainRemote(add) {
-        for (const c of this.remote) add(c);
-        this.remote.length = 0;
     }
 }
 
@@ -3314,7 +3230,7 @@ class BitBangConnection {
     // The target as a path prefix, '/<target>', or '' for a device that
     // routes the whole path itself.
     targetPrefix() {
-        return this.target ? '/' + this.target : '';
+        return targetPrefix(this.target);
     }
 
     // A page loaded with a hard reload (Ctrl+Shift+R) starts uncontrolled --

@@ -29,6 +29,11 @@ const BUILD = '__BB_BUILD__';
 
 console.log('[label-sw] booted', BUILD);
 
+// What this worker shares with the connection frame (UPLOAD_CREDIT). At the
+// top, as importScripts has to be: a worker can only import while it first
+// runs.
+importScripts('/__bitbang__/runtime-common.js');
+
 self.addEventListener('install', () => self.skipWaiting());
 self.addEventListener('activate', (event) => event.waitUntil(self.clients.claim()));
 
@@ -189,8 +194,8 @@ self.addEventListener('message', async (event) => {
 // Flow between this worker and connection.js, per proxied request (see
 // proxyToDevice).
 //
-// UPLOAD_CREDIT: how much of a request body may be handed over beyond what
-// connection.js has sent on. connection.js has the same constant and raises
+// UPLOAD_CREDIT (runtime-common.js): how much of a request body may be
+// handed over beyond what connection.js has sent on. connection.js raises
 // the limit with upload_credit.
 //
 // CONSUMED_REPORT_BYTES: how much of a response the reader takes before it is
@@ -199,7 +204,6 @@ self.addEventListener('message', async (event) => {
 //
 // BUFFERED_BODY_PIECE: the size a body that had to be read whole (no
 // Request.body: Firefox) is handed over in.
-const UPLOAD_CREDIT = 1 << 20;
 const CONSUMED_REPORT_BYTES = 64 * 1024;
 const BUFFERED_BODY_PIECE = 256 * 1024;
 
@@ -407,6 +411,20 @@ function parseCookie(setCookieStr) {
 // (falsy), so their cookies keep mirroring until the app re-issues them.
 function isMirrorable(cookie) {
     return !cookie.httpOnly;
+}
+
+// The jar's cookies as device-shim.js writes them into document.cookie:
+// unexpired, HttpOnly left out (the invariant above), each a
+// "name=value;path=...[;expires=...]" string. Both of the worker's mirror
+// sources use it, the preamble's window.__bbCookies and the BroadcastChannel,
+// so the shim writes one form whichever told it. The expiry goes with each:
+// without it every mirrored cookie would be a session one.
+function mirrorStrings(jarKey) {
+    const now = Date.now();
+    return (cookieJar.get(jarKey) || [])
+        .filter(c => (c.expires === null || c.expires > now) && isMirrorable(c))
+        .map(c => c.name + '=' + c.value + ';path=' + c.path
+            + (c.expires !== null ? ';expires=' + new Date(c.expires).toUTCString() : ''));
 }
 
 // Serialize a value for embedding inside an inline <script> element.
@@ -937,10 +955,7 @@ async function proxyToDevice(event) {
                     // cookie section of device-shim.js. When it went through that
                     // one, every cookie here came back without its expiry.
                     const bc = new BroadcastChannel('bitbang-cookies');
-                    bc.postMessage({
-                        jarKey,
-                        cookies: (cookieJar.get(jarKey) || []).filter(isMirrorable),
-                    });
+                    bc.postMessage({ jarKey, cookies: mirrorStrings(jarKey) });
                     bc.close();
                     delete headers['Set-Cookie'];
                     delete headers['set-cookie'];
@@ -972,25 +987,7 @@ async function proxyToDevice(event) {
                             // here, because where the browser won't keep
                             // cookies in this frame the shim keeps the mirror
                             // itself, and only it knows which.
-                            const cookieSync = [];
-                            if (!session?.noCookieJar) {
-                                const jar = cookieJar.get(jarKey);
-                                if (jar && jar.length > 0) {
-                                    const now = Date.now();
-                                    for (const c of jar) {
-                                        if (c.expires !== null && c.expires <= now) continue;
-                                        // HttpOnly stays jar-only (see invariant).
-                                        if (!isMirrorable(c)) continue;
-                                        // Expiry included, as the other two
-                                        // mirror sources in device-shim.js
-                                        // do. Without it every mirrored
-                                        // cookie would be a session one.
-                                        const exp = c.expires !== null
-                                            ? ';expires=' + new Date(c.expires).toUTCString() : '';
-                                        cookieSync.push(c.name + '=' + c.value + ';path=' + c.path + exp);
-                                    }
-                                }
-                            }
+                            const cookieSync = session?.noCookieJar ? [] : mirrorStrings(jarKey);
 
                             const eruda = session?.debug
                                 ? '<script src="https://cdn.jsdelivr.net/npm/eruda@3.4.3/eruda.js" integrity="sha384-weDBY9jeIj4NqaiZF9f6PMAMMY4lIu+0CAI+TjBIE73RctCQOxDoEHltYnstRszI" crossorigin="anonymous" onload="eruda.init();eruda.position({x:innerWidth-60,y:innerHeight-60})"></script>'

@@ -147,9 +147,13 @@
         cookieChannel.onmessage = function(event) {
             var d = event.data || {};
             if (d.jarKey !== window.__bbJarKey) return;
+            // Strings ready to write (mirrorStrings in label-sw.js). A
+            // worker from before that sent the jar's objects instead, and
+            // can still be the one running for a moment after a deploy.
             var cookies = d.cookies || [];
             for (var i = 0; i < cookies.length; i++) {
                 var c = cookies[i];
+                if (typeof c === 'string') { mirrorCookie(c); continue; }
                 var s = c.name + '=' + c.value + ';path=' + c.path;
                 if (typeof c.expires === 'number') {
                     s += ';expires=' + new Date(c.expires).toUTCString();

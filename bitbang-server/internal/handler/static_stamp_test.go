@@ -39,6 +39,7 @@ func stampDir(t *testing.T) string {
 		"bootstrap.html":     "<html><!-- FRONT_PAGE --></html>",
 		"bootstrap.js":       "const BUILD = '" + buildPlaceholder + "';\n",
 		"sw.js":              "const BUILD = '" + buildPlaceholder + "';\n",
+		"runtime-common.js":  "// runtime common\n",
 		"ws-shim.js":         "// ws shim\n",
 		"stream-shim.js":     "// stream shim\n",
 		"bitbang.js":         "// loader\n",
@@ -229,6 +230,24 @@ func TestInjectedScriptsAreServable(t *testing.T) {
 			if !labelAssets[m[1]] {
 				t.Errorf("%s loads %s, which a label host does not serve: "+
 					"it will 404 inside the device page", injector, m[1])
+			}
+		}
+	}
+
+	// bitba.ng's page, and the label worker's imports.
+	if src, err := os.ReadFile(filepath.Join(web, "bootstrap.html")); err == nil {
+		for _, m := range re.FindAllStringSubmatch(string(src), -1) {
+			if !allowedBitbangAssets[m[1]] {
+				t.Errorf("bootstrap.html loads %s, which bitba.ng does not serve", m[1])
+			}
+		}
+	}
+	imp := regexp.MustCompile(`importScripts\('/__bitbang__/([^']+)'\)`)
+	if src, err := os.ReadFile(filepath.Join(web, "label-sw.js")); err == nil {
+		for _, m := range imp.FindAllStringSubmatch(string(src), -1) {
+			if !labelAssets[m[1]] {
+				t.Errorf("label-sw.js imports %s, which a label host does not serve: "+
+					"the worker will fail to install", m[1])
 			}
 		}
 	}
