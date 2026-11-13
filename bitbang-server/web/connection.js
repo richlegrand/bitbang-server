@@ -269,7 +269,7 @@ const STATUS = {
 //     /__bb/start#<uid>[@<target>][!flags][/path]
 //
 // The path is the content frame's: for a proxied app, without its target,
-// which this frame puts back on every request (handleProxyRequest). The
+// which this frame puts back on every request (ProxyRequests.start). The
 // grammar and its parser, parseFragment, are runtime-common.js's, as are
 // parseUrlFlags, extractDTLSFingerprint, CandidateQueue and UPLOAD_CREDIT;
 // label-start.html loads it first.
@@ -369,7 +369,7 @@ const TURN_RENEW_LEAD_MS = 30_000;
 const TURN_RENEW_RECHECK_MS = 5000;
 
 // How often to tell the service worker it is busy while a proxied request is
-// open (keepWorkerAlive). label-sw.js holds itself for KEEPALIVE_HOLD_MS (25s) per
+// open (ProxyRequests.keepWorkerAlive). label-sw.js holds itself for KEEPALIVE_HOLD_MS (25s) per
 // keepalive, so this has to come round well inside that.
 const SW_KEEPALIVE_MS = 10000;
 
@@ -1242,12 +1242,361 @@ class Reconnector {
     wakeUp() { this.wake?.(); }
 }
 
+// The HTTP requests the label worker hands this frame (proxy_request), each
+// on a stream of its own: the request out, with its body if it has one, and
+// the response back to the worker's port as it arrives.
+//
+// hooks:
+//   targetPrefix()  '/<target>' for a proxied app, put back on every path
+//   channelDead()   a request found no open channel: start recovering
+class ProxyRequests {
+    constructor(swsp, hooks, debug) {
+        this.swsp = swsp;
+        this.hooks = hooks;
+        this.debug = debug;
+        this.pending = new Map();      // streamId -> request state
+        this.keptAliveAt = 0;          // last keepalive sent (keepWorkerAlive)
+        // Upload progress, for whichever device page started the upload
+        // (ota.html, the CLI's file browser). The whole vocabulary:
+        // uploadProgress { loaded, total }, uploadComplete (all bytes
+        // sent), then uploadSuccess or uploadFailed once the device answers.
+        //
+        // camelCase, unlike the rest of the browser's messages, because
+        // device pages hear these and we don't ship all of them: the CLI's
+        // file browser listens for these names, and a CLI already installed
+        // has to keep working against a new server. Never rename them.
+        this.progress = new BroadcastChannel('bitbang-progress');
+        // Backstop for keepWorkerAlive, which otherwise runs on arriving
+        // frames: an upload sends and receives nothing until it finishes, and
+        // a stalled response receives nothing either.
+        setInterval(() => this.keepWorkerAlive(), SW_KEEPALIVE_MS);
+    }
+
+    has(streamId) { return this.pending.has(streamId); }
+
+    // Tell the label worker it is still busy, at most every SW_KEEPALIVE_MS
+    // and only while a proxied request is open.
+    //
+    // The worker streams every proxied response, but its bytes come from here
+    // over a MessagePort, and the browser does not count port traffic as the
+    // worker doing anything. Firefox stopped one inside 45s of quiet, and the
+    // response did not fail -- it ended short, as if complete. Chromium kept
+    // it alive through 330s (measured 2026-10-18), but nothing promises that.
+    // A posted message is an event, which is the one thing that counts.
+    //
+    // Called on every arriving frame rather than only from a timer, because a
+    // download usually runs in a tab nobody is looking at, and a hidden tab's
+    // timers can be held to one wake-up a minute; frames are not throttled.
+    // The constructor's interval covers a request with no frames arriving.
+    keepWorkerAlive() {
+        if (this.pending.size === 0) return;
+        const now = Date.now();
+        if (now - this.keptAliveAt < SW_KEEPALIVE_MS) return;
+        this.keptAliveAt = now;
+        // The registration's worker rather than .controller, which Chrome can
+        // drop from a page that is still very much alive (see proxyToDevice).
+        navigator.serviceWorker.ready
+            .then((reg) => reg.active?.postMessage({ type: 'keepalive' }))
+            .catch(() => {});
+    }
+
+    start(data, responsePort) {
+        const { method, url, headers, hasBody, contentLength } = data;
+        if (this.debug) console.log(`[Connection] Received proxy request: ${method} ${new URL(url).pathname}, DC state: ${this.swsp.state}`);
+
+        if (!this.swsp.open) {
+            console.warn('[Connection] Data channel not open, rejecting request');
+            responsePort.postMessage({ type: 'proxy_error', message: 'Data channel not open' });
+            // A live page with a dead channel should be recovering, not
+            // rejecting forever -- kick the reconnect if nothing else did.
+            this.hooks.channelDead();
+            return;
+        }
+
+        // The path as the device expects it. A proxied app's origin belongs to
+        // one LAN target, which its pages never see in their paths; the
+        // listener routes on it, so it goes back on here.
+        const parsed = new URL(url);
+        const fullPath = this.hooks.targetPrefix() + parsed.pathname + parsed.search;
+
+        const streamId = this.swsp.newStreamId();
+
+        // Initial 30s timeout to catch "device not responding". Cleared once
+        // response headers arrive (SYN). After that we rely on FIN / data
+        // channel close to signal end -- inactivity is normal during streaming
+        // when the consumer (e.g. video player) backpressures the channel,
+        // which in a v4 session it really does.
+        let timeout;
+        const resetTimeout = () => {
+            clearTimeout(timeout);
+            timeout = setTimeout(() => {
+                this.pending.delete(streamId);
+                this.swsp.resetStream(streamId, 'timeout', 'no response within 30s');
+                responsePort.postMessage({ type: 'proxy_error', message: 'Request timeout' });
+            }, 30000);
+            /* Kept on the entry too, which is the one other code clears: it
+               held the first timer's id for good, so after a reset, clearing
+               req.timeout cleared a timer that had already been replaced. */
+            const req = this.pending.get(streamId);
+            if (req) req.timeout = timeout;
+        };
+        resetTimeout();
+
+        this.pending.set(streamId, {
+            responsePort,
+            timeout,
+            resetTimeout,
+            bytesReceived: 0,
+            startTime: Date.now(),
+            nextLogMB: 50,
+            isUpload: hasBody
+        });
+
+        // Build request metadata with all headers. SWSP v3 makes the
+        // stream `type` explicit on every SYN; v2 listeners that don't
+        // know the field default it to "http" -- same effect.
+        const requestMeta = { type: 'http', method, pathname: fullPath, headers };
+        if (hasBody) {
+            requestMeta.contentLength = contentLength;
+            // Keep contentType for backward compatibility with older devices
+            if (headers['content-type']) {
+                requestMeta.contentType = headers['content-type'];
+            }
+        }
+
+        // Besides the upload, the worker's end of this request's port says
+        // how much of the response its reader has taken (proxy_consumed),
+        // which is the credit a v4 session grants back, and that the reader
+        // has gone (proxy_cancel).
+        let onUpload = null;  // set below for a request with a body
+        responsePort.onmessage = (event) => {
+            const msg = event.data;
+            if (msg.type === 'proxy_consumed') {
+                this.swsp.onConsumed(streamId, msg.bytes);
+            } else if (msg.type === 'proxy_cancel') {
+                this.cancel(streamId);
+            } else if (onUpload) {
+                onUpload(msg);
+            }
+        };
+
+        this.swsp.openCredit(streamId);
+
+        if (!hasBody) {
+            // No body: SYN and FIN together.
+            this.swsp.send(streamId, FLAG_SYN | FLAG_FIN, JSON.stringify(requestMeta));
+            return;
+        }
+
+        // A body: the SYN with the metadata, then the body's chunks as the
+        // worker hands them over.
+        try {
+            this.swsp.send(streamId, FLAG_SYN, JSON.stringify(requestMeta));
+        } catch (e) {
+            this.swsp.dropCredit(streamId);
+            responsePort.postMessage({ type: 'proxy_error', message: 'Failed to start upload' });
+            this.progress.postMessage({ type: 'uploadFailed' });
+            return;
+        }
+
+        let bytesSent = 0;
+        let lastProgress = 0;
+        let processingChain = Promise.resolve();
+        let failed = false;
+
+        // Once: the chunks queued behind the one that failed would each
+        // say so again.
+        const failUpload = (msg) => {
+            if (failed) return;
+            failed = true;
+            this.pending.delete(streamId);
+            responsePort.postMessage({ type: 'proxy_error', message: msg });
+            this.progress.postMessage({ type: 'uploadFailed' });
+        };
+
+        const isOpen = () => this.swsp.open;
+
+        onUpload = (msg) => {
+            processingChain = processingChain.then(async () => {
+                if (failed) return;
+                if (!isOpen()) return failUpload('Connection lost');
+
+                if (msg.type === 'upload_chunk') {
+                    const data = msg.data;
+
+                    for (let i = 0; i < data.byteLength; i += SWSP_CHUNK_SIZE) {
+                        // Backpressure: wait while buffer is full
+                        while (isOpen() && this.swsp.bufferedAmount > 1024 * 1024) {
+                            await new Promise(r => setTimeout(r, 10));
+                        }
+                        if (!isOpen()) return failUpload('Connection lost');
+
+                        // And in a v4 session for the device's credit,
+                        // which is what a slow target looks like from
+                        // here. False means the stream ended meanwhile:
+                        // the device reset it, or the channel went.
+                        const chunk = data.subarray(i, Math.min(i + SWSP_CHUNK_SIZE, data.byteLength));
+                        if (!(await this.swsp.sendOnStream(streamId, FLAG_DAT, chunk))) {
+                            return failUpload(isOpen() ? 'Upload stopped by device' : 'Connection lost');
+                        }
+                    }
+
+                    bytesSent += data.byteLength;
+                    // Let the worker hand over more. Without this it read
+                    // the whole body as fast as it could and every chunk
+                    // queued here, so an upload over a slow link sat in
+                    // the tab's memory -- for every listener, v4 or not.
+                    responsePort.postMessage({ type: 'upload_credit', max: bytesSent + UPLOAD_CREDIT });
+
+                    const now = Date.now();
+                    if (now - lastProgress > 100) {
+                        lastProgress = now;
+                        resetTimeout();
+                        this.progress.postMessage({
+                            type: 'uploadProgress', loaded: bytesSent, total: contentLength
+                        });
+                    }
+
+                } else if (msg.type === 'upload_end') {
+                    if (!isOpen()) return failUpload('Connection lost');
+                    this.progress.postMessage({ type: 'uploadComplete' });
+                    await this.swsp.sendOnStream(streamId, FLAG_FIN, new Uint8Array(0));
+                }
+            });
+        };
+    }
+
+    // A frame on one of the requests' streams: the response's headers (SYN),
+    // its body, its end (FIN). Handed to the worker as it comes.
+    onFrame(frame) {
+        const req = this.pending.get(frame.streamId);
+        if (!req) return;
+        this.keepWorkerAlive();
+        // Not consumed yet: the worker reports that as its reader takes
+        // the bytes (proxy_consumed).
+        this.swsp.onArrived(frame, false);
+
+        // Cancelled in a v2/v3 session, which cannot stop the device: the
+        // rest goes nowhere.
+        if (req.cancelled) {
+            if (frame.flags & FLAG_FIN) this.pending.delete(frame.streamId);
+            return;
+        }
+
+        if (frame.flags & FLAG_SYN) {
+            // Metadata frame - send headers to SW, it will create the stream
+            const text = new TextDecoder().decode(frame.payload);
+            const metadata = JSON.parse(text);
+            const status = metadata.status || 200;
+            if (this.debug) console.log(`[Connection] Response for stream ${frame.streamId}: ${status}`);
+
+            // Clear timeout once response starts. After this, inactivity
+            // between chunks is normal (consumer backpressure for streams)
+            // and shouldn't kill the request.
+            clearTimeout(req.timeout);
+
+            req.responsePort.postMessage({
+                type: 'proxy_headers',
+                status: status,
+                headers: metadata.headers || {}
+            });
+
+            // Broadcast upload result for iframe UI
+            if (req.isUpload) {
+                this.progress.postMessage({
+                    type: status >= 200 && status < 300 ? 'uploadSuccess' : 'uploadFailed',
+                    status: status
+                });
+            }
+        }
+
+        if (frame.flags & FLAG_FIN) {
+            // End of stream
+            if (frame.payload.byteLength > 0 && !(frame.flags & FLAG_SYN)) {
+                req.bytesReceived += frame.payload.byteLength;
+                const data = new Uint8Array(frame.payload);
+                req.responsePort.postMessage({ type: 'proxy_chunk', data }, [data.buffer]);
+            }
+
+            // Log completion for large transfers
+            if (req.bytesReceived > 1024 * 1024) {
+                const elapsed = (Date.now() - req.startTime) / 1000;
+                const sizeMB = req.bytesReceived / (1024 * 1024);
+                const speed = elapsed > 0 ? (sizeMB / elapsed).toFixed(1) : '0';
+                console.log(`Download complete: ${sizeMB.toFixed(0)} MB in ${elapsed.toFixed(1)}s (${speed} MB/s)`);
+            }
+
+            req.responsePort.postMessage({ type: 'proxy_end' });
+            this.pending.delete(frame.streamId);
+            this.swsp.dropCredit(frame.streamId);
+        } else if (!(frame.flags & FLAG_SYN) && frame.payload.byteLength > 0) {
+            // Data chunk - use transferable to avoid copy
+            req.bytesReceived += frame.payload.byteLength;
+            const data = new Uint8Array(frame.payload);
+            req.responsePort.postMessage({ type: 'proxy_chunk', data }, [data.buffer]);
+
+            // Log progress at each 50MB milestone
+            const currentMB = req.bytesReceived / (1024 * 1024);
+            if (currentMB >= req.nextLogMB) {
+                const elapsed = (Date.now() - req.startTime) / 1000;
+                const speed = elapsed > 0 ? (currentMB / elapsed).toFixed(1) : '0';
+                console.log(`Download: ${currentMB.toFixed(0)} MB (${speed} MB/s)`);
+                req.nextLogMB += 50;
+            }
+        }
+    }
+
+    // The response's reader went away: a download cancelled in the browser,
+    // a media element that has what it needs. A v4 session tells the device,
+    // which stops reading its target; v2/v3 cannot, so the rest of the
+    // response is dropped as it arrives instead of being handed to nobody.
+    cancel(streamId) {
+        const req = this.pending.get(streamId);
+        if (!req) return;
+        clearTimeout(req.timeout);
+        if (this.swsp.flowControl) {
+            this.pending.delete(streamId);
+            this.swsp.resetStream(streamId, 'cancelled', 'the reader went away');
+        } else {
+            req.cancelled = true;
+        }
+    }
+
+    // The device reset one request's stream.
+    onReset(streamId, why) {
+        const req = this.pending.get(streamId);
+        if (!req) return;
+        clearTimeout(req.timeout);
+        this.pending.delete(streamId);
+        req.responsePort.postMessage({ type: 'proxy_error', message: why });
+        if (req.isUpload) this.progress.postMessage({ type: 'uploadFailed' });
+    }
+
+    // The channel every request was on has gone. One sent on it can never be
+    // answered, and used to wait out its own 30 s timeout instead. A
+    // settings poll sent as Wi-Fi's Apply took the device off the network
+    // held the panel's polling that long, since the panel waits for its
+    // outstanding poll before sending another: the page had reconnected, and
+    // still showed the device busy for 14 s more (2026-10-10). Ended here,
+    // the caller hears at once and its next request goes out on the new
+    // channel.
+    failAll(message) {
+        for (const [, req] of this.pending) {
+            clearTimeout(req.timeout);
+            try { req.responsePort.postMessage({ type: 'proxy_error', message }); } catch (e) {}
+            // An upload says so on its own channel as well, as failUpload does.
+            if (req.isUpload) this.progress.postMessage({ type: 'uploadFailed' });
+        }
+        this.pending.clear();
+    }
+}
+
 class BitBangConnection {
     constructor({ uid, target, devicePath, deviceSearch, deviceHash }) {
         this.uid = uid;
         // The content frame's path. For a proxied app (routing
         // "target-prefix") it never carries the target: this origin belongs
-        // to one target, which handleProxyRequest puts back on every request
+        // to one target, which ProxyRequests.start puts back on every request
         // and reportLocation on every address the top page shows.
         this.devicePath = devicePath || '/';
         this.target = target || '';
@@ -1261,12 +1610,6 @@ class BitBangConnection {
         this.ws = null;
         this.streamNameMap = {};      // from offer: { "0": "webcam", ... }
         this.resolvedStreams = {};    // name -> MediaStream
-        this.pendingRequests = new Map();  // streamId -> request state
-        this.workerKeptAliveAt = 0;   // last keepalive sent (keepWorkerAlive)
-        // Backstop for keepWorkerAlive, which otherwise runs on arriving
-        // frames: an upload sends and receives nothing until it finishes, and
-        // a stalled response receives nothing either.
-        setInterval(() => this.keepWorkerAlive(), SW_KEEPALIVE_MS);
         this.connectResolve = null;   // resolved when device sends 'ready'
         this.wsStreams = new Map();    // streamId -> { iframe } for WebSocket bridging
         this.benchStreams = new Map(); // streamId -> stats, for the transport benchmark
@@ -1275,16 +1618,6 @@ class BitBangConnection {
         this.candidateQueue = new CandidateQueue();
         this.remoteDescriptionSet = false;
         this.answerSent = false;          // local candidates wait for it
-        // Upload progress, for whichever device page started the upload
-        // (ota.html, the CLI's file browser). The whole vocabulary:
-        // uploadProgress { loaded, total }, uploadComplete (all bytes
-        // sent), then uploadSuccess or uploadFailed once the device answers.
-        //
-        // camelCase, unlike the rest of the browser's messages, because
-        // device pages hear these and we don't ship all of them: the CLI's
-        // file browser listens for these names, and a CLI already installed
-        // has to keep working against a new server. Never rename them.
-        this.progressChannel = new BroadcastChannel('bitbang-progress');
         // Frames arriving on a stream channel, forwarded to whatever page the
         // device served. The page owns the canvas; this only carries bytes.
         //
@@ -1314,6 +1647,11 @@ class BitBangConnection {
         this._wasConnected = false;
         // The relay verdict and its credential's expiry, and the path
         // telemetry. Both act on this only through the hooks given here.
+        // The worker's HTTP requests, each a stream on this.swsp.
+        this.requests = new ProxyRequests(this.swsp, {
+            targetPrefix: () => this.targetPrefix(),
+            channelDead: () => { if (this._wasConnected) this.reconnector.start(); },
+        }, this.debug);
         this.relay = new RelayMonitor({
             pc: () => this.pc,
             ended: () => this._sessionEnded,
@@ -1861,7 +2199,7 @@ class BitBangConnection {
         // is up.
         navigator.serviceWorker.addEventListener('message', (event) => {
             if (event.data?.type === 'proxy_request') {
-                this.handleProxyRequest(event.data, event.ports[0]);
+                this.requests.start(event.data, event.ports[0]);
             } else if (event.data?.type === 'connection_state' && event.ports[0]) {
                 event.ports[0].postMessage({
                     type: 'connection_state',
@@ -1896,32 +2234,6 @@ class BitBangConnection {
         await navigator.serviceWorker.ready;
     }
 
-    // Tell the service worker it is still busy, at most every SW_KEEPALIVE_MS
-    // and only while a proxied request is open.
-    //
-    // The worker streams every proxied response, but its bytes come from here
-    // over a MessagePort, and the browser does not count port traffic as the
-    // worker doing anything. Firefox stopped one inside 45s of quiet, and the
-    // response did not fail -- it ended short, as if complete. Chromium kept
-    // it alive through 330s (measured 2026-10-18), but nothing promises that.
-    // A posted message is an event, which is the one thing that counts.
-    //
-    // Called on every arriving frame rather than only from a timer, because a
-    // download usually runs in a tab nobody is looking at, and a hidden tab's
-    // timers can be held to one wake-up a minute; frames are not throttled.
-    // The constructor's interval covers a request with no frames arriving.
-    keepWorkerAlive() {
-        if (this.pendingRequests.size === 0) return;
-        const now = Date.now();
-        if (now - this.workerKeptAliveAt < SW_KEEPALIVE_MS) return;
-        this.workerKeptAliveAt = now;
-        // The registration's worker rather than .controller, which Chrome can
-        // drop from a page that is still very much alive (see proxyToDevice).
-        navigator.serviceWorker.ready
-            .then((reg) => reg.active?.postMessage({ type: 'keepalive' }))
-            .catch(() => {});
-    }
-
     // The device ended one stream -- its target went away, or this side
     // broke the stream's rules. Everything else on the session continues.
     onStreamReset(msg) {
@@ -1929,203 +2241,13 @@ class BitBangConnection {
         const why = msg.message || msg.code || 'stream reset by device';
         console.warn(`[Connection] stream ${streamId} reset by device: ${why}`);
         this.swsp.dropCredit(streamId);
-
-        const req = this.pendingRequests.get(streamId);
-        if (req) {
-            clearTimeout(req.timeout);
-            this.pendingRequests.delete(streamId);
-            req.responsePort.postMessage({ type: 'proxy_error', message: why });
-            if (req.isUpload) this.progressChannel.postMessage({ type: 'uploadFailed' });
-        }
+        this.requests.onReset(streamId, why);
         const ws = this.wsStreams.get(streamId);
         if (ws) {
             this.wsStreams.delete(streamId);
             ws.iframe.postMessage({ type: 'ws_closed', streamId, code: 1011, reason: why }, location.origin);
         }
         this.benchStreams.delete(streamId);
-    }
-
-    handleProxyRequest(data, responsePort) {
-        const { method, url, headers, hasBody, contentLength } = data;
-        if (this.debug) console.log(`[Connection] Received proxy request: ${method} ${new URL(url).pathname}, DC state: ${this.swsp.state}`);
-
-        if (!this.swsp.open) {
-            console.warn('[Connection] Data channel not open, rejecting request');
-            responsePort.postMessage({ type: 'proxy_error', message: 'Data channel not open' });
-            // A live page with a dead channel should be recovering, not
-            // rejecting forever — kick the reconnect if nothing else did.
-            // (No-op while a reconnect is in flight or after a terminal end.)
-            if (this._wasConnected) this.reconnector.start();
-            return;
-        }
-
-        // The path as the device expects it. A proxied app's origin belongs to
-        // one LAN target, which its pages never see in their paths; the
-        // listener routes on it, so it goes back on here.
-        const parsed = new URL(url);
-        const fullPath = this.targetPrefix() + parsed.pathname + parsed.search;
-
-        // Use incrementing stream ID for SWSP
-        const streamId = this.swsp.newStreamId();
-
-        // Initial 30s timeout to catch "device not responding". Cleared once
-        // response headers arrive (SYN). After that we rely on FIN / data
-        // channel close to signal end -- inactivity is normal during streaming
-        // when the consumer (e.g. video player) backpressures the channel,
-        // which in a v4 session it really does.
-        let timeout;
-        const resetTimeout = () => {
-            clearTimeout(timeout);
-            timeout = setTimeout(() => {
-                this.pendingRequests.delete(streamId);
-                this.swsp.resetStream(streamId, 'timeout', 'no response within 30s');
-                responsePort.postMessage({ type: 'proxy_error', message: 'Request timeout' });
-            }, 30000);
-            /* Kept on the entry too, which is the one other code clears: it
-               held the first timer's id for good, so after a reset, clearing
-               req.timeout cleared a timer that had already been replaced. */
-            const req = this.pendingRequests.get(streamId);
-            if (req) req.timeout = timeout;
-        };
-        resetTimeout();
-
-        this.pendingRequests.set(streamId, {
-            responsePort,
-            timeout,
-            resetTimeout,
-            bytesReceived: 0,
-            startTime: Date.now(),
-            nextLogMB: 50,
-            isUpload: hasBody
-        });
-
-        // Build request metadata with all headers. SWSP v3 makes the
-        // stream `type` explicit on every SYN; v2 listeners that don't
-        // know the field default it to "http" — same effect.
-        const requestMeta = { type: 'http', method, pathname: fullPath, headers };
-        if (hasBody) {
-            requestMeta.contentLength = contentLength;
-            // Keep contentType for backward compatibility with older devices
-            if (headers['content-type']) {
-                requestMeta.contentType = headers['content-type'];
-            }
-        }
-
-        // Besides the upload, the worker's end of this request's port says
-        // how much of the response its reader has taken (proxy_consumed),
-        // which is the credit a v4 session grants back, and that the reader
-        // has gone (proxy_cancel).
-        let onUpload = null;  // set below for a request with a body
-        responsePort.onmessage = (event) => {
-            const msg = event.data;
-            if (msg.type === 'proxy_consumed') {
-                this.swsp.onConsumed(streamId, msg.bytes);
-            } else if (msg.type === 'proxy_cancel') {
-                this.cancelRequest(streamId);
-            } else if (onUpload) {
-                onUpload(msg);
-            }
-        };
-
-        this.swsp.openCredit(streamId);
-
-        if (hasBody) {
-            // Send SYN frame with metadata, then stream body chunks as they arrive
-            try {
-                this.swsp.send(streamId, FLAG_SYN, JSON.stringify(requestMeta));
-            } catch (e) {
-                this.swsp.dropCredit(streamId);
-                responsePort.postMessage({ type: 'proxy_error', message: 'Failed to start upload' });
-                this.progressChannel.postMessage({ type: 'uploadFailed' });
-                return;
-            }
-
-            const MAX_CHUNK = SWSP_CHUNK_SIZE;
-            let bytesSent = 0;
-            let lastProgress = 0;
-            let processingChain = Promise.resolve();
-            let failed = false;
-
-            // Once: the chunks queued behind the one that failed would each
-            // say so again.
-            const failUpload = (msg) => {
-                if (failed) return;
-                failed = true;
-                this.pendingRequests.delete(streamId);
-                responsePort.postMessage({ type: 'proxy_error', message: msg });
-                this.progressChannel.postMessage({ type: 'uploadFailed' });
-            };
-
-            const isOpen = () => this.swsp.open;
-
-            onUpload = (msg) => {
-                processingChain = processingChain.then(async () => {
-                    if (failed) return;
-                    if (!isOpen()) return failUpload('Connection lost');
-
-                    if (msg.type === 'upload_chunk') {
-                        const data = msg.data;
-
-                        for (let i = 0; i < data.byteLength; i += MAX_CHUNK) {
-                            // Backpressure: wait while buffer is full
-                            while (isOpen() && this.swsp.bufferedAmount > 1024 * 1024) {
-                                await new Promise(r => setTimeout(r, 10));
-                            }
-                            if (!isOpen()) return failUpload('Connection lost');
-
-                            // And in a v4 session for the device's credit,
-                            // which is what a slow target looks like from
-                            // here. False means the stream ended meanwhile:
-                            // the device reset it, or the channel went.
-                            const chunk = data.subarray(i, Math.min(i + MAX_CHUNK, data.byteLength));
-                            if (!(await this.swsp.sendOnStream(streamId, FLAG_DAT, chunk))) {
-                                return failUpload(isOpen() ? 'Upload stopped by device' : 'Connection lost');
-                            }
-                        }
-
-                        bytesSent += data.byteLength;
-                        // Let the worker hand over more. Without this it read
-                        // the whole body as fast as it could and every chunk
-                        // queued here, so an upload over a slow link sat in
-                        // the tab's memory -- for every listener, v4 or not.
-                        responsePort.postMessage({ type: 'upload_credit', max: bytesSent + UPLOAD_CREDIT });
-
-                        const now = Date.now();
-                        if (now - lastProgress > 100) {
-                            lastProgress = now;
-                            resetTimeout();
-                            this.progressChannel.postMessage({
-                                type: 'uploadProgress', loaded: bytesSent, total: contentLength
-                            });
-                        }
-
-                    } else if (msg.type === 'upload_end') {
-                        if (!isOpen()) return failUpload('Connection lost');
-                        this.progressChannel.postMessage({ type: 'uploadComplete' });
-                        await this.swsp.sendOnStream(streamId, FLAG_FIN, new Uint8Array(0));
-                    }
-                });
-            };
-        } else {
-            // No body - send SYN|FIN together
-            this.swsp.send(streamId, FLAG_SYN | FLAG_FIN, JSON.stringify(requestMeta));
-        }
-    }
-
-    // The response's reader went away: a download cancelled in the browser,
-    // a media element that has what it needs. A v4 session tells the device,
-    // which stops reading its target; v2/v3 cannot, so the rest of the
-    // response is dropped as it arrives instead of being handed to nobody.
-    cancelRequest(streamId) {
-        const req = this.pendingRequests.get(streamId);
-        if (!req) return;
-        clearTimeout(req.timeout);
-        if (this.swsp.flowControl) {
-            this.pendingRequests.delete(streamId);
-            this.swsp.resetStream(streamId, 'cancelled', 'the reader went away');
-        } else {
-            req.cancelled = true;
-        }
     }
 
     // The signaling socket's URL, for the session and for the control socket
@@ -2723,23 +2845,8 @@ class BitBangConnection {
         }
         this.wsStreams.clear();
 
-        // The same for requests, which this left out -- though the comment on
-        // their timeout in handleProxyRequest counted on "data channel close"
-        // to end them. One sent on the channel just closed can never be
-        // answered, and waited out its own 30 s timeout instead. A settings
-        // poll sent as Wi-Fi's Apply took the device off the network held the
-        // panel's polling that long, since the panel waits for its outstanding
-        // poll before sending another: the page had reconnected, and still
-        // showed the device busy for 14 s more (2026-10-10). Ended here, the
-        // caller hears at once and its next request goes out on the new
-        // channel.
-        for (const [, req] of this.pendingRequests) {
-            clearTimeout(req.timeout);
-            try { req.responsePort.postMessage({ type: 'proxy_error', message: 'Connection lost' }); } catch (e) {}
-            // An upload says so on its own channel as well, as failUpload does.
-            if (req.isUpload) this.progressChannel?.postMessage({ type: 'uploadFailed' });
-        }
-        this.pendingRequests.clear();
+        // The same for requests (failAll says why).
+        this.requests.failAll('Connection lost');
     }
 
     // The text is a parameter because this strip says two things: that the
@@ -2798,85 +2905,11 @@ class BitBangConnection {
                 return;
             }
 
-            const req = this.pendingRequests.get(frame.streamId);
-
-            if (!req) {
-                console.log('Received frame for unknown stream:', frame.streamId);
+            if (this.requests.has(frame.streamId)) {
+                this.requests.onFrame(frame);
                 return;
             }
-            this.keepWorkerAlive();
-            // Not consumed yet: the worker reports that as its reader takes
-            // the bytes (proxy_consumed).
-            this.swsp.onArrived(frame, false);
-
-            // Cancelled in a v2/v3 session, which cannot stop the device: the
-            // rest goes nowhere.
-            if (req.cancelled) {
-                if (frame.flags & FLAG_FIN) this.pendingRequests.delete(frame.streamId);
-                return;
-            }
-
-            if (frame.flags & FLAG_SYN) {
-                // Metadata frame - send headers to SW, it will create the stream
-                const text = new TextDecoder().decode(frame.payload);
-                const metadata = JSON.parse(text);
-                const status = metadata.status || 200;
-                if (this.debug) console.log(`[Connection] Response for stream ${frame.streamId}: ${status}`);
-
-                // Clear timeout once response starts. After this, inactivity
-                // between chunks is normal (consumer backpressure for streams)
-                // and shouldn't kill the request.
-                clearTimeout(req.timeout);
-
-                req.responsePort.postMessage({
-                    type: 'proxy_headers',
-                    status: status,
-                    headers: metadata.headers || {}
-                });
-
-                // Broadcast upload result for iframe UI
-                if (req.isUpload) {
-                    this.progressChannel.postMessage({
-                        type: status >= 200 && status < 300 ? 'uploadSuccess' : 'uploadFailed',
-                        status: status
-                    });
-                }
-            }
-
-            if (frame.flags & FLAG_FIN) {
-                // End of stream
-                if (frame.payload.byteLength > 0 && !(frame.flags & FLAG_SYN)) {
-                    req.bytesReceived += frame.payload.byteLength;
-                    const data = new Uint8Array(frame.payload);
-                    req.responsePort.postMessage({ type: 'proxy_chunk', data }, [data.buffer]);
-                }
-
-                // Log completion for large transfers
-                if (req.bytesReceived > 1024 * 1024) {
-                    const elapsed = (Date.now() - req.startTime) / 1000;
-                    const sizeMB = req.bytesReceived / (1024 * 1024);
-                    const speed = elapsed > 0 ? (sizeMB / elapsed).toFixed(1) : '0';
-                    console.log(`Download complete: ${sizeMB.toFixed(0)} MB in ${elapsed.toFixed(1)}s (${speed} MB/s)`);
-                }
-
-                req.responsePort.postMessage({ type: 'proxy_end' });
-                this.pendingRequests.delete(frame.streamId);
-                this.swsp.dropCredit(frame.streamId);
-            } else if (!(frame.flags & FLAG_SYN) && frame.payload.byteLength > 0) {
-                // Data chunk - use transferable to avoid copy
-                req.bytesReceived += frame.payload.byteLength;
-                const data = new Uint8Array(frame.payload);
-                req.responsePort.postMessage({ type: 'proxy_chunk', data }, [data.buffer]);
-
-                // Log progress at each 50MB milestone
-                const currentMB = req.bytesReceived / (1024 * 1024);
-                if (currentMB >= req.nextLogMB) {
-                    const elapsed = (Date.now() - req.startTime) / 1000;
-                    const speed = elapsed > 0 ? (currentMB / elapsed).toFixed(1) : '0';
-                    console.log(`Download: ${currentMB.toFixed(0)} MB (${speed} MB/s)`);
-                    req.nextLogMB += 50;
-                }
-            }
+            console.log('Received frame for unknown stream:', frame.streamId);
         } catch (e) {
             console.error('Error parsing SWSP frame:', e);
         }
@@ -3530,7 +3563,7 @@ class BitBangConnection {
             const synPayload = JSON.stringify({
                 type: 'websocket',
                 // The device's path: a proxied app's target goes back on, as
-                // for HTTP (handleProxyRequest).
+                // for HTTP (ProxyRequests.start).
                 pathname: this.targetPrefix() + msg.pathname,
                 cookies: msg.cookies || '',
             });
