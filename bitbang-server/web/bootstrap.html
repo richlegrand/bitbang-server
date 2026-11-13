@@ -40,7 +40,12 @@
             const flags = frag.slice(i + 1, j).split(',');
             if (!flags.includes('debug')) return;
             const s = document.createElement('script');
-            s.src = 'https://cdn.jsdelivr.net/npm/eruda';
+            // An exact version, with its hash: a changed file is refused
+            // rather than run with the access code in this page's URL.
+            // label-sw.js loads the same one into device pages.
+            s.src = 'https://cdn.jsdelivr.net/npm/eruda@3.4.3/eruda.js';
+            s.integrity = 'sha384-weDBY9jeIj4NqaiZF9f6PMAMMY4lIu+0CAI+TjBIE73RctCQOxDoEHltYnstRszI';
+            s.crossOrigin = 'anonymous';
             s.onload = () => {
                 if (!window.eruda) return;
                 eruda.init();

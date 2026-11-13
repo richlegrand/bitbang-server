@@ -993,7 +993,7 @@ async function proxyToDevice(event) {
                             }
 
                             const eruda = session?.debug
-                                ? '<script src="https://cdn.jsdelivr.net/npm/eruda" onload="eruda.init();eruda.position({x:innerWidth-60,y:innerHeight-60})"></script>'
+                                ? '<script src="https://cdn.jsdelivr.net/npm/eruda@3.4.3/eruda.js" integrity="sha384-weDBY9jeIj4NqaiZF9f6PMAMMY4lIu+0CAI+TjBIE73RctCQOxDoEHltYnstRszI" crossorigin="anonymous" onload="eruda.init();eruda.position({x:innerWidth-60,y:innerHeight-60})"></script>'
                                 : '';
                             const shims = '<!DOCTYPE html>'
                                 + `<script>window.__bbJarKey=${jsonForScript(jarKey)};window.__bbDebug=${!!session?.debug};window.__bbCookies=${jsonForScript(cookieSync)};</script>`

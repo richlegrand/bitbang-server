@@ -352,8 +352,8 @@ const SWSP_VERSION = 4;
 const STREAM_WINDOW = 1 << 20;
 const STREAM_WINDOW_UPDATE_AT = STREAM_WINDOW / 2;
 // What the service worker may hand over of a request body beyond what has
-// gone onto the data channel. Both sides start with it implicitly; sw.js
-// has the matching constant.
+// gone onto the data channel. Both sides start with it implicitly;
+// label-sw.js has the matching constant.
 const UPLOAD_CREDIT = 1 << 20;
 
 // Stream chunk header, little-endian:
@@ -422,7 +422,7 @@ const TURN_RENEW_LEAD_MS = 30_000;
 const TURN_RENEW_RECHECK_MS = 5000;
 
 // How often to tell the service worker it is busy while a proxied request is
-// open (keepWorkerAlive). sw.js holds itself for KEEPALIVE_HOLD_MS (25s) per
+// open (keepWorkerAlive). label-sw.js holds itself for KEEPALIVE_HOLD_MS (25s) per
 // keepalive, so this has to come round well inside that.
 const SW_KEEPALIVE_MS = 10000;
 
@@ -1174,16 +1174,16 @@ class BitBangConnection {
         reg.update();
 
         // When a new SW takes over an existing controller, offer a reload if
-        // the build stamps disagree. skipWaiting() in sw.js's install handler
+        // the build stamps disagree. skipWaiting() in label-sw.js's install handler
         // is what makes the takeover happen without prompting, which is also
         // what creates the window this closes: the new worker claims the page
         // immediately, while the page itself may still be running the previous
-        // deploy's bootstrap.js.
+        // deploy's connection.js.
         navigator.serviceWorker.addEventListener('controllerchange', () => {
             if (!hadController) return;             // first install, not an update
             // Only a page that is actually behind is asked. The common case
             // after a deploy is a fresh navigation that already has the new
-            // bootstrap.js and merely watched the worker turn over underneath
+            // connection.js and merely watched the worker turn over underneath
             // it -- nothing to say there.
             offerReloadIfStale(navigator.serviceWorker.controller);
         });
@@ -1198,7 +1198,7 @@ class BitBangConnection {
         // and redialed when the server restarts; the server sends the stamp on
         // every connect and again whenever it moves. This covers what that
         // misses -- a tab that couldn't get a socket back, or a server too old
-        // to send one. A fetch of sw.js per half hour.
+        // to send one. A fetch of label-sw.js per half hour.
         setInterval(() => reg.update().catch(() => {}), 30 * 60 * 1000);
 
         // Handle proxy requests from the worker. The vocabulary of this
@@ -1359,9 +1359,12 @@ class BitBangConnection {
         this.sendControl({ type: 'stream_reset', stream_id: streamId, code, message });
     }
 
+    // A message on stream 0. Every control message goes through here.
+    // Returns whether it went: false when there is no open channel.
     sendControl(msg) {
-        if (this.dataChannel?.readyState !== 'open') return;
+        if (this.dataChannel?.readyState !== 'open') return false;
         this.dataChannel.send(this.createFrame(0, FLAG_SYN, JSON.stringify(msg)));
+        return true;
     }
 
     // The device ended one stream -- its target went away, or this side
@@ -1382,7 +1385,7 @@ class BitBangConnection {
         const ws = this.wsStreams.get(streamId);
         if (ws) {
             this.wsStreams.delete(streamId);
-            ws.iframe.postMessage({ type: 'ws_closed', streamId, code: 1011, reason: why }, '*');
+            ws.iframe.postMessage({ type: 'ws_closed', streamId, code: 1011, reason: why }, location.origin);
         }
         this.benchStreams.delete(streamId);
     }
@@ -1483,7 +1486,7 @@ class BitBangConnection {
                 return;
             }
 
-            const MAX_CHUNK = 16384;
+            const MAX_CHUNK = SWSP_CHUNK_SIZE;
             let bytesSent = 0;
             let lastProgress = 0;
             let processingChain = Promise.resolve();
@@ -2657,7 +2660,7 @@ class BitBangConnection {
         // the console panel sat at "connected" and silent after a soft
         // reconnect, and only a reload brought it back (2026-10-01).
         for (const [streamId, s] of this.wsStreams) {
-            s.iframe.postMessage({ type: 'ws_closed', streamId, code: 1006, reason: '' }, '*');
+            s.iframe.postMessage({ type: 'ws_closed', streamId, code: 1006, reason: '' }, location.origin);
         }
         this.wsStreams.clear();
 
@@ -2827,6 +2830,15 @@ class BitBangConnection {
         }
     }
 
+    // The device did not prove it holds its key, or broke the order that
+    // proof comes in. Nothing more is said on this connection.
+    rejectUnverified(why) {
+        console.error('[Connection] ' + why + '. Closing.');
+        this._printError('Connection rejected: device identity could not be verified.');
+        try { this.dataChannel.close(); } catch (e) {}
+        try { this.pc.close(); } catch (e) {}
+    }
+
     async handleControlMessage(frame) {
         if (!(frame.flags & FLAG_SYN)) return;
 
@@ -2844,10 +2856,7 @@ class BitBangConnection {
                 return;
             }
             if (!this.verifyNonceHash || msg.hash !== this.verifyNonceHash) {
-                console.error('[Connection] nonce hash mismatch — device did not prove possession of the private key. Closing.');
-                this._printError('Connection rejected: device identity could not be verified.');
-                try { this.dataChannel.close(); } catch (e) {}
-                try { this.pc.close(); } catch (e) {}
+                this.rejectUnverified('nonce hash mismatch -- device did not prove possession of the private key');
                 return;
             }
             this.deviceVerified = true;
@@ -2859,10 +2868,7 @@ class BitBangConnection {
         if (!this.deviceVerified) {
             // Any non-verify control message before verify is a protocol
             // violation. Treat as if the device failed to authenticate.
-            console.error('[Connection] control message %o received before verify_nonce_hash — closing', msg.type);
-            this._printError('Connection rejected: device identity could not be verified.');
-            try { this.dataChannel.close(); } catch (e) {}
-            try { this.pc.close(); } catch (e) {}
+            this.rejectUnverified(`control message ${JSON.stringify(msg.type)} before verify_nonce_hash`);
             return;
         }
 
@@ -2991,9 +2997,7 @@ class BitBangConnection {
             };
             pc.onicecandidate = (event) => {
                 if (event.candidate) {
-                    this.dataChannel.send(this.createFrame(0, FLAG_SYN, JSON.stringify({
-                        type: 'video_candidate', candidate: event.candidate.toJSON(),
-                    })));
+                    this.sendControl({ type: 'video_candidate', candidate: event.candidate.toJSON() });
                 }
             };
             pc.onconnectionstatechange = () => {
@@ -3002,9 +3006,7 @@ class BitBangConnection {
 
             await pc.setRemoteDescription({ type: 'offer', sdp });
             await pc.setLocalDescription(await pc.createAnswer());
-            this.dataChannel.send(this.createFrame(0, FLAG_SYN, JSON.stringify({
-                type: 'video_answer', sdp: pc.localDescription.sdp,
-            })));
+            this.sendControl({ type: 'video_answer', sdp: pc.localDescription.sdp });
             if (this.debug) console.log('[Connection] sent video answer');
         } catch (e) {
             console.error('[Connection] video offer handling failed:', e);
@@ -3039,18 +3041,17 @@ class BitBangConnection {
     // tab. `cached` says it was remembered rather than just typed, which
     // only changes how quickly the result is acted on.
     onTopPIN(msg) {
-        if (!this.dataChannel || this.dataChannel.readyState !== 'open') return;
         if (typeof msg.pin !== 'string' || !msg.pin) return;
+        if (this.dataChannel?.readyState !== 'open') return;
         this._authCached = !!msg.cached;
-        const authMsg = JSON.stringify({ type: 'auth', pin: msg.pin });
-        this.dataChannel.send(this.createFrame(0, FLAG_SYN, authMsg));
+        this.sendControl({ type: 'auth', pin: msg.pin });
     }
 
     handleWSFrame(frame, ws) {
         // Generic /__bitbang/<type> streams use raw bytes for DAT and
         // pass the FIN payload through untouched. Per-cap framing
         // (tag bytes, JSON status payloads, etc.) lives in the
-        // iframe; bootstrap.js stays a transport.
+        // iframe; this frame stays a transport.
         if (ws.kind === 'bitbang') {
             this.handleBitbangFrame(frame, ws);
             return;
@@ -3059,7 +3060,7 @@ class BitBangConnection {
         if (frame.flags & FLAG_SYN) {
             // Device acknowledged the WebSocket open
             if (this.debug) console.log(`[Connection] ws SYN ack from device, streamId=${frame.streamId}`);
-            ws.iframe.postMessage({ type: 'ws_opened', streamId: frame.streamId }, '*');
+            ws.iframe.postMessage({ type: 'ws_opened', streamId: frame.streamId }, location.origin);
         }
 
         if (frame.flags & FLAG_FIN) {
@@ -3084,7 +3085,7 @@ class BitBangConnection {
                 streamId: frame.streamId,
                 code,
                 reason
-            }, '*');
+            }, location.origin);
             return;
         }
 
@@ -3125,14 +3126,14 @@ class BitBangConnection {
                 type: 'ws_message',
                 streamId: frame.streamId,
                 data
-            }, '*');
+            }, location.origin);
         }
     }
 
     // handleBitbangFrame is the generic transport for streams opened
     // through the magic /__bitbang/<type> path. It does NO per-cap
     // interpretation — the iframe-served code handles tag bytes,
-    // JSON FIN payloads, status decoding, etc. Bootstrap.js is just
+    // JSON FIN payloads, status decoding, etc. This frame is just
     // shuttling raw bytes between the SWSP data channel and the
     // iframe's WebSocket shim.
     handleBitbangFrame(frame, ws) {
@@ -3146,7 +3147,7 @@ class BitBangConnection {
                 ? new TextDecoder().decode(frame.payload) : '';
             ws.iframe.postMessage({
                 type: 'ws_message', streamId: frame.streamId, data: text,
-            }, '*');
+            }, location.origin);
             return;
         }
 
@@ -3163,7 +3164,7 @@ class BitBangConnection {
             this.wsStreams.delete(frame.streamId);
             ws.iframe.postMessage({
                 type: 'ws_closed', streamId: frame.streamId, code: 1000, reason,
-            }, '*');
+            }, location.origin);
             return;
         }
 
@@ -3175,24 +3176,28 @@ class BitBangConnection {
         const ab = view.buffer.slice(view.byteOffset, view.byteOffset + view.byteLength);
         ws.iframe.postMessage({
             type: 'ws_message', streamId: frame.streamId, data: ab,
-        }, '*');
+        }, location.origin);
     }
 
     // Send the connect handshake and wait for the device's 'ready' (plus the
     // optional 2 s TURN banner hold). Shared by the initial connect and by a
     // soft reconnect — everything here is safe to run on a rebuilt transport.
+    // The connect message, for a whole device path (target included). The
+    // device answers 'ready', or 'auth_required' for a path behind a PIN.
+    //
+    // `version` is the SWSP version we're speaking; older v2 listeners
+    // ignore it. The listener fixes the version at the first connect and
+    // keeps it, which is what lets streams already open keep their
+    // flow-control accounting when a navigation connects again. No `caps`
+    // field -- this frame is a pure transport and doesn't claim knowledge
+    // of specific stream types. The iframe decides what to open via
+    // /__bitbang/<type>.
+    sendConnect(path) {
+        return this.sendControl({ type: 'connect', path, version: SWSP_VERSION });
+    }
+
     async _sendConnectAndAwaitReady() {
-        // Send connect handshake with path (streamId 0). `version` is
-        // the SWSP version we're speaking; older v2 listeners ignore
-        // it. No `caps` field — bootstrap.js is a pure transport and
-        // doesn't claim knowledge of specific stream types. The iframe
-        // decides what to open via /__bitbang/<type>.
-        const connectMsg = JSON.stringify({
-            type: 'connect',
-            path: this.targetPrefix() + this.devicePath,
-            version: SWSP_VERSION,
-        });
-        this.dataChannel.send(this.createFrame(0, FLAG_SYN, connectMsg));
+        this.sendConnect(this.targetPrefix() + this.devicePath);
 
         // The hold timer is armed in _onFirstConnected (which runs at DTLS-up,
         // before this point), so the wait is concurrent with device app boot.
@@ -3314,12 +3319,12 @@ class BitBangConnection {
 
     // A page loaded with a hard reload (Ctrl+Shift+R) starts uncontrolled --
     // Chrome bypasses the service worker for that navigation. Everything else
-    // works: bootstrap.js runs, the peer connection comes up, video frames
+    // works: connection.js runs, the peer connection comes up, video frames
     // arrive. Only the iframe fetch goes to the network instead of the SW, and
     // nothing there serves it, so the page is white behind a working data
     // channel. It looks like a video failure and is not one.
     //
-    // clients.claim() in sw.js's activate handler does claim us, but it can
+    // clients.claim() in label-sw.js's activate handler does claim us, but it can
     // land after the iframe has already navigated, so waiting for it is the
     // fix rather than reloading. Reload only if the claim never arrives.
     async waitForController(timeoutMs = 3000) {
@@ -3387,17 +3392,7 @@ class BitBangConnection {
             if (this.connectionUI) this.connectionUI.style.display = 'none';
         };
         this.connectResolve = navigateAfterAuth;
-
-        // Send connect with the new path. Matches the initial-connect
-        // payload — no caps advertisement. The listener fixed the SWSP
-        // version at the first connect and keeps it, which is what lets
-        // streams already open keep their flow-control accounting.
-        const connectMsg = JSON.stringify({
-            type: 'connect',
-            path,
-            version: SWSP_VERSION,
-        });
-        this.dataChannel.send(this.createFrame(0, FLAG_SYN, connectMsg));
+        this.sendConnect(path);
     }
 
     // The parent end of the ws-shim.js channel; its vocabulary is listed at
@@ -3418,8 +3413,8 @@ class BitBangConnection {
             // and closed on it in the same breath.
             if (msg.type === 'ws_open') {
                 const streamId = this.nextStreamId++;
-                iframe.contentWindow.postMessage({ type: 'ws_assign', openId: msg.openId, streamId }, '*');
-                iframe.contentWindow.postMessage({ type: 'ws_closed', streamId, code: 1006, reason: '' }, '*');
+                iframe.contentWindow.postMessage({ type: 'ws_assign', openId: msg.openId, streamId }, location.origin);
+                iframe.contentWindow.postMessage({ type: 'ws_closed', streamId, code: 1006, reason: '' }, location.origin);
             }
             return;
         }
@@ -3429,12 +3424,12 @@ class BitBangConnection {
             if (this.debug) console.log(`[Connection] ws_open ${msg.pathname}, streamId=${streamId}, cookies.len=${(msg.cookies || '').length}`);
 
             // Magic path: /__bitbang/<type>?<params> opens a SWSP
-            // stream of the named type. bootstrap.js is a generic
+            // stream of the named type. This frame is a generic
             // transport here — it builds the SYN from path+query but
             // shuttles raw bytes for DAT/FIN. Each iframe-served cap
             // (shell, serial, forward, …) handles its own per-stream
             // framing (tag bytes, JSON FIN payloads, etc.). Adding a
-            // new cap therefore doesn't require any bootstrap.js
+            // new cap therefore doesn't require any connection.js
             // changes — just a new device-side handler and an iframe
             // page that opens the right magic URL.
             const bitbangPrefix = '/__bitbang/';
@@ -3449,7 +3444,7 @@ class BitBangConnection {
                     iframe.contentWindow.postMessage({
                         type: 'ws_closed', streamId, code: 1008,
                         reason: 'bitbang: empty type in magic path',
-                    }, '*');
+                    }, location.origin);
                     return;
                 }
 
@@ -3467,14 +3462,14 @@ class BitBangConnection {
                 this.wsStreams.set(streamId, { iframe: iframe.contentWindow, kind: 'bitbang' });
                 iframe.contentWindow.postMessage({
                     type: 'ws_assign', openId: msg.openId, streamId,
-                }, '*');
+                }, location.origin);
                 this.openCredit(streamId);
                 this.dataChannel.send(this.createFrame(streamId, FLAG_SYN, JSON.stringify(syn)));
                 // Tell the iframe the WS is open now. Listener handlers
                 // typically don't send a SYN ack on the success path —
                 // the first DAT is the natural signal that things are
                 // working. Iframe code can start sending immediately.
-                iframe.contentWindow.postMessage({ type: 'ws_opened', streamId }, '*');
+                iframe.contentWindow.postMessage({ type: 'ws_opened', streamId }, location.origin);
                 return;
             }
 
@@ -3484,7 +3479,7 @@ class BitBangConnection {
                 type: 'ws_assign',
                 openId: msg.openId,
                 streamId
-            }, '*');
+            }, location.origin);
             const synPayload = JSON.stringify({
                 type: 'websocket',
                 // The device's path: a proxied app's target goes back on, as
@@ -3499,38 +3494,20 @@ class BitBangConnection {
         } else if (msg.type === 'ws_send') {
             const ws = this.wsStreams.get(msg.streamId);
             if (!ws) return;
+            const bytes = msg.isText ? new TextEncoder().encode(msg.data) : new Uint8Array(msg.data);
 
             if (ws.kind === 'bitbang') {
                 // Generic shuttle: raw bytes go through unchanged. Text
                 // frames are UTF-8 encoded; the iframe is responsible
                 // for keeping the cap-specific framing it expects.
-                let payload;
-                if (msg.isText) {
-                    payload = new TextEncoder().encode(msg.data);
-                } else {
-                    payload = msg.data instanceof ArrayBuffer
-                        ? new Uint8Array(msg.data)
-                        : new Uint8Array(msg.data);
-                }
-                this.queueOnStream(ws, msg.streamId, [[FLAG_DAT, payload]]);
+                this.queueOnStream(ws, msg.streamId, [[FLAG_DAT, bytes]]);
                 return;
             }
 
             // Regular WebSocket DAT framing: [1B type: 0=text 1=binary][message]
-            let payload;
-            if (msg.isText) {
-                const textBytes = new TextEncoder().encode(msg.data);
-                payload = new Uint8Array(1 + textBytes.length);
-                payload[0] = 0; // text
-                payload.set(textBytes, 1);
-            } else {
-                const binBytes = msg.data instanceof ArrayBuffer
-                    ? new Uint8Array(msg.data)
-                    : new Uint8Array(msg.data);
-                payload = new Uint8Array(1 + binBytes.length);
-                payload[0] = 1; // binary
-                payload.set(binBytes, 1);
-            }
+            const payload = new Uint8Array(1 + bytes.length);
+            payload[0] = msg.isText ? 0 : 1;
+            payload.set(bytes, 1);
             // Chunk at SWSP_CHUNK_SIZE (the data-channel message limit). Non-final
             // chunks carry FLAG_MORE so the device reassembles them into one WS
             // message (the type byte rides in the first chunk).
@@ -3558,7 +3535,7 @@ class BitBangConnection {
             ws.iframe.postMessage({
                 type: 'ws_closed', streamId: msg.streamId,
                 code: msg.code || 1000, reason: msg.reason || '',
-            }, '*');
+            }, location.origin);
         }
     }
 
@@ -3828,8 +3805,7 @@ class BitBangConnection {
             return;
         }
         try {
-            this.dataChannel.send(this.createFrame(0, FLAG_SYN,
-                JSON.stringify({ type: 'stream', name, on: !!on })));
+            if (!this.sendControl({ type: 'stream', name, on: !!on })) return;
             if (on) this.subscribedStreams.add(name);
             else this.subscribedStreams.delete(name);
         } catch (e) {
