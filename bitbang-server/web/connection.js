@@ -660,6 +660,424 @@ class SwspChannel {
     }
 }
 
+// What the reload screen says when a relayed session's credential runs out.
+const RELAY_ENDED_TEXT = 'Relay session ended. Reload to continue.';
+
+// Whether the session is on a TURN relay, kept current for the life of the
+// connection, and what happens as a relay's credential runs out: the title
+// warns, a visible page renews, a hidden one ends at the expiry and hands its
+// relay slot back.
+//
+// It acts on the connection only through `hooks`:
+//   pc()            the peer connection now in use, or null
+//   ended()         the session has ended for good (nothing to renew or end)
+//   reconnecting()  a reconnect is in flight (it renews by itself)
+//   renew()         renew the credential: a soft reconnect
+//   end(text)       end the session with the reload screen
+class RelayMonitor {
+    constructor(hooks, debug) {
+        this.hooks = hooks;
+        this.debug = debug;
+        this.usingRelay = false;
+        this.expiryMs = null;      // the credential's, from the offer's TURN username
+        this.monitorTimer = null;
+        this.warnTimer = null;
+        this.endTimer = null;
+        this.prevTitle = null;     // the tab title the warning replaced
+    }
+
+    // The relay credential of a new offer. The coturn REST-API username is
+    // "<epoch>[:<user_name>]"; the server stamps the same epoch on every
+    // entry, so the first match wins. Single-phase ICE stamps TURN up front,
+    // so there is no separate post-stall push.
+    setCredential(servers) {
+        this.expiryMs = null;
+        if (!Array.isArray(servers)) return;
+        for (const s of servers) {
+            const m = s && s.username && /^(\d+)(:|$)/.exec(s.username);
+            if (m) {
+                this.expiryMs = parseInt(m[1], 10) * 1000;
+                return;
+            }
+        }
+    }
+
+    // Whether the session is *currently* carried over a TURN relay.
+    //
+    // Two conditions, and both matter. The pair has to be the one selected
+    // right now -- ICE migrates, and a relay pair usually wins the first race
+    // because a TURN allocation is a deterministic round trip while a direct
+    // pair still has to hole-punch. And the pair has to be carrying traffic:
+    // with video and data on separate transports, an idle or superseded
+    // transport should not decide what the whole session is doing.
+    static async isUsingRelay(pc) {
+        if (!pc) return false;
+        try {
+            const stats = await pc.getStats();
+            for (const [, report] of stats) {
+                if (report.type !== 'transport' || !report.selectedCandidatePairId) continue;
+                const pair = stats.get(report.selectedCandidatePairId);
+                if (!pair) continue;
+                if (((pair.bytesSent || 0) + (pair.bytesReceived || 0)) === 0) continue;
+                const local = stats.get(pair.localCandidateId);
+                const remote = stats.get(pair.remoteCandidateId);
+                if (local?.candidateType === 'relay' || remote?.candidateType === 'relay') {
+                    return true;
+                }
+            }
+        } catch (e) {}
+        return false;
+    }
+
+    // What isUsingRelay is actually looking at, in a form a person can read.
+    // Kept beside it so the two cannot drift: if this says every pair is host
+    // and the session still ended on relay expiry, the fault is in the caller
+    // rather than in the stats.
+    static async describeSelectedPairs(pc) {
+        const out = [];
+        try {
+            const stats = await pc.getStats();
+            for (const [, report] of stats) {
+                if (report.type !== 'transport' || !report.selectedCandidatePairId) continue;
+                const pair = stats.get(report.selectedCandidatePairId);
+                if (!pair) { out.push('transport with no pair'); continue; }
+                const local = stats.get(pair.localCandidateId);
+                const remote = stats.get(pair.remoteCandidateId);
+                out.push({
+                    local: local?.candidateType,
+                    remote: remote?.candidateType,
+                    state: pair.state,
+                    nominated: pair.nominated,
+                    bytes: (pair.bytesSent || 0) + (pair.bytesReceived || 0),
+                });
+            }
+        } catch (e) {
+            out.push('getStats failed: ' + e);
+        }
+        return out;
+    }
+
+    // Debug only: poll every 2s and log when an ICE pair changes for any
+    // transport. OctoPrint has multiple transports (video + data channel)
+    // which ICE routes independently, so logging only the first hides cases
+    // where one transport is on direct and another is on relay.
+    static logPairChanges(pc) {
+        const lastByTransport = new Map();
+        const tick = async () => {
+            if (pc.connectionState !== 'connected') return;
+            try {
+                const stats = await pc.getStats();
+                for (const [, report] of stats) {
+                    if (report.type !== 'transport' || !report.selectedCandidatePairId) continue;
+                    const transportId = report.id;
+                    const selectedId = report.selectedCandidatePairId;
+                    if (lastByTransport.get(transportId) === selectedId) continue;
+                    lastByTransport.set(transportId, selectedId);
+                    const pair = stats.get(selectedId);
+                    const local = pair && stats.get(pair.localCandidateId);
+                    const remote = pair && stats.get(pair.remoteCandidateId);
+                    const localDesc = local ? `${local.candidateType} ${local.address}:${local.port}` : 'unknown';
+                    const remoteDesc = remote ? `${remote.candidateType} ${remote.address}:${remote.port}` : 'unknown';
+                    const isRelay = local?.candidateType === 'relay' || remote?.candidateType === 'relay';
+                    const dtlsState = report.dtlsState || '';
+                    console.log(`[Connection] ICE pair (transport ${transportId}, dtls=${dtlsState}): ${isRelay ? 'TURN relay' : 'direct'} - local ${localDesc}, remote ${remoteDesc}`);
+                }
+            } catch (e) {}
+            setTimeout(tick, 2000);
+        };
+        tick();
+    }
+
+    // Sample the path now, and remember the verdict.
+    async check(pc) {
+        this.usingRelay = await RelayMonitor.isUsingRelay(pc);
+        return this.usingRelay;
+    }
+
+    // Keep usingRelay honest for the life of the connection.
+    //
+    // The verdict used to be sampled once, at the first 'connected' event,
+    // which is the earliest and least representative moment: the relay pair
+    // typically succeeds first and the device (the controlling agent) then
+    // nominates a direct pair, by design. A session that spent two seconds on
+    // a relay and the next ten minutes direct was still shown the relay
+    // banner, and was still killed by the relay's expiry timer.
+    watch(pc) {
+        this.stopWatching();
+        const tick = async () => {
+            // Only a replaced or discarded connection ends the monitor. A
+            // transient 'disconnected' must not: the state flaps on any blip
+            // and recovers, and returning here without rescheduling left the
+            // monitor dead for the rest of the session -- with usingRelay
+            // frozen at whatever it was, which is usually true, because the
+            // relay pair wins first and the direct pair is nominated after.
+            if (this.hooks.pc() !== pc) return;
+            if (pc.connectionState !== 'connected') {
+                this.monitorTimer = setTimeout(tick, 2000);
+                return;
+            }
+            const now = await RelayMonitor.isUsingRelay(pc);
+            if (now !== this.usingRelay) {
+                this.usingRelay = now;
+                if (this.debug) {
+                    console.log(`[Connection] path changed: now ${now ? 'relayed' : 'direct'}`);
+                }
+                if (now) {
+                    if (!this.hooks.ended()) this.armEndTimers();
+                } else {
+                    // Off the relay: nothing here expires any more.
+                    this.clearEndTimers();
+                    this.restoreTitle();
+                }
+            }
+            this.monitorTimer = setTimeout(tick, 2000);
+        };
+        tick();
+    }
+
+    stopWatching() {
+        clearTimeout(this.monitorTimer);
+        this.monitorTimer = null;
+    }
+
+    // The transport is gone: forget its path and its credential.
+    reset() {
+        this.stopWatching();
+        this.clearEndTimers();
+        this.usingRelay = false;
+        this.expiryMs = null;
+    }
+
+    restoreTitle() {
+        if (!this.prevTitle) return;
+        setTopTitle(this.prevTitle);
+        this.prevTitle = null;
+    }
+
+    // Schedule what happens as the credential runs out. TURN_RENEW_LEAD_MS
+    // before the expiry, a visible page renews: a soft reconnect, which
+    // brings a fresh credential and arms this again. A hidden page keeps
+    // looking until the expiry and renews if someone comes back; otherwise it
+    // ends as it always has -- the title warns from expiry-60s, the reload
+    // screen comes at expiry -- so a tab nobody is looking at hands its relay
+    // slot back. Nothing to do without a credential.
+    //
+    // A credential that arrives with less than the lead left ends as before
+    // too, rather than renewing straight away: a server whose TTL is shorter
+    // than the lead would otherwise renew in a loop.
+    //
+    // Cleared first because this can run twice on a relayed connection, and
+    // in practice does: the monitor's first tick and the first-connected
+    // check race to see the path turn relayed, and each arms. Only the second
+    // pair of handles was kept, so the first pair could not be cancelled --
+    // not by a soft reconnect, not by the path going direct -- and ended the
+    // session at the expiry of the credential it was armed from, however
+    // many fresh ones had arrived since.
+    armEndTimers() {
+        if (!this.expiryMs) return;
+        this.clearEndTimers();
+        const now = Date.now();
+        const warnAt = this.expiryMs - 60_000 - now;
+        const renewAt = this.expiryMs - TURN_RENEW_LEAD_MS - now;
+        const endAt = this.expiryMs - now;
+        const warn = () => {
+            if (!this.prevTitle) this.prevTitle = topTitle;
+            setTopTitle('⚠ Relay ending soon — bitba.ng');
+        };
+        if (warnAt > 0) {
+            this.warnTimer = setTimeout(() => {
+                // A visible page renews before anything ends; no warning.
+                if (this.hooks.ended() || !this.usingRelay || !document.hidden) return;
+                warn();
+            }, warnAt);
+        }
+        // Re-check the live path before tearing the page down. The monitor
+        // should have caught a migration to direct already, but this timer is
+        // what actually ends the session, so it verifies rather than trusting
+        // a verdict that may be minutes old.
+        const endNow = async () => {
+            if (this.hooks.ended()) return;
+            const pc = this.hooks.pc();
+            if (!(await RelayMonitor.isUsingRelay(pc))) {
+                this.usingRelay = false;
+                this.clearEndTimers();
+                return;
+            }
+            // Ended before the stats are read, so nothing else acts on the
+            // session while they are.
+            this.hooks.end(RELAY_ENDED_TEXT);
+            // Not behind the debug flag. This fires at most once per session
+            // and only while tearing the page down, which is exactly the
+            // moment evidence is worth having -- "it said relay and I was not
+            // on a relay" is otherwise unfalsifiable after the fact.
+            console.warn('[Connection] ended session on relay expiry;',
+                         'selected pairs:', await RelayMonitor.describeSelectedPairs(pc));
+        };
+        // The same check before renewing: a session that went direct has
+        // nothing to renew.
+        const renewOrEnd = async () => {
+            if (this.hooks.ended() || this.hooks.reconnecting()) return;
+            if (!(await RelayMonitor.isUsingRelay(this.hooks.pc()))) {
+                this.usingRelay = false;
+                this.clearEndTimers();
+                return;
+            }
+            if (this.hooks.ended() || this.hooks.reconnecting()) return;
+            if (!document.hidden) {
+                this.restoreTitle();
+                this.hooks.renew();
+                return;
+            }
+            // Hidden after the warning was due, the page has not warned yet.
+            warn();
+            const left = this.expiryMs - Date.now();
+            this.endTimer = left > TURN_RENEW_RECHECK_MS
+                ? setTimeout(renewOrEnd, TURN_RENEW_RECHECK_MS)
+                : setTimeout(endNow, Math.max(0, left));
+        };
+        if (renewAt > 0) {
+            this.endTimer = setTimeout(renewOrEnd, renewAt);
+        } else if (endAt > 0) {
+            this.endTimer = setTimeout(endNow, endAt);
+        } else {
+            // Already past expiry by the time we got here -- check and fire.
+            endNow();
+        }
+    }
+
+    clearEndTimers() {
+        clearTimeout(this.warnTimer);
+        clearTimeout(this.endTimer);
+        this.warnTimer = null;
+        this.endTimer = null;
+    }
+}
+
+// The connection_path telemetry: one message to the signaling server per ICE
+// establishment, saying whether it ended up direct, relayed or relayed over
+// TCP, and one when ICE fails. Fire-and-forget: it never affects the session.
+//
+// Sample once ICE has settled, not the moment it first works. 'connected'
+// means some pair succeeded; 'completed' means checking is done and the
+// nomination is final. A relay pair usually wins the first race -- a TURN
+// allocation is one deterministic round trip, a direct pair still has to
+// hole-punch -- and the device then nominates direct, by design. Sampling at
+// 'connected' therefore counted relay for sessions that spent their whole
+// life direct.
+//
+// 'completed' is not guaranteed to arrive, and a short session may end before
+// it does, so a settle timer bounds the wait. First one wins; `reported`
+// keeps it to one report per establishment.
+//
+// hooks: pc() as RelayMonitor's, and send(msg) to the signaling socket.
+class PathReporter {
+    constructor(hooks, debug) {
+        this.hooks = hooks;
+        this.debug = debug;
+        this.reported = false;
+        this.settleTimer = null;
+        this.prevState = null;     // the last iceConnectionState seen
+    }
+
+    // A new peer connection: a new establishment to report.
+    reset() {
+        this.prevState = null;
+        this.reported = false;
+        this.clearSettleTimer();
+    }
+
+    // Each transition INTO connected gets one report with the actual
+    // selected path, and each transition INTO failed gets one "failed".
+    onIceState(pc) {
+        const now = pc.iceConnectionState;
+        const prev = this.prevState;
+        this.prevState = now;
+        if ((now === 'connected' || now === 'completed') && !this.reported) {
+            if (now === 'completed') {
+                this.report(pc);
+            } else if (!this.settleTimer) {
+                this.settleTimer = setTimeout(() => this.report(pc), PATH_SETTLE_MS);
+            }
+        } else if (now === 'failed' && prev !== 'failed') {
+            this.clearSettleTimer();
+            if (!this.reported) {
+                this.reported = true;
+                this.send('failed', 'ice_failed');
+            }
+        } else if (now === 'checking' && prev && prev !== 'checking') {
+            // A restartIce re-establishment (connected -> checking ->
+            // connected on the same PC) is a new establishment and earns its
+            // own report.
+            this.clearSettleTimer();
+            this.reported = false;
+        }
+    }
+
+    // One report per establishment, whichever trigger fires first.
+    report(pc) {
+        this.clearSettleTimer();
+        if (this.reported || this.hooks.pc() !== pc) return;
+        this.reported = true;
+        PathReporter.classify(pc)
+            .then((path) => this.send(path))
+            .catch(() => {});
+    }
+
+    clearSettleTimer() {
+        clearTimeout(this.settleTimer);
+        this.settleTimer = null;
+    }
+
+    // Classify the established path. Returns "direct", "relay", or
+    // "tcp-relay". Looks at every transport's selected pair and picks the
+    // "worst" (tcp-relay > relay > direct) so a mixed session -- e.g. data
+    // direct but video relay -- reports relay rather than under-counting it
+    // as direct.
+    //
+    // tcp-relay distinction: when a candidate is type "relay", the
+    // relayProtocol field (if exposed) tells us whether the allocation was
+    // made over UDP or TCP. We fall back to the candidate's transport
+    // protocol if relayProtocol isn't present.
+    static async classify(pc) {
+        let path = 'direct';
+        try {
+            const stats = await pc.getStats();
+            for (const [, report] of stats) {
+                if (report.type !== 'transport' || !report.selectedCandidatePairId) continue;
+                const pair = stats.get(report.selectedCandidatePairId);
+                if (!pair) continue;
+                // An idle or superseded transport should not classify the
+                // session; same rule as RelayMonitor.isUsingRelay.
+                if (((pair.bytesSent || 0) + (pair.bytesReceived || 0)) === 0) continue;
+                const local = stats.get(pair.localCandidateId);
+                const remote = stats.get(pair.remoteCandidateId);
+                const relayCand =
+                    local?.candidateType === 'relay' ? local
+                  : remote?.candidateType === 'relay' ? remote
+                  : null;
+                if (!relayCand) continue;
+                const proto = (relayCand.relayProtocol || relayCand.protocol || 'udp').toLowerCase();
+                path = proto === 'tcp' ? 'tcp-relay' : 'relay';
+                // Keep scanning in case a later transport has a worse
+                // classification (tcp-relay > relay).
+                if (path === 'tcp-relay') break;
+            }
+        } catch (e) {
+            // Telemetry must never break user flow. Best-effort classify
+            // as direct and move on.
+        }
+        return path;
+    }
+
+    send(path, reason) {
+        const msg = { type: 'connection_path', path };
+        if (reason) msg.reason = reason;
+        if (this.hooks.send(msg) && this.debug) {
+            console.log(`[Connection] reported connection_path: ${path}${reason ? ' (' + reason + ')' : ''}`);
+        }
+    }
+}
+
 class BitBangConnection {
     constructor({ uid, target, devicePath, deviceSearch, deviceHash }) {
         this.uid = uid;
@@ -730,15 +1148,22 @@ class BitBangConnection {
         }
         this._turnHoldPromise = null;
         this._wasConnected = false;
-        this._usingRelay = false;
-        this._relayMonitorTimer = null;
-        this._turnPrevTitle = null;
-        this._pathReported = false;
-        this._pathSettleTimer = null;
-        this._turnWarnTimer = null;
-        this._turnEndTimer = null;
-        this._turnExpiryMs = null;
+        // The relay verdict and its credential's expiry, and the path
+        // telemetry. Both act on this only through the hooks given here.
+        this.relay = new RelayMonitor({
+            pc: () => this.pc,
+            ended: () => this._turnEnded,
+            reconnecting: () => this._reconnecting,
+            renew: () => this._renewTurn(),
+            end: (text) => this.showReloadScreen(text),
+        }, this.debug);
+        this.path = new PathReporter({
+            pc: () => this.pc,
+            send: (msg) => this._sendSignaling(msg),
+        }, this.debug);
         this._turnUnavailable = false;
+        // The session has ended for good: relay expiry, the device ending it,
+        // or the reconnect window closing. Nothing retries after this.
         this._turnEnded = false;
         this._renewing = false;         // the reconnect in progress renews TURN
         // Soft-reconnect state.
@@ -1169,21 +1594,6 @@ class BitBangConnection {
         }
     }
 
-    // Parse the coturn REST-API expiry from a TURN credential's username
-    // ("<epoch>[:<user_name>]") and stash it in this._turnExpiryMs. The
-    // server stamps the same epoch on every entry it returns, so the
-    // first match wins. Called when the offer's ice_servers arrive — single-
-    // phase stamps TURN up front, so there is no separate post-stall push.
-    _extractTurnExpiry(servers) {
-        if (!Array.isArray(servers)) return;
-        for (const s of servers) {
-            const m = s && s.username && /^(\d+)(:|$)/.exec(s.username);
-            if (m) {
-                this._turnExpiryMs = parseInt(m[1], 10) * 1000;
-                return;
-            }
-        }
-    }
 
     async connect() {
         try {
@@ -1678,12 +2088,11 @@ class BitBangConnection {
             const flags = parseUrlFlags();
             if (flags.relay && !flags.norelay) {
                 console.warn('[Connection] relay full at renewal; ending session');
-                this.showReloadScreen(this._endedMessage());
+                this.showReloadScreen(RELAY_ENDED_TEXT);
                 return;
             }
         }
-        this._turnExpiryMs = null;
-        this._extractTurnExpiry(msg.ice_servers);
+        this.relay.setCredential(msg.ice_servers);
         this.iceServers = Array.isArray(msg.ice_servers) ? msg.ice_servers : [];
         this.pc = this.createPeerConnection(msg.ice_servers);
 
@@ -1771,8 +2180,8 @@ class BitBangConnection {
                 // Connection is up — cancel the "negotiating" reassurance banner.
                 this._clearReassureTimer();
                 this._printDebug(STATUS.CONNECTED);
-                this.pollConnectionType(pc);
-                this._monitorRelayPath(pc);
+                if (this.debug) RelayMonitor.logPairChanges(pc);
+                this.relay.watch(pc);
                 if (!this._wasConnected) {
                     this._wasConnected = true;
                     this._onFirstConnected(pc);
@@ -1792,58 +2201,14 @@ class BitBangConnection {
             }
         };
 
-        // _prevICEState tracks the last-seen iceConnectionState on this PC so
-        // we can detect transitions INTO 'connected' (including post-
-        // restartIce re-establishments — those go connected → checking →
-        // connected within the same PC) and fire one connection_path
-        // telemetry message per established or failed event.
-        this._prevICEState = null;
-        this._pathReported = false;
-        this._clearPathSettleTimer();
+        // A new peer connection is a new establishment to report.
+        this.path.reset();
 
         pc.oniceconnectionstatechange = () => {
             if (this.debug) console.log(`[Connection] iceConnectionState -> ${pc.iceConnectionState}`);
-            const now = pc.iceConnectionState;
-            const prev = this._prevICEState;
-            this._prevICEState = now;
+            this.path.onIceState(pc);
 
-            // Telemetry: each transition INTO connected gets one
-            // connection_path report with the actual selected path. Each
-            // transition INTO failed gets one "failed" report. Fire-and-
-            // forget — never block the connection state machine on it.
-            // Sample once ICE has settled, not the moment it first works.
-            // 'connected' means some pair succeeded; 'completed' means
-            // checking is done and the nomination is final. A relay pair
-            // usually wins the first race -- a TURN allocation is one
-            // deterministic round trip, a direct pair still has to
-            // hole-punch -- and the device then nominates direct, by design.
-            // Sampling at 'connected' therefore counted relay for sessions
-            // that spent their whole life direct.
-            //
-            // 'completed' is not guaranteed to arrive, and a short session may
-            // end before it does, so a settle timer bounds the wait. First one
-            // wins; _pathReported keeps it to one report per establishment.
-            if ((now === 'connected' || now === 'completed') && !this._pathReported) {
-                if (now === 'completed') {
-                    this._reportConnectionPath(pc);
-                } else if (!this._pathSettleTimer) {
-                    this._pathSettleTimer = setTimeout(
-                        () => this._reportConnectionPath(pc), PATH_SETTLE_MS);
-                }
-            } else if (now === 'failed' && prev !== 'failed') {
-                this._clearPathSettleTimer();
-                if (!this._pathReported) {
-                    this._pathReported = true;
-                    this._sendConnectionPath('failed', 'ice_failed');
-                }
-            } else if (now === 'checking' && prev && prev !== 'checking') {
-                // A restartIce re-establishment: this is a new establishment
-                // and earns its own report.
-                this._clearPathSettleTimer();
-                this._pathReported = false;
-            }
-
-            if (this._wasConnected && this._usingRelay
+            if (this._wasConnected && this.relay.usingRelay
                 && (pc.iceConnectionState === 'failed' || pc.iceConnectionState === 'disconnected')) {
                 this._handlePostHandshakeFailure();
             }
@@ -1950,190 +2315,15 @@ class BitBangConnection {
         }
     }
 
-    // Poll every 2s and log when an ICE pair changes for any transport.
-    // OctoPrint has multiple transports (video + data channel) which ICE
-    // routes independently, so logging only the first hides cases where
-    // one transport is on direct and another is on relay.
-    pollConnectionType(pc) {
-        if (!this.debug) return;
-        const lastByTransport = new Map();
-        const tick = async () => {
-            if (pc.connectionState !== 'connected') return;
-            try {
-                const stats = await pc.getStats();
-                for (const [, report] of stats) {
-                    if (report.type !== 'transport' || !report.selectedCandidatePairId) continue;
-                    const transportId = report.id;
-                    const selectedId = report.selectedCandidatePairId;
-                    if (lastByTransport.get(transportId) === selectedId) continue;
-                    lastByTransport.set(transportId, selectedId);
-                    const pair = stats.get(selectedId);
-                    const local = pair && stats.get(pair.localCandidateId);
-                    const remote = pair && stats.get(pair.remoteCandidateId);
-                    const localDesc = local ? `${local.candidateType} ${local.address}:${local.port}` : 'unknown';
-                    const remoteDesc = remote ? `${remote.candidateType} ${remote.address}:${remote.port}` : 'unknown';
-                    const isRelay = local?.candidateType === 'relay' || remote?.candidateType === 'relay';
-                    const dtlsState = report.dtlsState || '';
-                    console.log(`[Connection] ICE pair (transport ${transportId}, dtls=${dtlsState}): ${isRelay ? 'TURN relay' : 'direct'} - local ${localDesc}, remote ${remoteDesc}`);
-                }
-            } catch (e) {}
-            setTimeout(tick, 2000);
-        };
-        tick();
-    }
-
-    // Returns true if the session is *currently* carried over a TURN relay.
-    //
-    // Two conditions, and both matter. The pair has to be the one selected
-    // right now -- ICE migrates, and a relay pair usually wins the first race
-    // because a TURN allocation is a deterministic round trip while a direct
-    // pair still has to hole-punch. And the pair has to be carrying traffic:
-    // with video and data on separate transports, an idle or superseded
-    // transport should not decide what the whole session is doing.
-    async _isUsingRelay(pc) {
-        if (!pc) return false;
-        try {
-            const stats = await pc.getStats();
-            for (const [, report] of stats) {
-                if (report.type !== 'transport' || !report.selectedCandidatePairId) continue;
-                const pair = stats.get(report.selectedCandidatePairId);
-                if (!pair) continue;
-                if (((pair.bytesSent || 0) + (pair.bytesReceived || 0)) === 0) continue;
-                const local = stats.get(pair.localCandidateId);
-                const remote = stats.get(pair.remoteCandidateId);
-                if (local?.candidateType === 'relay' || remote?.candidateType === 'relay') {
-                    return true;
-                }
-            }
-        } catch (e) {}
-        return false;
-    }
-
-    // Keep _usingRelay honest for the life of the connection.
-    //
-    // The verdict used to be sampled once, at the first 'connected' event,
-    // which is the earliest and least representative moment: the relay pair
-    // typically succeeds first and the device (the controlling agent) then
-    // nominates a direct pair, by design. A session that spent two seconds on
-    // a relay and the next ten minutes direct was still shown the relay
-    // banner, and was still killed by the relay's expiry timer.
-    _monitorRelayPath(pc) {
-        this._clearRelayMonitor();
-        const tick = async () => {
-            // Only a replaced or discarded connection ends the monitor. A
-            // transient 'disconnected' must not: the state flaps on any blip
-            // and recovers, and returning here without rescheduling left the
-            // monitor dead for the rest of the session -- with _usingRelay
-            // frozen at whatever it was, which is usually true, because the
-            // relay pair wins first and the direct pair is nominated after.
-            if (!this.pc || this.pc !== pc) return;
-            if (pc.connectionState !== 'connected') {
-                this._relayMonitorTimer = setTimeout(tick, 2000);
-                return;
-            }
-            const now = await this._isUsingRelay(pc);
-            if (now !== this._usingRelay) {
-                this._usingRelay = now;
-                if (this.debug) {
-                    console.log(`[Connection] path changed: now ${now ? 'relayed' : 'direct'}`);
-                }
-                if (now) {
-                    if (this._turnExpiryMs && !this._turnEnded) this._armTurnEndTimers();
-                } else {
-                    // Off the relay: nothing here expires any more.
-                    this._clearTurnEndTimers();
-                    if (this._turnPrevTitle) {
-                        setTopTitle(this._turnPrevTitle);
-                        this._turnPrevTitle = null;
-                    }
-                }
-            }
-            this._relayMonitorTimer = setTimeout(tick, 2000);
-        };
-        tick();
-    }
-
-    _clearRelayMonitor() {
-        if (this._relayMonitorTimer) {
-            clearTimeout(this._relayMonitorTimer);
-            this._relayMonitorTimer = null;
-        }
-    }
-
-    // Classify the established path for telemetry. Returns "direct",
-    // "relay", or "tcp-relay". Looks at every transport's selected pair
-    // and picks the "worst" (relay > tcp-relay > direct) so a mixed
-    // session — e.g. data direct but video relay — reports relay rather
-    // than under-counting it as direct.
-    //
-    // tcp-relay distinction: when a candidate is type "relay", the
-    // relayProtocol field (if exposed) tells us whether the allocation
-    // was made over UDP or TCP. We fall back to the candidate's
-    // transport protocol if relayProtocol isn't present.
-    async _detectConnectionPath(pc) {
-        let path = 'direct';
-        try {
-            const stats = await pc.getStats();
-            for (const [, report] of stats) {
-                if (report.type !== 'transport' || !report.selectedCandidatePairId) continue;
-                const pair = stats.get(report.selectedCandidatePairId);
-                if (!pair) continue;
-                // An idle or superseded transport should not classify the
-                // session; same rule as _isUsingRelay.
-                if (((pair.bytesSent || 0) + (pair.bytesReceived || 0)) === 0) continue;
-                const local = stats.get(pair.localCandidateId);
-                const remote = stats.get(pair.remoteCandidateId);
-                const relayCand =
-                    local?.candidateType === 'relay' ? local
-                  : remote?.candidateType === 'relay' ? remote
-                  : null;
-                if (!relayCand) continue;
-                const proto = (relayCand.relayProtocol || relayCand.protocol || 'udp').toLowerCase();
-                // "relay" wins outright over "direct"; "tcp-relay" is a
-                // worse outcome than "relay" only in cost/latency terms,
-                // not strictly worse, so we treat them as distinct but
-                // either takes precedence over direct.
-                path = proto === 'tcp' ? 'tcp-relay' : 'relay';
-                // Don't break — keep scanning in case a later transport
-                // has a worse classification (tcp-relay > relay).
-                if (path === 'tcp-relay') break;
-            }
-        } catch (e) {
-            // Telemetry must never break user flow. Best-effort classify
-            // as direct and move on.
-        }
-        return path;
-    }
-
-    // One report per ICE establishment, whichever trigger fires first.
-    _reportConnectionPath(pc) {
-        this._clearPathSettleTimer();
-        if (this._pathReported || !this.pc || this.pc !== pc) return;
-        this._pathReported = true;
-        this._detectConnectionPath(pc)
-            .then((path) => this._sendConnectionPath(path))
-            .catch(() => {});
-    }
-
-    _clearPathSettleTimer() {
-        if (this._pathSettleTimer) {
-            clearTimeout(this._pathSettleTimer);
-            this._pathSettleTimer = null;
-        }
-    }
-
-    // Fire-and-forget telemetry. Sends one connection_path message to
-    // the signaling server. Tolerant of a closed/closing WS — telemetry
-    // failure must never affect the user's session.
-    _sendConnectionPath(path, reason) {
-        if (this.ws?.readyState !== WebSocket.OPEN) return;
-        const msg = { type: 'connection_path', path };
-        if (reason) msg.reason = reason;
+    // A message to the signaling server, if its socket is open. Returns
+    // whether it went; a socket that has closed is not an error here.
+    _sendSignaling(msg) {
+        if (this.ws?.readyState !== WebSocket.OPEN) return false;
         try {
             this.ws.send(JSON.stringify(msg));
-            if (this.debug) console.log(`[Connection] reported connection_path: ${path}${reason ? ' (' + reason + ')' : ''}`);
+            return true;
         } catch (e) {
-            // swallow — see above
+            return false;
         }
     }
 
@@ -2163,8 +2353,8 @@ class BitBangConnection {
     //   (b) arm the 2-second loading-page hold so the banner is readable;
     //   (c) start the data-budget / time-budget poll loop (Part 2).
     async _onFirstConnected(pc) {
-        this._usingRelay = await this._isUsingRelay(pc);
-        if (this._usingRelay) {
+        const relayed = await this.relay.check(pc);
+        if (relayed) {
             this._print('Using temporary relay (TURN) — direct peer-to-peer was not possible.');
             this._turnHoldPromise = new Promise(r => setTimeout(r, 2000));
         } else if (this._turnUnavailable) {
@@ -2172,154 +2362,18 @@ class BitBangConnection {
             // the visible message survives iframe handoff for ~2 s.
             this._turnHoldPromise = new Promise(r => setTimeout(r, 2000));
         }
-        // Arm the TTL-based end triggers if we're on a relay path and we
-        // know when the credential expires. Direct paths skip both.
-        if (this._usingRelay && this._turnExpiryMs) {
-            this._armTurnEndTimers();
-        }
-    }
-
-    // Schedule what happens as the TURN credential runs out, from the epoch
-    // expiry the server embedded in its username. TURN_RENEW_LEAD_MS before
-    // it, a visible page renews: a soft reconnect, which brings a fresh
-    // credential and arms this again. A hidden page keeps looking until the
-    // expiry and renews if someone comes back; otherwise it ends as it always
-    // has -- the title warns from expiry-60s, the reload screen comes at
-    // expiry -- so a tab nobody is looking at hands its relay slot back.
-    //
-    // A credential that arrives with less than the lead left ends as before
-    // too, rather than renewing straight away: a server whose TTL is shorter
-    // than the lead would otherwise renew in a loop.
-    //
-    // Cleared first because this can run twice on a relayed connection, and
-    // in practice does: the relay monitor's first tick and _onFirstConnected
-    // race to see the path turn relayed, and each arms. Only the second pair
-    // of handles was kept, so the first pair could not be cancelled -- not
-    // by a soft reconnect, not by the path going direct -- and ended the
-    // session at the expiry of the credential it was armed from, however
-    // many fresh ones had arrived since.
-    _armTurnEndTimers() {
-        this._clearTurnEndTimers();
-        const now = Date.now();
-        const warnAt = this._turnExpiryMs - 60_000 - now;
-        const renewAt = this._turnExpiryMs - TURN_RENEW_LEAD_MS - now;
-        const endAt = this._turnExpiryMs - now;
-        const warn = () => {
-            if (!this._turnPrevTitle) this._turnPrevTitle = topTitle;
-            setTopTitle('⚠ Relay ending soon — bitba.ng');
-        };
-        if (warnAt > 0) {
-            this._turnWarnTimer = setTimeout(() => {
-                // A visible page renews before anything ends; no warning.
-                if (this._turnEnded || !this._usingRelay || !document.hidden) return;
-                warn();
-            }, warnAt);
-        }
-        // Re-check the live path before tearing the page down. The monitor
-        // should have caught a migration to direct already, but this timer is
-        // what actually ends the session, so it verifies rather than trusting
-        // a verdict that may be minutes old.
-        const endNow = async () => {
-            if (this._turnEnded) return;
-            if (!(await this._isUsingRelay(this.pc))) {
-                this._usingRelay = false;
-                this._clearTurnEndTimers();
-                return;
-            }
-            this._turnEnded = true;
-            // Not behind the debug flag. This fires at most once per session
-            // and only while tearing the page down, which is exactly the
-            // moment evidence is worth having -- "it said relay and I was not
-            // on a relay" is otherwise unfalsifiable after the fact.
-            console.warn('[Connection] ending session on relay expiry;',
-                         'selected pairs:', await this._describeSelectedPairs(this.pc));
-            this.showReloadScreen(this._endedMessage());
-        };
-        // The same check before renewing: a session that went direct has
-        // nothing to renew.
-        const renewOrEnd = async () => {
-            if (this._turnEnded || this._reconnecting) return;
-            if (!(await this._isUsingRelay(this.pc))) {
-                this._usingRelay = false;
-                this._clearTurnEndTimers();
-                return;
-            }
-            if (this._turnEnded || this._reconnecting) return;
-            if (!document.hidden) {
-                this._renewTurn();
-                return;
-            }
-            // Hidden after the warning was due, the page has not warned yet.
-            warn();
-            const left = this._turnExpiryMs - Date.now();
-            this._turnEndTimer = left > TURN_RENEW_RECHECK_MS
-                ? setTimeout(renewOrEnd, TURN_RENEW_RECHECK_MS)
-                : setTimeout(endNow, Math.max(0, left));
-        };
-        if (renewAt > 0) {
-            this._turnEndTimer = setTimeout(renewOrEnd, renewAt);
-        } else if (endAt > 0) {
-            this._turnEndTimer = setTimeout(endNow, endAt);
-        } else {
-            // Already past expiry by the time we got here — check and fire.
-            endNow();
-        }
+        // Arm the TTL-based end triggers if we're on a relay path (and the
+        // credential says when it expires). Direct paths skip both.
+        if (relayed) this.relay.armEndTimers();
     }
 
     // Renew the relay credential before it runs out, through the soft
-    // reconnect. _renewing lets the offer handler tell a renewal that finds
+    // reconnect (RelayMonitor decides when). _renewing lets the offer handler tell a renewal that finds
     // the relay full from a reconnect that should keep trying.
     _renewTurn() {
         console.log('[Connection] renewing the relay credential before it expires');
-        if (this._turnPrevTitle) {
-            setTopTitle(this._turnPrevTitle);
-            this._turnPrevTitle = null;
-        }
         this._renewing = true;
         this._reconnectLoop();
-    }
-
-    _endedMessage() {
-        return 'Relay session ended. Reload to continue.';
-    }
-
-    // What _isUsingRelay is actually looking at, in a form a person can read.
-    // Kept beside it so the two cannot drift: if this says every pair is host
-    // and the session still ended on relay expiry, the fault is in the caller
-    // rather than in the stats.
-    async _describeSelectedPairs(pc) {
-        const out = [];
-        try {
-            const stats = await pc.getStats();
-            for (const [, report] of stats) {
-                if (report.type !== 'transport' || !report.selectedCandidatePairId) continue;
-                const pair = stats.get(report.selectedCandidatePairId);
-                if (!pair) { out.push('transport with no pair'); continue; }
-                const local = stats.get(pair.localCandidateId);
-                const remote = stats.get(pair.remoteCandidateId);
-                out.push({
-                    local: local?.candidateType,
-                    remote: remote?.candidateType,
-                    state: pair.state,
-                    nominated: pair.nominated,
-                    bytes: (pair.bytesSent || 0) + (pair.bytesReceived || 0),
-                });
-            }
-        } catch (e) {
-            out.push('getStats failed: ' + e);
-        }
-        return out;
-    }
-
-    _clearTurnEndTimers() {
-        if (this._turnWarnTimer) {
-            clearTimeout(this._turnWarnTimer);
-            this._turnWarnTimer = null;
-        }
-        if (this._turnEndTimer) {
-            clearTimeout(this._turnEndTimer);
-            this._turnEndTimer = null;
-        }
     }
 
     // Called from onconnectionstatechange === 'failed' or the ICE handler
@@ -2339,7 +2393,7 @@ class BitBangConnection {
     // sessionId, iframe, and app state throughout.
     async _reconnectLoop() {
         this._reconnecting = true;
-        this._clearTurnEndTimers();
+        this.relay.clearEndTimers();
         this._clearReassureTimer();
         this._showReconnecting();
 
@@ -2385,7 +2439,7 @@ class BitBangConnection {
         this._hideReconnecting();
         if (this._turnEnded) return;
         this._turnEnded = true;
-        const msg = this._usingRelay
+        const msg = this.relay.usingRelay
             ? 'Connection lost — relay may have expired.'
             : 'Connection lost. Reload to continue.';
         this.showReloadScreen(msg);
@@ -2600,9 +2654,10 @@ class BitBangConnection {
         // not know about. The loop owns the socket from here.
         clearTimeout(this._signalTimer);
         this._signalTimer = null;
-        this._clearTurnEndTimers();
         this._clearReassureTimer();
-        // The channel, its credit and its version go with it (detach).
+        // The channel, its credit and its version go with it (detach), and
+        // the relay verdict and credential with the peer connection.
+        this.relay.reset();
         this.swsp.detach();
         try { if (this.pc) this.pc.close(); } catch (e) {}
         try { if (this.ws) this.ws.close(); } catch (e) {}
@@ -2614,10 +2669,7 @@ class BitBangConnection {
         this.connectResolve = null;
         this.candidateQueue = new CandidateQueue();
         this._wasConnected = false;
-        this._usingRelay = false;
-        this._clearRelayMonitor();
         this._turnHoldPromise = null;
-        this._turnExpiryMs = null;
 
         // Every stream the page has open was on the data channel just closed,
         // and none of them will be carried over: a new peer connection is a new
