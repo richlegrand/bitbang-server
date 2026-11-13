@@ -1952,12 +1952,18 @@ class BitBangConnection {
         }
     }
 
+    // The signaling socket's URL, for the session and for the control socket
+    // alike. Signaling is bitba.ng's, not this origin's: a label host serves
+    // nothing but its own files (label.go) and answers anything else with the
+    // start page, so a socket opened here never opens.
+    signalingURL() {
+        const proto = location.protocol === 'https:' ? 'wss:' : 'ws:';
+        return `${proto}//${new URL(TOP_ORIGIN).host}/ws/client/${this.uid}`;
+    }
+
     connectWebSocket() {
         return new Promise((resolve, reject) => {
-            // Signaling is bitba.ng's, not this origin's: a label host serves
-            // nothing but its own files (label.go).
-            const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
-            const ws = new WebSocket(`${protocol}//${new URL(TOP_ORIGIN).host}/ws/client/${this.uid}`);
+            const ws = new WebSocket(this.signalingURL());
             this.ws = ws;
 
             const offerTimeout = setTimeout(() => {
@@ -2626,8 +2632,7 @@ class BitBangConnection {
     // seconds.
     _redialSignaling() {
         if (!this._shouldHoldSignaling()) return;
-        const proto = location.protocol === 'https:' ? 'wss:' : 'ws:';
-        const ws = new WebSocket(`${proto}//${location.host}/ws/client/${this.uid}`);
+        const ws = new WebSocket(this.signalingURL());
         ws.bbControl = true;                  // carries no session; see the trickle
         this.ws = ws;
         if (this.debug) console.log('[Connection] redialing signaling');
