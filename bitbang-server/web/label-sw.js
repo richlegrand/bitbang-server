@@ -179,7 +179,7 @@ self.addEventListener('message', async (event) => {
         if (!port) return;
         await cookieJarReady;
         const path = String(event.data.path || '/').split('?')[0];
-        port.postMessage({ cookies: config.noCookieJar ? '' : (getCookieHeader(JAR_KEY, path) || '') });
+        port.postMessage({ cookies: config.noCookieJar ? '' : (getCookieHeader(path) || '') });
         return;
     }
     if (type === 'cookie_write') {
@@ -187,7 +187,7 @@ self.addEventListener('message', async (event) => {
         // outbound request includes it.
         if (typeof event.data.value !== 'string') return;
         await cookieJarReady;
-        keepAlive(event, storeCookies(JAR_KEY, event.data.value));
+        keepAlive(event, storeCookies(event.data.value));
     }
 });
 
@@ -419,9 +419,9 @@ function isMirrorable(cookie) {
 // sources use it, the preamble's window.__bbCookies and the BroadcastChannel,
 // so the shim writes one form whichever told it. The expiry goes with each:
 // without it every mirrored cookie would be a session one.
-function mirrorStrings(jarKey) {
+function mirrorStrings() {
     const now = Date.now();
-    return (cookieJar.get(jarKey) || [])
+    return (cookieJar.get(JAR_KEY) || [])
         .filter(c => (c.expires === null || c.expires > now) && isMirrorable(c))
         .map(c => c.name + '=' + c.value + ';path=' + c.path
             + (c.expires !== null ? ';expires=' + new Date(c.expires).toUTCString() : ''));
@@ -454,12 +454,12 @@ function jsonForScript(value) {
 
 // Returns the persistence promise so callers can keepAlive() it. Always
 // returns a promise, including on the no-op path.
-function storeCookies(jarKey, setCookieHeaders) {
+function storeCookies(setCookieHeaders) {
     if (!setCookieHeaders) return Promise.resolve();
     const headers = Array.isArray(setCookieHeaders) ? setCookieHeaders : [setCookieHeaders];
 
-    if (!cookieJar.has(jarKey)) cookieJar.set(jarKey, []);
-    const jar = cookieJar.get(jarKey);
+    if (!cookieJar.has(JAR_KEY)) cookieJar.set(JAR_KEY, []);
+    const jar = cookieJar.get(JAR_KEY);
 
     for (const h of headers) {
         const cookie = parseCookie(h);
@@ -478,8 +478,8 @@ function storeCookies(jarKey, setCookieHeaders) {
     return saveCookieJar();
 }
 
-function getCookieHeader(jarKey, requestPath) {
-    const jar = cookieJar.get(jarKey);
+function getCookieHeader(requestPath) {
+    const jar = cookieJar.get(JAR_KEY);
     if (!jar || jar.length === 0) return null;
 
     const now = Date.now();
@@ -751,370 +751,416 @@ async function serveMetaPage(name) {
  * Proxy a request through a connection frame's data channel. The path is the
  * device's own; connection.js puts a proxied app's target back on.
  */
+// Hand a request to a connection frame, which sends it over its data channel,
+// and build the response from what comes back on a MessageChannel port. The
+// pieces, in the order a request meets them, are below this function:
+//   readUnstreamableBody   a body this browser can't stream, read whole
+//   deviceRequestHeaders   the request's headers, with the jar's cookies
+//   UploadCredit, sendBody the body, as fast as connection.js allows
+//   keepSetCookies         a response's cookies, into the jar and the mirror
+//   pagePreamble           the scripts put in front of a device page
+//   deviceResponseHeaders  the response's headers, reframed
+//   PulledBody             the response body, as the reader pulls it
 async function proxyToDevice(event) {
-    const url = new URL(event.request.url);
+    const request = event.request;
+    const url = new URL(request.url);
     const devicePath = url.pathname;
 
-    // -- Find a connection frame --
-    //
     // includeUncontrolled because Chrome may drop worker->client control
     // after idle, with the page still alive and its connection working.
     const connection = await pickConnection();
-
-    if (config.debug) console.log(`[label-sw] ${event.request.method} ${devicePath} -> connection: ${!!connection}`);
-
+    if (config.debug) console.log(`[label-sw] ${request.method} ${devicePath} -> connection: ${!!connection}`);
     if (!connection) {
         console.warn('[label-sw] no connection frame');
         return new Response('BitBang: no connection', { status: 503 });
     }
 
-    // -- Build request with cookies --
-    const jarKey = JAR_KEY;
-    const session = config;
     const channel = new MessageChannel();
-    const hasBody = event.request.method !== 'GET' && event.request.method !== 'HEAD';
-
-    // Request.body is not available everywhere: Firefox does not support it in
-    // any version, Samsung Internet gained it in 20, Chrome in 105. Without a
-    // fallback the body was simply never sent -- the request went out empty and
-    // the server rejected it, which looked like a login failure rather than a
-    // missing body. Buffer it in that case; there is no streaming option there.
-    let bufferedBody = null;
-    if (hasBody && !event.request.body) {
-        try {
-            bufferedBody = new Uint8Array(await event.request.arrayBuffer());
-        } catch (e) {
-            // Nothing readable. Send an empty body rather than hanging: the
-            // request still has to be completed or the page waits forever.
-            bufferedBody = new Uint8Array(0);
-        }
-    }
+    const port = channel.port1;
+    const hasBody = request.method !== 'GET' && request.method !== 'HEAD';
+    const bufferedBody = hasBody ? await readUnstreamableBody(request) : null;
 
     // Buffering has one upside: the exact size is known, so the listener can
     // send a real Content-Length instead of chunked encoding. The streaming
     // path has to fall back to the header, which browsers do not expose to a
     // service worker -- so it is usually absent and the request goes chunked.
     const contentLength = bufferedBody !== null ? bufferedBody.byteLength : parseInt(
-        event.request.headers.get('content-length') ||
-        event.request.headers.get('x-file-size') ||
+        request.headers.get('content-length') ||
+        request.headers.get('x-file-size') ||
         '0', 10
     );
-
-    const reqHeaders = Object.fromEntries(event.request.headers);
-    if (!session.noCookieJar) {
-        await cookieJarReady;
-        const appCookies = getCookieHeader(jarKey, devicePath);
-        if (appCookies) {
-            reqHeaders['cookie'] = appCookies;
-        } else {
-            delete reqHeaders['cookie'];
-        }
-    } else {
-        delete reqHeaders['cookie'];
-    }
 
     connection.postMessage({
         type: 'proxy_request',
         url: url.origin + devicePath + url.search,
-        method: event.request.method,
-        headers: reqHeaders,
+        method: request.method,
+        headers: await deviceRequestHeaders(request, devicePath),
         hasBody,
         contentLength
     }, [channel.port2]);
 
-    // How much of the body this worker may hand over beyond what connection.js
-    // has put on the data channel. It starts at UPLOAD_CREDIT and connection.js
-    // raises it (upload_credit) as pieces go out. Before, the whole body was
-    // read as fast as it could be and queued in the page, so an upload
-    // over a slow link sat in the tab's memory.
-    const upload = { allowed: UPLOAD_CREDIT, sent: 0, wake: null, stopped: false, reader: null };
-    const wakeUpload = () => { const w = upload.wake; upload.wake = null; w?.(); };
-    const stopUpload = () => {
-        upload.stopped = true;
-        wakeUpload();
-        upload.reader?.cancel().catch(() => {});
-    };
+    const upload = new UploadCredit();
 
-    // -- Stream response back to browser --
-    //
     // The handler goes on the port before the body is sent, so an answer the
     // device gives while the upload is still going -- a 413, a reset -- is
     // acted on rather than queued behind a loop that only ends with the body.
     const response = new Promise((resolve) => {
-        let streamController;
+        const body = new PulledBody(port);
         let resolved = false;
-        let timeout;
+        let timeout = null;
         if (!hasBody) {
             timeout = setTimeout(() => {
-                if (!resolved) {
-                    resolve(new Response('BitBang: request timeout', { status: 504 }));
-                }
+                if (!resolved) resolve(new Response('BitBang: request timeout', { status: 504 }));
             }, 30000);
         }
 
-        // The response body is pulled, not pushed. Chunks wait here until the
-        // reader asks for one, and each one handed over is reported back as
-        // consumed, which is the credit a v4 session returns to the device.
-        // So a reader that stops -- a paused download, a slow disk, a page
-        // that reads at its own pace -- stops the device instead of filling
-        // this worker. Before, every chunk was enqueued the moment it came,
-        // and the stream's queue held whatever the reader had not taken.
-        const pending = [];      // arrived, not yet taken by the reader
-        let ended = false;       // proxy_end arrived
-        let waiting = null;      // resolves the reader's outstanding pull
-        let unreported = 0;      // consumed bytes not yet reported
-        const report = (now) => {
-            if (unreported > 0 && (now || unreported >= CONSUMED_REPORT_BYTES)) {
-                channel.port1.postMessage({ type: 'proxy_consumed', bytes: unreported });
-                unreported = 0;
-            }
-        };
-        // Hand the reader one chunk if there is one, or close if that was
-        // all of them. Reported at once when nothing is left behind it, so
-        // the last credit before a lull is never held back.
-        const give = (controller) => {
-            if (pending.length > 0) {
-                const chunk = pending.shift();
-                controller.enqueue(chunk);
-                unreported += chunk.byteLength;
-                report(pending.length === 0);
-                return true;
-            }
-            if (ended) {
-                try { controller.close(); } catch (e) {}
-                return true;
-            }
-            return false;
-        };
-        const answerPull = () => {
-            if (waiting && streamController && give(streamController)) {
-                const w = waiting;
-                waiting = null;
-                w();
-            }
-        };
-
-        channel.port1.onmessage = (msg) => {
+        port.onmessage = (msg) => {
             const { type, status, headers, data, message } = msg.data;
-
             if (type === 'upload_credit') {
-                if (msg.data.max > upload.allowed) {
-                    upload.allowed = msg.data.max;
-                    wakeUpload();
-                }
-                return;
-            }
-
-            if (type === 'proxy_headers') {
-                if (timeout) clearTimeout(timeout);
+                upload.raise(msg.data.max);
+            } else if (type === 'proxy_headers') {
+                clearTimeout(timeout);
                 resolved = true;
-
-                // Store response cookies in our jar (skipped when !nocookiejar is set)
-                const setCookie = headers?.['Set-Cookie'] || headers?.['set-cookie'];
-                if (setCookie && !session.noCookieJar) {
-                    // keepAlive: the jar write is async and the SW can be
-                    // terminated the moment this response is done streaming.
-                    keepAlive(event, storeCookies(jarKey, setCookie));
-                    // Surface cookies via a custom header so device-shim can
-                    // sync them into document.cookie *synchronously* in the
-                    // same Promise/event chain as the response, before app
-                    // code's handler runs. JSON-encoded so multiple Set-Cookie
-                    // values round-trip through a single header without
-                    // ambiguity from comma joins.
-                    //
-                    // Strip Domain= so the browser scopes the cookie to the
-                    // current document origin (this label) instead of
-                    // silently refusing the write when the upstream's Domain
-                    // attribute (e.g. octoprint.local, 192.168.1.10) doesn't
-                    // match -- or, worse, writing it for bitba.ng itself.
-                    const stripCookieAttrs = (s) => s.split(';')
-                        .map(p => p.trim())
-                        .filter(p => !p.toLowerCase().startsWith('domain='))
-                        .join('; ');
-                    // HttpOnly cookies are withheld from the mirror entirely
-                    // (see "HttpOnly invariant"). They are already in the jar,
-                    // so outbound requests still carry them.
-                    const isHttpOnlyHeader = (s) => s.split(';').slice(1)
-                        .some(p => p.trim().toLowerCase() === 'httponly');
-                    const list = (Array.isArray(setCookie) ? setCookie : [setCookie])
-                        .filter(s => !isHttpOnlyHeader(s))
-                        .map(stripCookieAttrs);
-                    if (list.length > 0) {
-                        headers['X-BB-Set-Cookie'] = JSON.stringify(list);
-                    }
-                    // Cross-tab fallback: another tab won't see X-BB-Set-Cookie
-                    // (different fetch). The broadcast keeps its document.cookie
-                    // eventually consistent. A BroadcastChannel is per origin,
-                    // so it reaches this device's pages only.
-                    //
-                    // It reaches the tab that made this request as well, and
-                    // carries the whole jar rather than what just changed.
-                    // Both are harmless only because the page writes what it
-                    // receives straight to the native cookie setter, never
-                    // through the one that forwards to this jar -- see the
-                    // cookie section of device-shim.js. When it went through that
-                    // one, every cookie here came back without its expiry.
-                    const bc = new BroadcastChannel('bitbang-cookies');
-                    bc.postMessage({ jarKey, cookies: mirrorStrings(jarKey) });
-                    bc.close();
-                    delete headers['Set-Cookie'];
-                    delete headers['set-cookie'];
-                }
+                // Skipped when !nocookiejar is set.
+                if (!config.noCookieJar) keepSetCookies(event, headers);
 
                 // Redirects need nothing: an absolute-path Location (/login/
                 // from OctoPrint's forced login) resolves against this origin,
                 // which is the device's.
 
-                // Detect HTML navigation responses for shim injection
+                // A download is a navigation too, so without the attachment
+                // check a saved .html file would come out with our script
+                // tags in front of it. The CLI's file browser hands its
+                // downloads to the browser this way, and other devices' apps
+                // can do the same.
                 const ct = headers?.['Content-Type'] || headers?.['content-type'] || '';
-                // A download is a navigation too, so without this a saved
-                // .html file would come out with our script tags in front of
-                // it. The CLI's file browser hands its downloads to the
-                // browser this way, and other devices' apps can do the same.
                 const disposition = headers?.['Content-Disposition']
                     || headers?.['content-disposition'] || '';
                 const isAttachment = /^\s*attachment\b/i.test(disposition);
-                const isNav = !isAttachment && event.request?.mode === 'navigate';
-
-                const stream = new ReadableStream({
-                    start(controller) {
-                        streamController = controller;
-
-                        // Inject shims + cookie sync into HTML navigation responses
-                        if (ct.includes('text/html') && isNav) {
-                            // The jar's cookies, for device-shim.js to mirror
-                            // into document.cookie as it starts -- not written
-                            // here, because where the browser won't keep
-                            // cookies in this frame the shim keeps the mirror
-                            // itself, and only it knows which.
-                            const cookieSync = session?.noCookieJar ? [] : mirrorStrings(jarKey);
-
-                            const eruda = session?.debug
-                                ? '<script src="https://cdn.jsdelivr.net/npm/eruda@3.4.3/eruda.js" integrity="sha384-weDBY9jeIj4NqaiZF9f6PMAMMY4lIu+0CAI+TjBIE73RctCQOxDoEHltYnstRszI" crossorigin="anonymous" onload="eruda.init();eruda.position({x:innerWidth-60,y:innerHeight-60})"></script>'
-                                : '';
-                            const shims = '<!DOCTYPE html>'
-                                + `<script>window.__bbJarKey=${jsonForScript(jarKey)};window.__bbDebug=${!!session?.debug};window.__bbCookies=${jsonForScript(cookieSync)};</script>`
-                                + eruda
-                                + '<script src="/__bitbang__/device-shim.js"></script>'
-                                + '<script src="/__bitbang__/ws-shim.js"></script>';
-                            // These two and no more, because these two are the
-                            // only ones that have to precede the page's own
-                            // script: they replace XMLHttpRequest, popups and
-                            // window.WebSocket, which page code may call on its
-                            // first line.
-                            //
-                            // stream-shim.js used to be here and is not code of
-                            // that kind -- it patches nothing, and a page loads
-                            // it with a script tag like any other library. It
-                            // was injected because it was built beside these two
-                            // and inherited their delivery. What it cost was 15
-                            // KB on every device page including the ones with no
-                            // stream element at all, and a second story for how
-                            // the library gets into a page, when
-                            // settings-panel.js already had the first one.
-                            controller.enqueue(new TextEncoder().encode(shims));
-                        }
-                    },
-                    // Called when the reader wants a chunk -- with a high-
-                    // water mark of 0, only then. Waits for one to arrive if
-                    // none is here yet.
-                    pull(controller) {
-                        if (give(controller)) return;
-                        return new Promise((r) => { waiting = r; });
-                    },
-                    // The reader is gone: a download cancelled in the browser,
-                    // a media element done with a range. connection.js stops the
-                    // device sending the rest (in a v4 session; v3 cannot).
-                    cancel() {
-                        pending.length = 0;
-                        channel.port1.postMessage({ type: 'proxy_cancel' });
-                    },
-                }, { highWaterMark: 0 });
-
-                // CORS headers for fonts with crossorigin attributes. Only
-                // this origin's own pages ever see a response from here (a
-                // request is handled by the requesting page's worker), so
-                // this opens nothing to other sites.
-                if (!headers['access-control-allow-origin']) {
-                    headers['access-control-allow-origin'] = '*';
-                }
-
-                // Where this response may be framed: the device's own rule
-                // out, this origin's in (reframe).
-                const ours = reframe(headers);
-                const out = new Headers();
-                for (const [k, v] of Object.entries(headers)) {
-                    try { out.set(k, Array.isArray(v) ? v.join(', ') : String(v)); } catch (e) { /* forbidden or malformed */ }
-                }
-                for (const csp of ours) out.append('Content-Security-Policy', csp);
-                // A document of this origin names it in the referrer of the
-                // navigations it starts, which is how the worker knows them
-                // for its own (attributable). A page's own meta tag or
-                // rel=noreferrer can still suppress it; that falls back to
-                // GET-only.
-                if (isNav) out.set('Referrer-Policy', 'same-origin');
+                const isNav = !isAttachment && request.mode === 'navigate';
+                const stream = body.stream(ct.includes('text/html') && isNav ? pagePreamble() : null);
 
                 // 204/304 responses must not have a body per spec
                 const nullBodyStatus = (status === 204 || status === 304);
-                resolve(new Response(nullBodyStatus ? null : stream, { status, headers: out }));
+                resolve(new Response(nullBodyStatus ? null : stream,
+                    { status, headers: deviceResponseHeaders(headers, isNav) }));
             } else if (type === 'proxy_chunk') {
-                pending.push(data);
-                answerPull();
+                body.push(data);
             } else if (type === 'proxy_end') {
-                ended = true;
-                answerPull();
+                body.end();
             } else if (type === 'proxy_error') {
-                if (timeout) clearTimeout(timeout);
-                stopUpload();
-                pending.length = 0;
-                if (waiting) { const w = waiting; waiting = null; w(); }
-                if (!resolved) {
-                    resolve(new Response(`BitBang: ${message}`, { status: 500 }));
-                } else {
-                    try { streamController?.error(new Error(message)); } catch (e) {}
-                }
+                clearTimeout(timeout);
+                upload.stop();
+                body.fail(message);
+                if (!resolved) resolve(new Response(`BitBang: ${message}`, { status: 500 }));
             }
         };
     });
 
-    // -- Stream request body (if any) --
-    if (hasBody) {
-        // Hand over one piece once the credit allows; false if the upload
-        // was stopped (the device refused it, or the channel went) while
-        // waiting.
-        const post = async (piece) => {
-            while (!upload.stopped && upload.sent >= upload.allowed) {
-                await new Promise((r) => { upload.wake = r; });
-            }
-            if (upload.stopped) return false;
-            upload.sent += piece.byteLength;
-            channel.port1.postMessage({ type: 'upload_chunk', data: piece }, [piece.buffer]);
-            return true;
-        };
-        if (bufferedBody !== null) {
-            // Already all in memory (no Request.body here), so slicing it buys
-            // nothing in this worker -- but it keeps connection.js to the same
-            // credit as a streamed body. Copies, since each is transferred.
-            for (let off = 0; off < bufferedBody.byteLength; off += BUFFERED_BODY_PIECE) {
-                if (!(await post(bufferedBody.slice(off, off + BUFFERED_BODY_PIECE)))) break;
-            }
-        } else if (event.request.body) {
-            const reader = event.request.body.getReader();
-            upload.reader = reader;
-            try {
-                while (!upload.stopped) {
-                    const { done, value } = await reader.read();
-                    if (done) break;
-                    if (!(await post(value))) break;
-                }
-            } catch (e) {
-                // Cancelled by stopUpload, or the page went away.
-            } finally {
-                try { reader.releaseLock(); } catch (e) {}
-            }
-        }
-        if (!upload.stopped) channel.port1.postMessage({ type: 'upload_end' });
+    if (hasBody) await sendBody(request, bufferedBody, port, upload);
+    return response;
+}
+
+// Request.body is not available everywhere: Firefox does not support it in
+// any version, Samsung Internet gained it in 20, Chrome in 105. Without a
+// fallback the body was simply never sent -- the request went out empty and
+// the server rejected it, which looked like a login failure rather than a
+// missing body. Buffer it in that case; there is no streaming option there.
+// null when the body can be streamed.
+async function readUnstreamableBody(request) {
+    if (request.body) return null;
+    try {
+        return new Uint8Array(await request.arrayBuffer());
+    } catch (e) {
+        // Nothing readable. Send an empty body rather than hanging: the
+        // request still has to be completed or the page waits forever.
+        return new Uint8Array(0);
+    }
+}
+
+// The request's headers as the device gets them. The browser's Cookie header
+// (if any) is never this device's; the jar's cookies go instead, unless
+// !nocookiejar is set.
+async function deviceRequestHeaders(request, devicePath) {
+    const headers = Object.fromEntries(request.headers);
+    delete headers['cookie'];
+    if (!config.noCookieJar) {
+        await cookieJarReady;
+        const cookies = getCookieHeader(devicePath);
+        if (cookies) headers['cookie'] = cookies;
+    }
+    return headers;
+}
+
+// How much of a request body this worker may hand over beyond what
+// connection.js has put on the data channel. It starts at UPLOAD_CREDIT and
+// connection.js raises it (upload_credit) as pieces go out. Before, the whole
+// body was read as fast as it could be and queued in the page, so an upload
+// over a slow link sat in the tab's memory.
+class UploadCredit {
+    constructor() {
+        this.allowed = UPLOAD_CREDIT;
+        this.sent = 0;
+        this.waiter = null;      // a take() waiting for credit
+        this.stopped = false;    // the device refused it, or the channel went
+        this.reader = null;      // the body's reader, cancelled on stop
     }
 
-    return response;
+    raise(max) {
+        if (max <= this.allowed) return;
+        this.allowed = max;
+        this.wake();
+    }
+
+    stop() {
+        this.stopped = true;
+        this.wake();
+        this.reader?.cancel().catch(() => {});
+    }
+
+    wake() {
+        const w = this.waiter;
+        this.waiter = null;
+        w?.();
+    }
+
+    // Resolves true once `bytes` may be handed over, false if the upload was
+    // stopped while waiting.
+    async take(bytes) {
+        while (!this.stopped && this.sent >= this.allowed) {
+            await new Promise((r) => { this.waiter = r; });
+        }
+        if (this.stopped) return false;
+        this.sent += bytes;
+        return true;
+    }
+}
+
+// Hand the request's body to connection.js, a piece at a time as the credit
+// allows, then upload_end.
+async function sendBody(request, bufferedBody, port, upload) {
+    const post = async (piece) => {
+        if (!(await upload.take(piece.byteLength))) return false;
+        port.postMessage({ type: 'upload_chunk', data: piece }, [piece.buffer]);
+        return true;
+    };
+    if (bufferedBody !== null) {
+        // Already all in memory (no Request.body here), so slicing it buys
+        // nothing in this worker -- but it keeps connection.js to the same
+        // credit as a streamed body. Copies, since each is transferred.
+        for (let off = 0; off < bufferedBody.byteLength; off += BUFFERED_BODY_PIECE) {
+            if (!(await post(bufferedBody.slice(off, off + BUFFERED_BODY_PIECE)))) break;
+        }
+    } else if (request.body) {
+        const reader = request.body.getReader();
+        upload.reader = reader;
+        try {
+            while (!upload.stopped) {
+                const { done, value } = await reader.read();
+                if (done) break;
+                if (!(await post(value))) break;
+            }
+        } catch (e) {
+            // Cancelled by upload.stop(), or the page went away.
+        } finally {
+            try { reader.releaseLock(); } catch (e) {}
+        }
+    }
+    if (!upload.stopped) port.postMessage({ type: 'upload_end' });
+}
+
+// A response's Set-Cookie: into the jar, and to the pages' document.cookie
+// mirrors. Takes Set-Cookie off `headers`, since a page can't see it anyway.
+function keepSetCookies(event, headers) {
+    const setCookie = headers?.['Set-Cookie'] || headers?.['set-cookie'];
+    if (!setCookie) return;
+    // keepAlive: the jar write is async and the SW can be terminated the
+    // moment this response is done streaming.
+    keepAlive(event, storeCookies(setCookie));
+    // Surface cookies via a custom header so device-shim can sync them into
+    // document.cookie *synchronously* in the same Promise/event chain as the
+    // response, before app code's handler runs. JSON-encoded so multiple
+    // Set-Cookie values round-trip through a single header without ambiguity
+    // from comma joins.
+    //
+    // Strip Domain= so the browser scopes the cookie to the current document
+    // origin (this label) instead of silently refusing the write when the
+    // upstream's Domain attribute (e.g. octoprint.local, 192.168.1.10)
+    // doesn't match -- or, worse, writing it for bitba.ng itself.
+    const stripCookieAttrs = (s) => s.split(';')
+        .map(p => p.trim())
+        .filter(p => !p.toLowerCase().startsWith('domain='))
+        .join('; ');
+    // HttpOnly cookies are withheld from the mirror entirely (see "HttpOnly
+    // invariant"). They are already in the jar, so outbound requests still
+    // carry them.
+    const isHttpOnlyHeader = (s) => s.split(';').slice(1)
+        .some(p => p.trim().toLowerCase() === 'httponly');
+    const list = (Array.isArray(setCookie) ? setCookie : [setCookie])
+        .filter(s => !isHttpOnlyHeader(s))
+        .map(stripCookieAttrs);
+    if (list.length > 0) {
+        headers['X-BB-Set-Cookie'] = JSON.stringify(list);
+    }
+    // Cross-tab fallback: another tab won't see X-BB-Set-Cookie (different
+    // fetch). The broadcast keeps its document.cookie eventually consistent.
+    // A BroadcastChannel is per origin, so it reaches this device's pages
+    // only.
+    //
+    // It reaches the tab that made this request as well, and carries the
+    // whole jar rather than what just changed. Both are harmless only because
+    // the page writes what it receives straight to the native cookie setter,
+    // never through the one that forwards to this jar -- see the cookie
+    // section of device-shim.js. When it went through that one, every cookie
+    // here came back without its expiry.
+    const bc = new BroadcastChannel('bitbang-cookies');
+    bc.postMessage({ jarKey: JAR_KEY, cookies: mirrorStrings() });
+    bc.close();
+    delete headers['Set-Cookie'];
+    delete headers['set-cookie'];
+}
+
+// What goes in front of a device page: the jar's cookies, for device-shim.js
+// to mirror into document.cookie as it starts (not written here, because
+// where the browser won't keep cookies in this frame the shim keeps the
+// mirror itself, and only it knows which), then the two shims.
+//
+// These two and no more, because these two are the only ones that have to
+// precede the page's own script: they replace XMLHttpRequest, popups and
+// window.WebSocket, which page code may call on its first line.
+//
+// stream-shim.js used to be here and is not code of that kind -- it patches
+// nothing, and a page loads it with a script tag like any other library. It
+// was injected because it was built beside these two and inherited their
+// delivery. What it cost was 15 KB on every device page including the ones
+// with no stream element at all, and a second story for how the library gets
+// into a page, when settings-panel.js already had the first one.
+function pagePreamble() {
+    const cookieSync = config.noCookieJar ? [] : mirrorStrings();
+    const eruda = config.debug
+        ? '<script src="https://cdn.jsdelivr.net/npm/eruda@3.4.3/eruda.js" integrity="sha384-weDBY9jeIj4NqaiZF9f6PMAMMY4lIu+0CAI+TjBIE73RctCQOxDoEHltYnstRszI" crossorigin="anonymous" onload="eruda.init();eruda.position({x:innerWidth-60,y:innerHeight-60})"></script>'
+        : '';
+    return '<!DOCTYPE html>'
+        + `<script>window.__bbJarKey=${jsonForScript(JAR_KEY)};window.__bbDebug=${!!config.debug};window.__bbCookies=${jsonForScript(cookieSync)};</script>`
+        + eruda
+        + '<script src="/__bitbang__/device-shim.js"></script>'
+        + '<script src="/__bitbang__/ws-shim.js"></script>';
+}
+
+// The device's response headers, as the browser gets them.
+function deviceResponseHeaders(headers, isNav) {
+    // CORS headers for fonts with crossorigin attributes. Only this origin's
+    // own pages ever see a response from here (a request is handled by the
+    // requesting page's worker), so this opens nothing to other sites.
+    if (!headers['access-control-allow-origin']) {
+        headers['access-control-allow-origin'] = '*';
+    }
+
+    // Where this response may be framed: the device's own rule out, this
+    // origin's in (reframe).
+    const ours = reframe(headers);
+    const out = new Headers();
+    for (const [k, v] of Object.entries(headers)) {
+        try { out.set(k, Array.isArray(v) ? v.join(', ') : String(v)); } catch (e) { /* forbidden or malformed */ }
+    }
+    for (const csp of ours) out.append('Content-Security-Policy', csp);
+    // A document of this origin names it in the referrer of the navigations
+    // it starts, which is how the worker knows them for its own
+    // (attributable). A page's own meta tag or rel=noreferrer can still
+    // suppress it; that falls back to GET-only.
+    if (isNav) out.set('Referrer-Policy', 'same-origin');
+    return out;
+}
+
+// A response body that is pulled, not pushed. Chunks wait here until the
+// reader asks for one, and each one handed over is reported back as consumed
+// (proxy_consumed), which is the credit a v4 session returns to the device.
+// So a reader that stops -- a paused download, a slow disk, a page that reads
+// at its own pace -- stops the device instead of filling this worker. Before,
+// every chunk was enqueued the moment it came, and the stream's queue held
+// whatever the reader had not taken.
+class PulledBody {
+    constructor(port) {
+        this.port = port;
+        this.pending = [];       // arrived, not yet taken by the reader
+        this.ended = false;      // proxy_end arrived
+        this.waiting = null;     // resolves the reader's outstanding pull
+        this.unreported = 0;     // consumed bytes not yet reported
+        this.controller = null;  // once stream() has been asked for
+    }
+
+    // The ReadableStream to answer with, `preamble` (a string) first if
+    // given. With a high-water mark of 0, pull is called only when the
+    // reader wants a chunk.
+    stream(preamble) {
+        const body = this;
+        return new ReadableStream({
+            start(controller) {
+                body.controller = controller;
+                if (preamble) controller.enqueue(new TextEncoder().encode(preamble));
+            },
+            pull(controller) {
+                if (body.give(controller)) return;
+                return new Promise((r) => { body.waiting = r; });
+            },
+            // The reader is gone: a download cancelled in the browser, a
+            // media element done with a range. connection.js stops the device
+            // sending the rest (in a v4 session; v3 cannot).
+            cancel() {
+                body.pending.length = 0;
+                body.port.postMessage({ type: 'proxy_cancel' });
+            },
+        }, { highWaterMark: 0 });
+    }
+
+    push(chunk) {
+        this.pending.push(chunk);
+        this.answerPull();
+    }
+
+    end() {
+        this.ended = true;
+        this.answerPull();
+    }
+
+    // The request failed. A stream already handed out errors; the reader's
+    // outstanding pull is let go first.
+    fail(message) {
+        this.pending.length = 0;
+        if (this.waiting) { const w = this.waiting; this.waiting = null; w(); }
+        try { this.controller?.error(new Error(message)); } catch (e) {}
+    }
+
+    report(now) {
+        if (this.unreported > 0 && (now || this.unreported >= CONSUMED_REPORT_BYTES)) {
+            this.port.postMessage({ type: 'proxy_consumed', bytes: this.unreported });
+            this.unreported = 0;
+        }
+    }
+
+    // Hand the reader one chunk if there is one, or close if that was all of
+    // them. Reported at once when nothing is left behind it, so the last
+    // credit before a lull is never held back.
+    give(controller) {
+        if (this.pending.length > 0) {
+            const chunk = this.pending.shift();
+            controller.enqueue(chunk);
+            this.unreported += chunk.byteLength;
+            this.report(this.pending.length === 0);
+            return true;
+        }
+        if (this.ended) {
+            try { controller.close(); } catch (e) {}
+            return true;
+        }
+        return false;
+    }
+
+    answerPull() {
+        if (this.waiting && this.controller && this.give(this.controller)) {
+            const w = this.waiting;
+            this.waiting = null;
+            w();
+        }
+    }
 }
