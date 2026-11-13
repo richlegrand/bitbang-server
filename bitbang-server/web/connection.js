@@ -1591,6 +1591,276 @@ class ProxyRequests {
     }
 }
 
+// The device page's WebSockets, each a stream on the data channel. ws-shim.js
+// in the page posts ws_open, ws_send and ws_close (its vocabulary is listed at
+// the top of that file); this sends them on, and answers with ws_assign,
+// ws_opened, ws_message and ws_closed.
+//
+// Two kinds of stream:
+//   websocket  a proxied app's WebSocket. Each message carries a type byte
+//              (0 text, 1 binary) and is split at SWSP_CHUNK_SIZE, with
+//              FLAG_MORE on every piece but the last; the FIN carries the
+//              close code and reason.
+//   bitbang    the magic path, /__bitbang/<type>?<params>: a stream of the
+//              named type, raw bytes both ways. Each cap's page does its own
+//              framing (tag bytes, JSON FIN payloads), so a new cap needs a
+//              device handler and a page, and nothing here.
+//
+// hooks: targetPrefix(), as ProxyRequests'.
+const MAGIC_PREFIX = '/__bitbang/';
+
+class SocketBridge {
+    constructor(swsp, hooks, debug) {
+        this.swsp = swsp;
+        this.hooks = hooks;
+        this.debug = debug;
+        // streamId -> { page, kind, sendChain (SwspChannel.queueOnStream),
+        // rx (a websocket message's pieces so far) }
+        this.streams = new Map();
+    }
+
+    has(streamId) { return this.streams.has(streamId); }
+
+    // To the page, which is this origin's: a frame that has navigated
+    // somewhere else doesn't get a socket's traffic.
+    static post(page, msg) { page.postMessage(msg, location.origin); }
+
+    // A message from ws-shim.js in the content frame (`page`, its window).
+    onPageMessage(msg, page) {
+        if (!msg || !msg.type?.startsWith('ws_')) return;
+        if (msg.type === 'ws_open') this.open(msg, page);
+        else if (!this.swsp.open) return;
+        else if (msg.type === 'ws_send') this.send(msg);
+        else if (msg.type === 'ws_close') this.close(msg);
+    }
+
+    open(msg, page) {
+        const streamId = this.swsp.newStreamId();
+        // The shim matches a socket still waiting by openId, and everything
+        // after by streamId, so the id goes back first, whatever follows.
+        const assign = () => SocketBridge.post(page, { type: 'ws_assign', openId: msg.openId, streamId });
+        const refuse = (code, reason) => {
+            assign();
+            SocketBridge.post(page, { type: 'ws_closed', streamId, code, reason });
+        };
+
+        // No transport, so an open fails rather than being dropped. Dropped,
+        // the socket waited in CONNECTING for an answer that never came, and
+        // a page retrying across a reconnect -- the console panel -- retried
+        // once and then hung.
+        if (!this.swsp.open) return refuse(1006, '');
+
+        if (this.debug) console.log(`[Connection] ws_open ${msg.pathname}, streamId=${streamId}, cookies.len=${(msg.cookies || '').length}`);
+        let kind, syn;
+        if (msg.pathname && msg.pathname.startsWith(MAGIC_PREFIX)) {
+            kind = 'bitbang';
+            syn = SocketBridge.magicSyn(msg.pathname);
+            if (!syn) return refuse(1008, 'bitbang: empty type in magic path');
+        } else {
+            kind = 'websocket';
+            syn = {
+                type: 'websocket',
+                // The device's path: a proxied app's target goes back on, as
+                // for HTTP (ProxyRequests.start).
+                pathname: this.hooks.targetPrefix() + msg.pathname,
+                cookies: msg.cookies || '',
+            };
+        }
+        this.streams.set(streamId, { page, kind });
+        assign();
+        this.swsp.openCredit(streamId);
+        this.swsp.send(streamId, FLAG_SYN, JSON.stringify(syn));
+        if (kind === 'bitbang') {
+            // Open now. Listener handlers typically don't send a SYN ack on
+            // the success path -- the first DAT is the natural signal that
+            // things are working -- so the page can start sending at once.
+            SocketBridge.post(page, { type: 'ws_opened', streamId });
+        } else if (this.debug) {
+            console.log(`[Connection] ws SYN sent to device, streamId=${streamId}`);
+        }
+    }
+
+    // The SYN for a magic path, or null if it names no type. The type is the
+    // first segment after /__bitbang/; each query value is JSON-parsed where
+    // possible ("true" a bool, "80" a number, '["bash"]' an array) and kept
+    // as a string otherwise, so the listener unmarshals a typed object.
+    static magicSyn(pathname) {
+        const u = new URL(pathname, 'http://device');
+        const type = u.pathname.substring(MAGIC_PREFIX.length).split('/')[0];
+        if (!type) return null;
+        const syn = { type };
+        for (const [k, v] of u.searchParams) {
+            try { syn[k] = JSON.parse(v); }
+            catch (e) { syn[k] = v; }
+        }
+        return syn;
+    }
+
+    send(msg) {
+        const s = this.streams.get(msg.streamId);
+        if (!s) return;
+        const bytes = msg.isText ? new TextEncoder().encode(msg.data) : new Uint8Array(msg.data);
+
+        if (s.kind === 'bitbang') {
+            // Raw bytes through unchanged, text UTF-8 encoded; the page keeps
+            // whatever framing its cap expects.
+            this.swsp.queueOnStream(s, msg.streamId, [[FLAG_DAT, bytes]]);
+            return;
+        }
+
+        // [1 byte type: 0 text, 1 binary][message], in pieces of at most
+        // SWSP_CHUNK_SIZE (the data-channel message limit). Every piece but
+        // the last carries FLAG_MORE, so the device reassembles one message;
+        // the type byte rides in the first.
+        const payload = new Uint8Array(1 + bytes.length);
+        payload[0] = msg.isText ? 0 : 1;
+        payload.set(bytes, 1);
+        const frames = [];
+        for (let off = 0; off < payload.length; off += SWSP_CHUNK_SIZE) {
+            const end = off + SWSP_CHUNK_SIZE;
+            const flags = end >= payload.length ? FLAG_DAT : (FLAG_DAT | FLAG_MORE);
+            frames.push([flags, payload.subarray(off, Math.min(end, payload.length))]);
+        }
+        this.swsp.queueOnStream(s, msg.streamId, frames);
+    }
+
+    close(msg) {
+        const s = this.streams.get(msg.streamId);
+        if (!s) return;
+        this.streams.delete(msg.streamId);
+        // Behind whatever the page sent before closing, then the stream's
+        // credit is done with.
+        const streamId = msg.streamId;
+        this.swsp.queueOnStream(s, streamId, [[FLAG_FIN, new Uint8Array(0)]])
+            .then(() => this.swsp.dropCredit(streamId));
+        // The stream is forgotten, so whatever the device answers is
+        // dropped. The app's close event comes from here, carrying the code
+        // it asked to close with; without it the socket sat in CLOSING and
+        // onclose never ran.
+        SocketBridge.post(s.page, {
+            type: 'ws_closed', streamId,
+            code: msg.code || 1000, reason: msg.reason || '',
+        });
+    }
+
+    // A frame on one of the sockets' streams. A WebSocket's reader cannot be
+    // slowed, so handing a frame on is consuming it; a piece counts as it
+    // joins reassembly, or a message larger than the window could never
+    // complete.
+    onFrame(frame) {
+        const s = this.streams.get(frame.streamId);
+        if (!s) return;
+        this.swsp.onArrived(frame, true);
+        if (frame.flags & FLAG_FIN) this.swsp.dropCredit(frame.streamId);
+        if (s.kind === 'bitbang') this.onBitbangFrame(frame, s);
+        else this.onWebSocketFrame(frame, s);
+    }
+
+    onWebSocketFrame(frame, s) {
+        const streamId = frame.streamId;
+        if (frame.flags & FLAG_SYN) {
+            // Device acknowledged the WebSocket open
+            if (this.debug) console.log(`[Connection] ws SYN ack from device, streamId=${streamId}`);
+            SocketBridge.post(s.page, { type: 'ws_opened', streamId });
+        }
+
+        if (frame.flags & FLAG_FIN) {
+            // Device closed the WebSocket. Parse the JSON close-info payload
+            // (added in adapter.py) for the actual close code + reason from
+            // the upstream WS. Fall back to 1006 if missing or malformed --
+            // we always want SockJS-style clients to retry (code 1000 would
+            // be treated as terminal).
+            let code = 1006;
+            let reason = '';
+            if (frame.payload && frame.payload.byteLength > 0) {
+                try {
+                    const info = JSON.parse(new TextDecoder().decode(frame.payload));
+                    if (typeof info.code === 'number') code = info.code;
+                    if (typeof info.reason === 'string') reason = info.reason;
+                } catch (e) {}
+            }
+            if (this.debug) console.log(`[Connection] ws FIN from device, streamId=${streamId} code=${code} reason=${JSON.stringify(reason)}`);
+            this.streams.delete(streamId);
+            SocketBridge.post(s.page, { type: 'ws_closed', streamId, code, reason });
+            return;
+        }
+
+        if (frame.payload.byteLength === 0 || (frame.flags & FLAG_SYN)) return;
+        // A piece of a message; FLAG_MORE on all but the last. Buffered
+        // until the last, then delivered whole, keeping the WS message
+        // boundary.
+        const part = new Uint8Array(frame.payload);
+        if (frame.flags & FLAG_MORE) {
+            (s.rx || (s.rx = [])).push(part);
+            return;
+        }
+        let full = part;
+        if (s.rx) {
+            s.rx.push(part);
+            full = new Uint8Array(s.rx.reduce((n, a) => n + a.byteLength, 0));
+            let o = 0;
+            for (const a of s.rx) { full.set(a, o); o += a.byteLength; }
+            s.rx = null;
+        }
+        const messageBytes = full.slice(1);
+        const data = full[0] === 0 ? new TextDecoder().decode(messageBytes) : messageBytes.buffer;
+        SocketBridge.post(s.page, { type: 'ws_message', streamId, data });
+    }
+
+    // No interpretation at all: the page's code handles tag bytes, JSON FIN
+    // payloads and status decoding.
+    onBitbangFrame(frame, s) {
+        const streamId = frame.streamId;
+        const text = () => (frame.payload && frame.payload.byteLength > 0)
+            ? new TextDecoder().decode(frame.payload) : '';
+
+        if (frame.flags & FLAG_SYN) {
+            // A mid-stream SYN is the listener's way to deliver an
+            // early-error payload (or other one-shot metadata), as a text
+            // message; most caps decode it and look for `error`.
+            SocketBridge.post(s.page, { type: 'ws_message', streamId, data: text() });
+            return;
+        }
+
+        if (frame.flags & FLAG_FIN) {
+            // The FIN payload, if any, is the close event's reason, parsed
+            // however the cap requires (shell: {exit_code, signal}; file
+            // ops: {status, error}).
+            this.streams.delete(streamId);
+            SocketBridge.post(s.page, { type: 'ws_closed', streamId, code: 1000, reason: text() });
+            return;
+        }
+
+        // DAT: the bytes, as a binary message.
+        if (!frame.payload || frame.payload.byteLength === 0) return;
+        const view = new Uint8Array(frame.payload);
+        const data = view.buffer.slice(view.byteOffset, view.byteOffset + view.byteLength);
+        SocketBridge.post(s.page, { type: 'ws_message', streamId, data });
+    }
+
+    // The device reset one socket's stream.
+    onReset(streamId, why) {
+        const s = this.streams.get(streamId);
+        if (!s) return;
+        this.streams.delete(streamId);
+        SocketBridge.post(s.page, { type: 'ws_closed', streamId, code: 1011, reason: why });
+    }
+
+    // Every socket was on a data channel that has gone, and none of them will
+    // be carried over: a new peer connection is a new set of streams on the
+    // device too. Closed here, as a device FIN would, so each socket's close
+    // handler runs and the page can open it again. Left alone, a socket
+    // stayed OPEN with nothing ever arriving on it -- the console panel sat at
+    // "connected" and silent after a soft reconnect, and only a reload
+    // brought it back (2026-10-01).
+    closeAll() {
+        for (const [streamId, s] of this.streams) {
+            SocketBridge.post(s.page, { type: 'ws_closed', streamId, code: 1006, reason: '' });
+        }
+        this.streams.clear();
+    }
+}
+
 class BitBangConnection {
     constructor({ uid, target, devicePath, deviceSearch, deviceHash }) {
         this.uid = uid;
@@ -1611,7 +1881,6 @@ class BitBangConnection {
         this.streamNameMap = {};      // from offer: { "0": "webcam", ... }
         this.resolvedStreams = {};    // name -> MediaStream
         this.connectResolve = null;   // resolved when device sends 'ready'
-        this.wsStreams = new Map();    // streamId -> { iframe } for WebSocket bridging
         this.benchStreams = new Map(); // streamId -> stats, for the transport benchmark
         this.sessionId = Array.from(crypto.getRandomValues(new Uint8Array(4)), b => b.toString(16).padStart(2, '0')).join(''); // 8 hex chars
         console.log('[Connection] ctor', this.sessionId);
@@ -1647,10 +1916,14 @@ class BitBangConnection {
         this._wasConnected = false;
         // The relay verdict and its credential's expiry, and the path
         // telemetry. Both act on this only through the hooks given here.
-        // The worker's HTTP requests, each a stream on this.swsp.
+        // The worker's HTTP requests and the device page's WebSockets, each
+        // a stream on this.swsp.
         this.requests = new ProxyRequests(this.swsp, {
             targetPrefix: () => this.targetPrefix(),
             channelDead: () => { if (this._wasConnected) this.reconnector.start(); },
+        }, this.debug);
+        this.sockets = new SocketBridge(this.swsp, {
+            targetPrefix: () => this.targetPrefix(),
         }, this.debug);
         this.relay = new RelayMonitor({
             pc: () => this.pc,
@@ -2242,11 +2515,7 @@ class BitBangConnection {
         console.warn(`[Connection] stream ${streamId} reset by device: ${why}`);
         this.swsp.dropCredit(streamId);
         this.requests.onReset(streamId, why);
-        const ws = this.wsStreams.get(streamId);
-        if (ws) {
-            this.wsStreams.delete(streamId);
-            ws.iframe.postMessage({ type: 'ws_closed', streamId, code: 1011, reason: why }, location.origin);
-        }
+        this.sockets.onReset(streamId, why);
         this.benchStreams.delete(streamId);
     }
 
@@ -2833,19 +3102,10 @@ class BitBangConnection {
         this._wasConnected = false;
         this._turnHoldPromise = null;
 
-        // Every stream the page has open was on the data channel just closed,
-        // and none of them will be carried over: a new peer connection is a new
-        // set of streams on the device too. Closed here, as a device FIN would,
-        // so each socket's close handler runs and the page can open it again.
-        // Left alone, a socket stayed OPEN with nothing ever arriving on it --
-        // the console panel sat at "connected" and silent after a soft
-        // reconnect, and only a reload brought it back (2026-10-01).
-        for (const [streamId, s] of this.wsStreams) {
-            s.iframe.postMessage({ type: 'ws_closed', streamId, code: 1006, reason: '' }, location.origin);
-        }
-        this.wsStreams.clear();
-
-        // The same for requests (failAll says why).
+        // Every stream the page has open was on the channel just closed; the
+        // sockets are closed and the requests failed, so the page can try
+        // again on the next one (closeAll and failAll say why).
+        this.sockets.closeAll();
         this.requests.failAll('Connection lost');
     }
 
@@ -2884,15 +3144,8 @@ class BitBangConnection {
                 return;
             }
 
-            // WebSocket stream -- forward to iframe. A WebSocket's reader cannot
-            // be slowed, so handing a frame on is consuming it; a fragment
-            // counts as it joins reassembly, or a message larger than the
-            // window could never complete.
-            const ws = this.wsStreams.get(frame.streamId);
-            if (ws) {
-                this.swsp.onArrived(frame, true);
-                if (frame.flags & FLAG_FIN) this.swsp.dropCredit(frame.streamId);
-                this.handleWSFrame(frame, ws);
+            if (this.sockets.has(frame.streamId)) {
+                this.sockets.onFrame(frame);
                 return;
             }
 
@@ -3127,138 +3380,6 @@ class BitBangConnection {
         this.swsp.sendControl({ type: 'auth', pin: msg.pin });
     }
 
-    handleWSFrame(frame, ws) {
-        // Generic /__bitbang/<type> streams use raw bytes for DAT and
-        // pass the FIN payload through untouched. Per-cap framing
-        // (tag bytes, JSON status payloads, etc.) lives in the
-        // iframe; this frame stays a transport.
-        if (ws.kind === 'bitbang') {
-            this.handleBitbangFrame(frame, ws);
-            return;
-        }
-
-        if (frame.flags & FLAG_SYN) {
-            // Device acknowledged the WebSocket open
-            if (this.debug) console.log(`[Connection] ws SYN ack from device, streamId=${frame.streamId}`);
-            ws.iframe.postMessage({ type: 'ws_opened', streamId: frame.streamId }, location.origin);
-        }
-
-        if (frame.flags & FLAG_FIN) {
-            // Device closed the WebSocket. Parse the JSON close-info payload
-            // (added in adapter.py) for the actual close code + reason from
-            // the upstream WS. Fall back to 1006 if missing or malformed --
-            // we always want SockJS-style clients to retry (code 1000 would
-            // be treated as terminal).
-            let code = 1006;
-            let reason = '';
-            if (frame.payload && frame.payload.byteLength > 0) {
-                try {
-                    const info = JSON.parse(new TextDecoder().decode(frame.payload));
-                    if (typeof info.code === 'number') code = info.code;
-                    if (typeof info.reason === 'string') reason = info.reason;
-                } catch (e) {}
-            }
-            if (this.debug) console.log(`[Connection] ws FIN from device, streamId=${frame.streamId} code=${code} reason=${JSON.stringify(reason)}`);
-            this.wsStreams.delete(frame.streamId);
-            ws.iframe.postMessage({
-                type: 'ws_closed',
-                streamId: frame.streamId,
-                code,
-                reason
-            }, location.origin);
-            return;
-        }
-
-        if (frame.payload.byteLength > 0 && !(frame.flags & FLAG_SYN)) {
-            // DAT frame(s): a large WS message is split into <=SWSP_CHUNK_SIZE
-            // chunks, with FLAG_MORE on every non-final chunk. Buffer until the
-            // final chunk, then deliver the reassembled message -- preserving the
-            // WS message boundary. The type byte (0=text, 1=binary) rides in the
-            // first chunk.
-            const part = new Uint8Array(frame.payload);
-            if (frame.flags & FLAG_MORE) {
-                (ws._rx || (ws._rx = [])).push(part);
-                return;
-            }
-            let full;
-            if (ws._rx) {
-                ws._rx.push(part);
-                const total = ws._rx.reduce((n, a) => n + a.byteLength, 0);
-                full = new Uint8Array(total);
-                let o = 0;
-                for (const a of ws._rx) { full.set(a, o); o += a.byteLength; }
-                ws._rx = null;
-            } else {
-                full = part;
-            }
-
-            const isText = full[0] === 0;
-            const messageBytes = full.slice(1);
-
-            let data;
-            if (isText) {
-                data = new TextDecoder().decode(messageBytes);
-            } else {
-                data = messageBytes.buffer;
-            }
-
-            ws.iframe.postMessage({
-                type: 'ws_message',
-                streamId: frame.streamId,
-                data
-            }, location.origin);
-        }
-    }
-
-    // handleBitbangFrame is the generic transport for streams opened
-    // through the magic /__bitbang/<type> path. It does NO per-cap
-    // interpretation — the iframe-served code handles tag bytes,
-    // JSON FIN payloads, status decoding, etc. This frame is just
-    // shuttling raw bytes between the SWSP data channel and the
-    // iframe's WebSocket shim.
-    handleBitbangFrame(frame, ws) {
-        if (frame.flags & FLAG_SYN) {
-            // A mid-stream SYN from the device is the listener's
-            // chosen way to deliver an early-error payload (or any
-            // other one-shot metadata). Deliver as a text WS message
-            // so the iframe can decide what to do with it. Most caps
-            // will UTF-8-decode + JSON.parse and look for `error`.
-            const text = frame.payload && frame.payload.byteLength > 0
-                ? new TextDecoder().decode(frame.payload) : '';
-            ws.iframe.postMessage({
-                type: 'ws_message', streamId: frame.streamId, data: text,
-            }, location.origin);
-            return;
-        }
-
-        if (frame.flags & FLAG_FIN) {
-            // FIN — close the iframe-side WebSocket. The FIN payload
-            // (if any) becomes the `reason` field on the close event.
-            // The iframe parses it however its cap requires (e.g.
-            // shell parses {exit_code, signal}; file ops parse
-            // {status, error}).
-            let reason = '';
-            if (frame.payload && frame.payload.byteLength > 0) {
-                reason = new TextDecoder().decode(frame.payload);
-            }
-            this.wsStreams.delete(frame.streamId);
-            ws.iframe.postMessage({
-                type: 'ws_closed', streamId: frame.streamId, code: 1000, reason,
-            }, location.origin);
-            return;
-        }
-
-        // DAT — raw bytes through. Send as a binary ws_message; the
-        // iframe is responsible for whatever tag-byte or framing
-        // scheme its cap uses.
-        if (!frame.payload || frame.payload.byteLength === 0) return;
-        const view = new Uint8Array(frame.payload);
-        const ab = view.buffer.slice(view.byteOffset, view.byteOffset + view.byteLength);
-        ws.iframe.postMessage({
-            type: 'ws_message', streamId: frame.streamId, data: ab,
-        }, location.origin);
-    }
-
     // Send the connect handshake and wait for the device's 'ready' (plus the
     // optional 2 s TURN banner hold). Shared by the initial connect and by a
     // soft reconnect — everything here is safe to run on a rebuilt transport.
@@ -3350,7 +3471,7 @@ class BitBangConnection {
         setInterval(alive, ALIVE_EVERY_MS);
 
         // Listen for messages from the content frame. Besides the ws_*
-        // traffic (handleWSShimMessage), a device page can post:
+        // traffic (SocketBridge.onPageMessage), a device page can post:
         //   bb-navigate  { path }                 move the iframe to a path
         //   bb-open-cap  { path, newTab = true }  open /<uid>#<code><path>
         //
@@ -3380,7 +3501,7 @@ class BitBangConnection {
                 if (event.data.type === 'bb-open') path = this.targetPrefix() + path;
                 toTop({ type: 'open', path, newTab: event.data.newTab !== false });
             } else {
-                this.handleWSShimMessage(event);
+                this.sockets.onPageMessage(event.data, iframe.contentWindow);
             }
         });
 
@@ -3473,150 +3594,6 @@ class BitBangConnection {
         };
         this.connectResolve = navigateAfterAuth;
         this.sendConnect(path);
-    }
-
-    // The parent end of the ws-shim.js channel; its vocabulary is listed at
-    // the top of that file.
-    handleWSShimMessage(event) {
-        const iframe = document.getElementById('device-frame');
-        if (!iframe || event.source !== iframe.contentWindow) return;
-
-        const msg = event.data;
-        if (!msg || !msg.type?.startsWith('ws_')) return;
-
-        if (!this.swsp.open) {
-            // No transport, so an open fails rather than being dropped. Dropped,
-            // the socket waited in CONNECTING for an answer that never came,
-            // and a page retrying across a reconnect -- the console panel --
-            // retried once and then hung. The shim matches a waiting socket by
-            // openId and a closing one by streamId, so it is assigned a stream
-            // and closed on it in the same breath.
-            if (msg.type === 'ws_open') {
-                const streamId = this.swsp.newStreamId();
-                iframe.contentWindow.postMessage({ type: 'ws_assign', openId: msg.openId, streamId }, location.origin);
-                iframe.contentWindow.postMessage({ type: 'ws_closed', streamId, code: 1006, reason: '' }, location.origin);
-            }
-            return;
-        }
-
-        if (msg.type === 'ws_open') {
-            const streamId = this.swsp.newStreamId();
-            if (this.debug) console.log(`[Connection] ws_open ${msg.pathname}, streamId=${streamId}, cookies.len=${(msg.cookies || '').length}`);
-
-            // Magic path: /__bitbang/<type>?<params> opens a SWSP
-            // stream of the named type. This frame is a generic
-            // transport here — it builds the SYN from path+query but
-            // shuttles raw bytes for DAT/FIN. Each iframe-served cap
-            // (shell, serial, forward, …) handles its own per-stream
-            // framing (tag bytes, JSON FIN payloads, etc.). Adding a
-            // new cap therefore doesn't require any connection.js
-            // changes — just a new device-side handler and an iframe
-            // page that opens the right magic URL.
-            const bitbangPrefix = '/__bitbang/';
-            if (msg.pathname && msg.pathname.indexOf(bitbangPrefix) === 0) {
-                const u = new URL(msg.pathname, 'http://device');
-                // Pathname after /__bitbang/ is the stream type. Strip
-                // the leading slash that URL.pathname keeps and pull
-                // out the first segment.
-                const tail = u.pathname.substring(bitbangPrefix.length);
-                const type = tail.split('/')[0];
-                if (!type) {
-                    iframe.contentWindow.postMessage({
-                        type: 'ws_closed', streamId, code: 1008,
-                        reason: 'bitbang: empty type in magic path',
-                    }, location.origin);
-                    return;
-                }
-
-                // Build the SYN payload from the query string. Each
-                // value is JSON-parsed where possible (so "true" → bool,
-                // "80" → number, "[\"bash\"]" → array), otherwise kept
-                // as a literal string. The result is a typed JSON
-                // object the listener can unmarshal cleanly.
-                const syn = { type };
-                for (const [k, v] of u.searchParams) {
-                    try { syn[k] = JSON.parse(v); }
-                    catch (e) { syn[k] = v; }
-                }
-
-                this.wsStreams.set(streamId, { iframe: iframe.contentWindow, kind: 'bitbang' });
-                iframe.contentWindow.postMessage({
-                    type: 'ws_assign', openId: msg.openId, streamId,
-                }, location.origin);
-                this.swsp.openCredit(streamId);
-                this.swsp.send(streamId, FLAG_SYN, JSON.stringify(syn));
-                // Tell the iframe the WS is open now. Listener handlers
-                // typically don't send a SYN ack on the success path —
-                // the first DAT is the natural signal that things are
-                // working. Iframe code can start sending immediately.
-                iframe.contentWindow.postMessage({ type: 'ws_opened', streamId }, location.origin);
-                return;
-            }
-
-            // Regular WebSocket proxy path (unchanged).
-            this.wsStreams.set(streamId, { iframe: iframe.contentWindow, kind: 'websocket' });
-            iframe.contentWindow.postMessage({
-                type: 'ws_assign',
-                openId: msg.openId,
-                streamId
-            }, location.origin);
-            const synPayload = JSON.stringify({
-                type: 'websocket',
-                // The device's path: a proxied app's target goes back on, as
-                // for HTTP (ProxyRequests.start).
-                pathname: this.targetPrefix() + msg.pathname,
-                cookies: msg.cookies || '',
-            });
-            this.swsp.openCredit(streamId);
-            this.swsp.send(streamId, FLAG_SYN, synPayload);
-            if (this.debug) console.log(`[Connection] ws SYN sent to device, streamId=${streamId}`);
-
-        } else if (msg.type === 'ws_send') {
-            const ws = this.wsStreams.get(msg.streamId);
-            if (!ws) return;
-            const bytes = msg.isText ? new TextEncoder().encode(msg.data) : new Uint8Array(msg.data);
-
-            if (ws.kind === 'bitbang') {
-                // Generic shuttle: raw bytes go through unchanged. Text
-                // frames are UTF-8 encoded; the iframe is responsible
-                // for keeping the cap-specific framing it expects.
-                this.swsp.queueOnStream(ws, msg.streamId, [[FLAG_DAT, bytes]]);
-                return;
-            }
-
-            // Regular WebSocket DAT framing: [1B type: 0=text 1=binary][message]
-            const payload = new Uint8Array(1 + bytes.length);
-            payload[0] = msg.isText ? 0 : 1;
-            payload.set(bytes, 1);
-            // Chunk at SWSP_CHUNK_SIZE (the data-channel message limit). Non-final
-            // chunks carry FLAG_MORE so the device reassembles them into one WS
-            // message (the type byte rides in the first chunk).
-            const frames = [];
-            for (let off = 0; off < payload.length; off += SWSP_CHUNK_SIZE) {
-                const end = off + SWSP_CHUNK_SIZE;
-                const flags = end >= payload.length ? FLAG_DAT : (FLAG_DAT | FLAG_MORE);
-                frames.push([flags, payload.subarray(off, Math.min(end, payload.length))]);
-            }
-            this.swsp.queueOnStream(ws, msg.streamId, frames);
-
-        } else if (msg.type === 'ws_close') {
-            const ws = this.wsStreams.get(msg.streamId);
-            if (!ws) return;
-            this.wsStreams.delete(msg.streamId);
-            // Behind whatever the page sent before closing, then the stream's
-            // credit is done with.
-            const streamId = msg.streamId;
-            this.swsp.queueOnStream(ws, streamId, [[FLAG_FIN, new Uint8Array(0)]])
-                .then(() => this.swsp.dropCredit(streamId));
-            // The stream is forgotten, so whatever the device answers is
-            // dropped. The app's close event comes from here, carrying the
-            // code it asked to close with; without it the socket sat in
-            // CLOSING and onclose never ran.
-            ws.iframe.postMessage({
-                type: 'ws_closed', streamId: msg.streamId,
-                code: msg.code || 1000, reason: msg.reason || '',
-            }, location.origin);
-        }
     }
 
     createIframe() {
