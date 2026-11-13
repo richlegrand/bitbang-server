@@ -1078,6 +1078,170 @@ class PathReporter {
     }
 }
 
+// The soft reconnect: when an established peer connection drops, rebuild the
+// transport under the live page with fresh connection requests, until one
+// works or RECONNECT_WINDOW_MS of trying is used up (see the constants).
+// Also how a relay credential is renewed, ahead of its expiry.
+//
+// It acts on the connection only through `hooks`:
+//   ended()     the session has ended for good: stop
+//   begin()     a loop is starting: quiet the timers, show the strip
+//   attempt()   tear down what is left and send a fresh request; a promise
+//               that rejects if signaling fails. Success is reported later,
+//               by succeeded(), when the new transport reaches 'ready'.
+//   finish()    the loop is over, either way: take the strip down
+//   giveUp()    the window closed without a connection: end the session
+class Reconnector {
+    constructor(hooks) {
+        this.hooks = hooks;
+        this.active = false;       // a loop is running
+        this.renewing = false;     // ...and it is renewing a relay credential
+        this.resolve = null;       // the attempt in flight
+        this.reject = null;
+        this.timeout = null;
+        this.wake = null;          // cuts a backoff short, see sleep
+    }
+
+    // The established connection failed. Nothing to do if the session has
+    // ended on purpose or a loop already owns the recovery.
+    start() {
+        if (this.hooks.ended() || this.active) return;
+        this.loop();
+    }
+
+    // Renew the relay credential: the same loop, flagged so the offer handler
+    // can tell a renewal that finds the relay full from a reconnect that
+    // should keep trying.
+    renew() {
+        this.renewing = true;
+        this.loop();
+    }
+
+    // Rebuild with capped exponential backoff. Each attempt re-runs the
+    // normal signaling flow (request, offer, answer, data channel, ready);
+    // the device answers via its ordinary HandleRequest path. The iframe and
+    // the page's state are untouched throughout.
+    async loop() {
+        this.active = true;
+        this.hooks.begin();
+
+        // deadline is (re)armed whenever attempting becomes newly possible:
+        // at entry, and again when connectivity returns after an offline
+        // park. Between those points it only counts down.
+        let deadline = Date.now() + RECONNECT_WINDOW_MS;
+        let backoff = 1000;
+        let attempt = 0;
+        // A terminal screen (the device ending the session, relay expiry)
+        // may land at any await point; ended() stops the loop wherever it is
+        // checked.
+        while (!this.hooks.ended()) {
+            if (!navigator.onLine) {
+                console.log('[Connection] offline — waiting for connectivity before reconnecting');
+                await this.waitForOnline();
+                if (this.hooks.ended()) break;
+                await new Promise(r => setTimeout(r, RECONNECT_SETTLE_MS));
+                deadline = Date.now() + RECONNECT_WINDOW_MS;
+                backoff = 1000;
+                continue;
+            }
+            attempt++;
+            try {
+                await this.once();
+                console.log(`[Connection] reconnected on attempt ${attempt}`);
+                this.active = false;
+                this.renewing = false;
+                this.hooks.finish();
+                return;
+            } catch (e) {
+                console.warn(`[Connection] reconnect attempt ${attempt} failed:`, e?.message || e);
+                if (Date.now() + backoff >= deadline) break;
+                await this.sleep(backoff);
+                backoff = Math.min(backoff * 2, RECONNECT_MAX_BACKOFF_MS);
+            }
+        }
+
+        // Window closed (or a terminal screen owns the page) -- fall back.
+        this.active = false;
+        this.renewing = false;
+        this.hooks.finish();
+        if (this.hooks.ended()) return;
+        this.hooks.giveUp();
+    }
+
+    // One attempt: resolves once the rebuilt data channel is verified and the
+    // device replies 'ready' (succeeded), or rejects on timeout or a
+    // signaling error.
+    once() {
+        return new Promise((resolve, reject) => {
+            this.resolve = resolve;
+            this.reject = reject;
+            this.timeout = setTimeout(() => this.fail(new Error('reconnect_timeout')), RECONNECT_TIMEOUT_MS);
+            this.hooks.attempt().catch(e => this.fail(e));
+        });
+    }
+
+    // The attempt in flight worked: the new transport reached 'ready'. A
+    // no-op when nothing is waiting.
+    succeeded() { this.settle(true); }
+
+    // The attempt in flight failed (a fresh peer connection that never
+    // connected, say). The loop's backoff decides what next.
+    fail(err) { this.settle(false, err); }
+
+    // A terminal screen took the page: stop, and fail what is in flight.
+    cancel() {
+        if (!this.active) return;
+        this.active = false;
+        this.fail(new Error('terminal'));
+    }
+
+    // Resolve or reject the attempt in flight, exactly once.
+    settle(ok, err) {
+        clearTimeout(this.timeout);
+        this.timeout = null;
+        const resolve = this.resolve, reject = this.reject;
+        this.resolve = null;
+        this.reject = null;
+        if (ok && resolve) resolve();
+        else if (!ok && reject) reject(err || new Error('reconnect_failed'));
+    }
+
+    // Resolve once navigator.onLine is true. The 'online' event is the
+    // primary signal; a 5s poll backstops it and lets the loop notice the
+    // session ending while parked here.
+    async waitForOnline() {
+        while (!navigator.onLine && !this.hooks.ended()) {
+            await new Promise((resolve) => {
+                const done = () => {
+                    window.removeEventListener('online', done);
+                    clearTimeout(timer);
+                    resolve();
+                };
+                const timer = setTimeout(done, 5000);
+                window.addEventListener('online', done);
+            });
+        }
+    }
+
+    // A sleep the device coming back can cut short (wakeUp).
+    //
+    // The backoff reaches ten seconds, and a device that has finished
+    // rebooting should not be waited out for the rest of it -- the moment it
+    // registers is the one moment an attempt is certain to find something.
+    // Resolving early is all this does; the loop re-decides everything else
+    // for itself.
+    sleep(ms) {
+        return new Promise((resolve) => {
+            let t = null;
+            const done = () => { clearTimeout(t); this.wake = null; resolve(); };
+            t = setTimeout(done, ms);
+            this.wake = done;
+        });
+    }
+
+    wakeUp() { this.wake?.(); }
+}
+
 class BitBangConnection {
     constructor({ uid, target, devicePath, deviceSearch, deviceHash }) {
         this.uid = uid;
@@ -1152,9 +1316,12 @@ class BitBangConnection {
         // telemetry. Both act on this only through the hooks given here.
         this.relay = new RelayMonitor({
             pc: () => this.pc,
-            ended: () => this._turnEnded,
-            reconnecting: () => this._reconnecting,
-            renew: () => this._renewTurn(),
+            ended: () => this._sessionEnded,
+            reconnecting: () => this.reconnector.active,
+            renew: () => {
+                console.log('[Connection] renewing the relay credential before it expires');
+                this.reconnector.renew();
+            },
             end: (text) => this.showReloadScreen(text),
         }, this.debug);
         this.path = new PathReporter({
@@ -1164,15 +1331,24 @@ class BitBangConnection {
         this._turnUnavailable = false;
         // The session has ended for good: relay expiry, the device ending it,
         // or the reconnect window closing. Nothing retries after this.
-        this._turnEnded = false;
-        this._renewing = false;         // the reconnect in progress renews TURN
-        // Soft-reconnect state.
+        this._sessionEnded = false;
         this._transportReady = false;   // one-time setup (SW reg, iframe) done
-        this._reconnecting = false;     // a reconnect loop is in progress
-        this._reconnectResolve = null;  // resolves the in-flight attempt on ready
-        this._reconnectReject = null;
-        this._reconnectTimeout = null;
-        this._wake = null;              // cuts a backoff short, see _sleep
+        this.reconnector = new Reconnector({
+            ended: () => this._sessionEnded,
+            begin: () => {
+                this.relay.clearEndTimers();
+                this._clearReassureTimer();
+                this._showReconnecting();
+            },
+            attempt: () => {
+                this._teardownTransport();
+                return this.connectWebSocket();
+            },
+            finish: () => this._hideReconnecting(),
+            giveUp: () => this.showReloadScreen(this.relay.usingRelay
+                ? 'Connection lost — relay may have expired.'
+                : 'Connection lost. Reload to continue.'),
+        });
 
         // What the server has told us about the device, as opposed to what
         // our own transport has worked out. The two are independent: a device
@@ -1779,7 +1955,7 @@ class BitBangConnection {
             // A live page with a dead channel should be recovering, not
             // rejecting forever — kick the reconnect if nothing else did.
             // (No-op while a reconnect is in flight or after a terminal end.)
-            if (this._wasConnected) this._handlePostHandshakeFailure();
+            if (this._wasConnected) this.reconnector.start();
             return;
         }
 
@@ -2072,7 +2248,7 @@ class BitBangConnection {
         // session is about to be built on a page that cannot use it, and the
         // sooner that is settled the less there is to throw away.
         this._onDeviceBoot(msg.device_boot);
-        if (this._turnEnded) return;      // reloading; do not negotiate
+        if (this._sessionEnded) return;      // reloading; do not negotiate
 
         this._printDebug(STATUS.CONNECTING_WEBRTC);
         this.streamNameMap = msg.streams || {};
@@ -2090,7 +2266,7 @@ class BitBangConnection {
         // with the relay full, this attempt cannot connect and neither can
         // the next few minutes of retries, so end now with the message the
         // expiry would have shown.
-        if (this._renewing && this._turnUnavailable) {
+        if (this.reconnector.renewing && this._turnUnavailable) {
             const flags = parseUrlFlags();
             if (flags.relay && !flags.norelay) {
                 console.warn('[Connection] relay full at renewal; ending session');
@@ -2195,12 +2371,12 @@ class BitBangConnection {
             } else if (pc.connectionState === 'failed') {
                 this._clearReassureTimer();
                 if (this._wasConnected) {
-                    this._handlePostHandshakeFailure();
-                } else if (this._reconnecting) {
+                    this.reconnector.start();
+                } else if (this.reconnector.active) {
                     // A reconnect attempt's fresh PC failed before connecting.
-                    // Let the reconnect loop's timeout drive the retry rather
+                    // Let the reconnect loop's backoff drive the retry rather
                     // than surfacing a terminal error screen.
-                    this._settleReconnect(false, new Error('pc_failed'));
+                    this.reconnector.fail(new Error('pc_failed'));
                 } else {
                     this._printError('Peer connection failed');
                 }
@@ -2216,7 +2392,7 @@ class BitBangConnection {
 
             if (this._wasConnected && this.relay.usingRelay
                 && (pc.iceConnectionState === 'failed' || pc.iceConnectionState === 'disconnected')) {
-                this._handlePostHandshakeFailure();
+                this.reconnector.start();
             }
         };
 
@@ -2297,9 +2473,9 @@ class BitBangConnection {
                 console.log('DataChannel closed');
                 // The channel can die without the PC ever reporting 'failed'
                 // (e.g. the device closes its end). Route through the same
-                // recovery path; its guards skip intentional teardown
-                // (_reconnecting) and terminal ends (_turnEnded).
-                if (this._wasConnected) this._handlePostHandshakeFailure();
+                // recovery path; start() skips a loop already running and a
+                // session that has ended.
+                if (this._wasConnected) this.reconnector.start();
             };
             dc.onerror = (e) => console.error('DataChannel error:', e);
             dc.onmessage = (e) => this.handleDataChannelMessage(e);
@@ -2373,147 +2549,6 @@ class BitBangConnection {
         if (relayed) this.relay.armEndTimers();
     }
 
-    // Renew the relay credential before it runs out, through the soft
-    // reconnect (RelayMonitor decides when). _renewing lets the offer handler tell a renewal that finds
-    // the relay full from a reconnect that should keep trying.
-    _renewTurn() {
-        console.log('[Connection] renewing the relay credential before it expires');
-        this._renewing = true;
-        this._reconnectLoop();
-    }
-
-    // Called from onconnectionstatechange === 'failed' or the ICE handler
-    // after we were once connected. Instead of giving up, attempt a soft
-    // reconnect: rebuild the transport under the live page. Only falls back to
-    // the reload screen once reconnect attempts are exhausted.
-    _handlePostHandshakeFailure() {
-        if (this._turnEnded) return;      // intentional end (e.g. relay expiry)
-        if (this._reconnecting) return;   // a reconnect loop already owns this
-        this._reconnectLoop();
-    }
-
-    // Rebuild the transport with a fresh connection request, retrying with
-    // linear backoff. Each attempt tears down the dead PC/WS and re-runs the
-    // normal signaling flow (request → offer → answer → data channel → ready);
-    // the device answers via its ordinary HandleRequest path. Preserves the
-    // sessionId, iframe, and app state throughout.
-    async _reconnectLoop() {
-        this._reconnecting = true;
-        this.relay.clearEndTimers();
-        this._clearReassureTimer();
-        this._showReconnecting();
-
-        // deadline is (re)armed whenever attempting becomes newly possible:
-        // at entry, and again when connectivity returns after an offline
-        // park. Between those points it only counts down.
-        let deadline = Date.now() + RECONNECT_WINDOW_MS;
-        let backoff = 1000;
-        let attempt = 0;
-        // A terminal screen (e.g. the device ending the session, relay
-        // expiry) may fire at any await point — _turnEnded ends the loop
-        // wherever it's checked.
-        while (!this._turnEnded) {
-            if (!navigator.onLine) {
-                console.log('[Connection] offline — waiting for connectivity before reconnecting');
-                await this._waitForOnline();
-                if (this._turnEnded) break;
-                await new Promise(r => setTimeout(r, RECONNECT_SETTLE_MS));
-                deadline = Date.now() + RECONNECT_WINDOW_MS;
-                backoff = 1000;
-                continue;
-            }
-            attempt++;
-            this._teardownTransport();
-            try {
-                await this._reconnectOnce();
-                console.log(`[Connection] reconnected on attempt ${attempt}`);
-                this._reconnecting = false;
-                this._renewing = false;
-                this._hideReconnecting();
-                return;
-            } catch (e) {
-                console.warn(`[Connection] reconnect attempt ${attempt} failed:`, e?.message || e);
-                if (Date.now() + backoff >= deadline) break;
-                await this._sleep(backoff);
-                backoff = Math.min(backoff * 2, RECONNECT_MAX_BACKOFF_MS);
-            }
-        }
-
-        // Window closed (or a terminal screen owns the page) — fall back.
-        this._reconnecting = false;
-        this._renewing = false;
-        this._hideReconnecting();
-        if (this._turnEnded) return;
-        this._turnEnded = true;
-        const msg = this.relay.usingRelay
-            ? 'Connection lost — relay may have expired.'
-            : 'Connection lost. Reload to continue.';
-        this.showReloadScreen(msg);
-    }
-
-    // One reconnect attempt: kick off signaling and resolve once the rebuilt
-    // data channel is verified and the device replies 'ready' (via
-    // _onReconnected), or reject on timeout / signaling error.
-    _reconnectOnce() {
-        return new Promise((resolve, reject) => {
-            this._reconnectResolve = resolve;
-            this._reconnectReject = reject;
-            this._reconnectTimeout = setTimeout(() => this._settleReconnect(false, new Error('reconnect_timeout')), RECONNECT_TIMEOUT_MS);
-            // connectWebSocket resolves when the offer is handled; the ready
-            // signal comes later via _onReconnected. A WS/offer error here
-            // fails this attempt.
-            this.connectWebSocket().catch(e => this._settleReconnect(false, e));
-        });
-    }
-
-    // Resolve/reject the in-flight reconnect attempt exactly once.
-    _settleReconnect(ok, err) {
-        if (this._reconnectTimeout) { clearTimeout(this._reconnectTimeout); this._reconnectTimeout = null; }
-        const resolve = this._reconnectResolve, reject = this._reconnectReject;
-        this._reconnectResolve = null;
-        this._reconnectReject = null;
-        if (ok && resolve) resolve();
-        else if (!ok && reject) reject(err || new Error('reconnect_failed'));
-    }
-
-    // Called from onDataChannelReady when the rebuilt transport reaches 'ready'.
-    _onReconnected() {
-        this._settleReconnect(true);
-    }
-
-    // Resolve once navigator.onLine is true. The 'online' event is the
-    // primary signal; a 5s poll backstops it and lets the reconnect loop
-    // notice _turnEnded while parked here.
-    async _waitForOnline() {
-        while (!navigator.onLine && !this._turnEnded) {
-            await new Promise((resolve) => {
-                const done = () => {
-                    window.removeEventListener('online', done);
-                    clearTimeout(timer);
-                    resolve();
-                };
-                const timer = setTimeout(done, 5000);
-                window.addEventListener('online', done);
-            });
-        }
-    }
-
-    // A sleep the device coming back can cut short.
-    //
-    // The reconnect loop's backoff reaches ten seconds, and a device that has
-    // finished rebooting should not be waited out for the rest of it -- the
-    // moment it registers is the one moment an attempt is certain to find
-    // something. Resolving early is all this does; the loop re-decides
-    // everything else for itself.
-    _sleep(ms) {
-        return new Promise((resolve) => {
-            let t = null;
-            const done = () => { clearTimeout(t); this._wake = null; resolve(); };
-            t = setTimeout(done, ms);
-            this._wake = done;
-        });
-    }
-
     // A device registered for our UID, and this is which run of its firmware.
     //
     // The whole decision is one comparison, and it is here rather than on the
@@ -2547,7 +2582,7 @@ class BitBangConnection {
             return;
         }
         if (this._deviceBoot === boot) {
-            this._wake?.();               // shortens a backoff, nothing more
+            this.reconnector.wakeUp();    // shortens a backoff, nothing more
             return;
         }
 
@@ -2568,7 +2603,7 @@ class BitBangConnection {
     // the first -- the thing it existed to prevent. So now it is the same strip
     // with the same words on both sides of the reload.
     _reloadForRestart() {
-        this._turnEnded = true;           // stop the reconnect loop competing
+        this._sessionEnded = true;           // stop the reconnect loop competing
         this._showReconnecting(DEVICE_RESET_TEXT);
         // Not a delay: the reload is not held for the message. The page that
         // comes back puts the same strip up again and takes it down once it
@@ -2605,7 +2640,7 @@ class BitBangConnection {
     // which is what stops a redial scheduled earlier from opening a second one
     // after the reconnect loop has put its own in place.
     _shouldHoldSignaling() {
-        return this._transportReady && !this._reconnecting && !this._turnEnded
+        return this._transportReady && !this.reconnector.active && !this._sessionEnded
             && !this.ws;
     }
 
@@ -3031,11 +3066,8 @@ class BitBangConnection {
     showReloadScreen(message) {
         // This is terminal — cancel any in-flight soft reconnect and mark the
         // session ended so a reconnect loop mid-backoff bails out.
-        this._turnEnded = true;
-        if (this._reconnecting) {
-            this._reconnecting = false;
-            this._settleReconnect(false, new Error('terminal'));
-        }
+        this._sessionEnded = true;
+        this.reconnector.cancel();
         this._hideReconnecting();
         const iframe = document.getElementById('device-frame');
         if (iframe) iframe.style.display = 'none';
@@ -3240,7 +3272,7 @@ class BitBangConnection {
         // RECONNECT_TIMEOUT_MS over a working connection before tearing that
         // connection down to try again. Twenty seconds of "Reconnecting..."
         // and then a real disconnect, with nothing actually wrong.
-        this._onReconnected();
+        this.reconnector.succeeded();
 
         // Does the one-time setup still need doing? The iframe, SW
         // registration, and window message listener all persist across a
