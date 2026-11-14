@@ -388,6 +388,12 @@ const RECONNECT_WINDOW_MS = 5 * 60 * 1000;  // give up after this much failed ef
 const RECONNECT_MAX_BACKOFF_MS = 10000;     // cap on the delay between attempts
 const RECONNECT_TIMEOUT_MS = 20000;  // per attempt: WS + offer + DC verify + ready
 const RECONNECT_SETTLE_MS = 2000;    // after offline→online, let the network settle
+// Past the window, a visible page keeps trying this often instead of giving
+// up, and a hidden one waits to be shown again. An S3-EYE whose network went
+// bad came back by itself after 13 minutes; the tab watching it had stopped
+// at 5 and never tried again, so only a new tab could reach it. The device
+// not being there yet costs the server one cheap request per attempt.
+const RECONNECT_SLOW_MS = 30000;
 
 // A relayed session on a visible page renews its TURN credential this long
 // before it expires, through the same soft reconnect: a fresh request, so a
@@ -1103,9 +1109,11 @@ class PathReporter {
 }
 
 // The soft reconnect: when an established peer connection drops, rebuild the
-// transport under the live page with fresh connection requests, until one
-// works or RECONNECT_WINDOW_MS of trying is used up (see the constants).
-// Also how a relay credential is renewed, ahead of its expiry.
+// transport under the live page with fresh connection requests. Quickly for
+// RECONNECT_WINDOW_MS, then every RECONNECT_SLOW_MS for as long as the page is
+// visible, and on being shown again while it is hidden (see the constants).
+// Also how a relay credential is renewed, ahead of its expiry; a renewal still
+// gives up when its window closes.
 //
 // It acts on the connection only through `hooks`:
 //   ended()     the session has ended for good: stop
@@ -1114,7 +1122,8 @@ class PathReporter {
 //               that rejects if signaling fails. Success is reported later,
 //               by succeeded(), when the new transport reaches 'ready'.
 //   finish()    the loop is over, either way: take the strip down
-//   giveUp()    the window closed without a connection: end the session
+//   slow()      the window is used up and trying goes on slowly: say so
+//   giveUp()    a renewal's window closed without a connection: end it
 class Reconnector {
     constructor(hooks) {
         this.hooks = hooks;
@@ -1178,9 +1187,23 @@ class Reconnector {
                 return;
             } catch (e) {
                 console.warn(`[Connection] reconnect attempt ${attempt} failed:`, e?.message || e);
-                if (Date.now() + backoff >= deadline) break;
-                await this.sleep(backoff);
-                backoff = Math.min(backoff * 2, RECONNECT_MAX_BACKOFF_MS);
+                if (Date.now() + backoff < deadline) {
+                    await this.sleep(backoff);
+                    backoff = Math.min(backoff * 2, RECONNECT_MAX_BACKOFF_MS);
+                    continue;
+                }
+                // The window is used up. A relay renewal has a deadline of its
+                // own and ends here, as before; a device that is merely
+                // unreachable is waited for, slowly, for as long as the page
+                // is open, rather than handed to the reload screen.
+                if (this.renewing) break;
+                this.hooks.slow();
+                if (document.hidden) {
+                    console.log('[Connection] still unreachable; waiting for the page to be shown');
+                    await this.waitForVisible();
+                } else {
+                    await this.sleep(RECONNECT_SLOW_MS);
+                }
             }
         }
 
@@ -1244,6 +1267,26 @@ class Reconnector {
                 const timer = setTimeout(done, 5000);
                 window.addEventListener('online', done);
             });
+        }
+    }
+
+    // Resolve when the page is visible again, or when the device coming back
+    // cuts it short (wakeUp), or when the session ends (checked every 5 s).
+    async waitForVisible() {
+        while (document.hidden && !this.hooks.ended()) {
+            const woken = await new Promise((resolve) => {
+                const done = (v) => {
+                    document.removeEventListener('visibilitychange', onVis);
+                    clearTimeout(timer);
+                    this.wake = null;
+                    resolve(v);
+                };
+                const onVis = () => { if (!document.hidden) done(false); };
+                const timer = setTimeout(() => done(false), 5000);
+                document.addEventListener('visibilitychange', onVis);
+                this.wake = () => done(true);
+            });
+            if (woken) return;
         }
     }
 
@@ -2331,6 +2374,7 @@ class BitBangConnection {
                 return this.connectWebSocket();
             },
             finish: () => this._hideReconnecting(),
+            slow: () => this._showReconnecting('Device unreachable, still trying...'),
             giveUp: () => this.showReloadScreen(this.relay.usingRelay
                 ? 'Connection lost — relay may have expired.'
                 : 'Connection lost. Reload to continue.'),
