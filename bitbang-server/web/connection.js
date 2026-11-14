@@ -1901,9 +1901,17 @@ class SocketBridge {
 // an app that sets its icon late (an SPA bootstrap seconds after load) is
 // still picked up, and attribute changes cover one that swaps the href in
 // place. The icon itself is kept across page loads, as a tab keeps one.
+// A failed icon fetch is tried again on the next page load, or on a change to
+// the head once this long has passed. Not on every change: an app that churns
+// its head would cost the device a request each time.
+const ICON_RETRY_MS = 5000;
+
 class IconWatcher {
     constructor(debug) {
         this.href = null;     // the href last sent up, so a no-op change sends nothing
+        this.pending = null;  // the href being fetched
+        this.failed = null;   // the href whose fetch last failed, and when
+        this.failedAt = 0;
         this.set = false;     // a page has named an icon (the fallback stays out)
         this.win = null;      // the page's window
         // Fires on every change to the device page's head, so only with !debug.
@@ -1914,12 +1922,12 @@ class IconWatcher {
     loaded(iframe) {
         this.win = iframe.contentWindow;
         this.dbg('initial scan;', this.win?.location.href);
-        this.scan();
+        this.scan(true);
 
         // Fallback: /favicon.ico, used only if no page has named an icon by
         // the time it arrives, so it never replaces a real one.
         if (!this.set) {
-            IconWatcher.dataURL(fetch('/favicon.ico'), true).then((url) => {
+            IconWatcher.dataURL(fetch('/favicon.ico')).then((url) => {
                 if (!url || this.set) return;
                 this.dbg('static probe applied');
                 this.send(url);
@@ -1927,12 +1935,12 @@ class IconWatcher {
         }
     }
 
-    // Look again: the page's head changed, or it just loaded.
-    scan() {
+    // Look again: the page's head changed, or (loaded) it just loaded.
+    scan(loaded = false) {
         try {
             const doc = this.win?.document;
             if (!doc) return this.dbg('no document');
-            this.apply(this.best(doc), this.win.location.href);
+            this.apply(this.best(doc), this.win.location.href, loaded);
         } catch (e) {
             this.dbg('scan threw:', String(e));
         }
@@ -1964,19 +1972,42 @@ class IconWatcher {
 
     // Fetch the icon here, through the worker, from the device, and send it
     // up. An icon on another origin (a CDN) is left alone.
-    apply(rawHref, base) {
-        if (!rawHref || rawHref === this.href) return;
-        this.href = rawHref;
+    //
+    // The href counts as shown only once it has been sent. It used to count
+    // from the moment its fetch started, so an icon whose fetch failed -- a
+    // device busy, a reconnect under way -- was never asked for again, and
+    // the tab kept bitba.ng's icon for as long as the page named that one.
+    apply(rawHref, base, loaded) {
+        if (!rawHref) return;
+        // Shown already. A fetch still out for another href is now stale.
+        if (rawHref === this.href) { this.pending = null; return; }
+        if (rawHref === this.pending) return;
+        if (rawHref === this.failed && !loaded
+            && Date.now() - this.failedAt < ICON_RETRY_MS) return;
         if (rawHref.startsWith('data:')) {
+            this.href = rawHref;
             this.send(rawHref);
             return;
         }
         let u;
         try { u = new URL(rawHref, base); } catch { return; }
         if (u.origin !== location.origin && u.protocol !== 'blob:') return;
-        IconWatcher.dataURL(fetch(u.href), false).then((url) => {
-            if (url && rawHref === this.href) this.send(url);
-        }).catch((e) => this.dbg('icon fetch failed:', String(e)));
+
+        this.pending = rawHref;
+        const done = (url) => {
+            if (this.pending !== rawHref) return;   // another href since
+            this.pending = null;
+            if (!url) {
+                this.dbg('icon fetch failed:', rawHref);
+                this.failed = rawHref;
+                this.failedAt = Date.now();
+                return;
+            }
+            this.failed = null;
+            this.href = rawHref;
+            this.send(url);
+        };
+        IconWatcher.dataURL(fetch(u.href)).then(done, () => done(null));
     }
 
     // Larger than any tab icon needs; a device that serves a huge one keeps
@@ -1987,19 +2018,47 @@ class IconWatcher {
         toTop({ type: 'icon', href: dataURL });
     }
 
-    // A response as a data URL, or null for a failed one (or, with
-    // imageOnly, one that isn't an image).
-    static async dataURL(responsePromise, imageOnly) {
+    // A response as an image's data URL, or null for a failed one or one
+    // that isn't an image.
+    //
+    // The type is the device's Content-Type when that says image, and
+    // otherwise what the first bytes say. bitba.ng's page takes only a
+    // data:image/ URL, and a small server that sets no type, or the wrong
+    // one, used to cost the tab its icon without a word.
+    static async dataURL(responsePromise) {
         const r = await responsePromise;
         if (!r.ok) return null;
-        const blob = await r.blob();
-        if (imageOnly && !/^image\//.test(blob.type)) return null;
+        let blob = await r.blob();
+        if (!/^image\//.test(blob.type)) {
+            const type = IconWatcher.sniff(new Uint8Array(await blob.slice(0, 512).arrayBuffer()));
+            if (!type) return null;
+            blob = new Blob([blob], { type });
+        }
         return new Promise((resolve) => {
             const reader = new FileReader();
             reader.onload = () => resolve(reader.result);
             reader.onerror = () => resolve(null);
             reader.readAsDataURL(blob);
         });
+    }
+
+    // An icon's type from its first bytes: the formats a tab icon comes in,
+    // or null for anything else (a page served for every path, say).
+    static sniff(b) {
+        const starts = (...sig) => sig.every((v, i) => b[i] === v);
+        if (starts(0x89, 0x50, 0x4E, 0x47)) return 'image/png';
+        if (starts(0x00, 0x00, 0x01, 0x00)) return 'image/x-icon';
+        if (starts(0x47, 0x49, 0x46, 0x38)) return 'image/gif';
+        if (starts(0xFF, 0xD8, 0xFF)) return 'image/jpeg';
+        if (starts(0x52, 0x49, 0x46, 0x46) && String.fromCharCode(...b.slice(8, 12)) === 'WEBP') {
+            return 'image/webp';
+        }
+        // TextDecoder drops a byte-order mark.
+        const text = new TextDecoder().decode(b).trimStart().toLowerCase();
+        if ((text.startsWith('<svg') || text.startsWith('<?xml')) && text.includes('<svg')) {
+            return 'image/svg+xml';
+        }
+        return null;
     }
 }
 
