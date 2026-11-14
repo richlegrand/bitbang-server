@@ -54,13 +54,43 @@ function fromTop(fn) {
     });
 }
 
-// The tab's title belongs to bitba.ng's page. Kept here too, so code that
-// saves a title to restore later can read back what it last set.
-let topTitle = '';
-function setTopTitle(title) {
-    topTitle = title;
-    toTop({ type: 'title', title });
+// The tab's title belongs to bitba.ng's page; this is what this frame asks it
+// to show. Two parts: the page's own title, and notices (reconnecting, the
+// relay ending) shown over it while they last, the latest on top. A notice
+// taken down shows the page's title as it is by then: a page that loaded or
+// retitled under the notice has moved on from the title the notice covered.
+// (Each notice used to save the title it replaced and put that back, so a
+// page load under one overwrote the notice, and taking it down then brought
+// back the previous page's title.)
+class TabTitle {
+    constructor() {
+        this.page = '';
+        this.notices = new Map();   // key -> text, in the order put up
+    }
+
+    setPage(title) {
+        this.page = title;
+        this.show();
+    }
+
+    // Put a notice up, or take it down with no text.
+    notice(key, text) {
+        this.notices.delete(key);
+        if (text) this.notices.set(key, text);
+        this.show();
+    }
+
+    get shown() {
+        let top = null;
+        for (const text of this.notices.values()) top = text;
+        return top ?? this.page;
+    }
+
+    show() {
+        toTop({ type: 'title', title: this.shown });
+    }
 }
+const tabTitle = new TabTitle();
 
 // reloadTab reloads the whole tab: bitba.ng's page as well as this frame,
 // which a stale build needs (both halves of the runtime are behind) and
@@ -683,7 +713,6 @@ class RelayMonitor {
         this.monitorTimer = null;
         this.warnTimer = null;
         this.endTimer = null;
-        this.prevTitle = null;     // the tab title the warning replaced
     }
 
     // The relay credential of a new offer. The coturn REST-API username is
@@ -849,9 +878,7 @@ class RelayMonitor {
     }
 
     restoreTitle() {
-        if (!this.prevTitle) return;
-        setTopTitle(this.prevTitle);
-        this.prevTitle = null;
+        tabTitle.notice('relay', null);
     }
 
     // Schedule what happens as the credential runs out. TURN_RENEW_LEAD_MS
@@ -880,10 +907,7 @@ class RelayMonitor {
         const warnAt = this.expiryMs - 60_000 - now;
         const renewAt = this.expiryMs - TURN_RENEW_LEAD_MS - now;
         const endAt = this.expiryMs - now;
-        const warn = () => {
-            if (!this.prevTitle) this.prevTitle = topTitle;
-            setTopTitle('⚠ Relay ending soon — bitba.ng');
-        };
+        const warn = () => tabTitle.notice('relay', '⚠ Relay ending soon — bitba.ng');
         if (warnAt > 0) {
             this.warnTimer = setTimeout(() => {
                 // A visible page renews before anything ends; no warning.
@@ -1873,37 +1897,24 @@ class SocketBridge {
 // nothing of the device's applies, and nothing is missed by starting on load:
 // the first scan sees whatever the page named while it parsed.
 //
-// The MutationObserver has no timeout, so an app that sets its icon late (an
-// SPA bootstrap seconds after load) is still picked up, and attribute changes
-// cover one that swaps the href in place. It is attached per page load, so
-// observers don't accumulate across navigations; the icon itself is kept
-// across them, as a tab keeps one.
+// ContentFrame's observer of the page's head calls scan() on every change, so
+// an app that sets its icon late (an SPA bootstrap seconds after load) is
+// still picked up, and attribute changes cover one that swaps the href in
+// place. The icon itself is kept across page loads, as a tab keeps one.
 class IconWatcher {
     constructor(debug) {
         this.href = null;     // the href last sent up, so a no-op change sends nothing
         this.set = false;     // a page has named an icon (the fallback stays out)
-        // Fires on every DOM mutation in the device page, so only with !debug.
+        this.win = null;      // the page's window
+        // Fires on every change to the device page's head, so only with !debug.
         this.dbg = debug ? (...args) => console.log('[favicon]', ...args) : () => {};
     }
 
     // A page loaded in the frame.
-    watch(iframe) {
-        try {
-            const doc = iframe.contentDocument;
-            if (doc) {
-                this.dbg('initial scan;', iframe.contentWindow.location.href);
-                const scan = () => this.apply(this.best(doc), iframe.contentWindow.location.href);
-                scan();
-                new MutationObserver(scan).observe(doc.head || doc.documentElement, {
-                    childList: true, subtree: true,
-                    attributes: true, attributeFilter: ['href', 'rel', 'sizes'],
-                });
-            } else {
-                this.dbg('no iframe.contentDocument');
-            }
-        } catch (e) {
-            this.dbg('initial scan threw:', String(e));
-        }
+    loaded(iframe) {
+        this.win = iframe.contentWindow;
+        this.dbg('initial scan;', this.win?.location.href);
+        this.scan();
 
         // Fallback: /favicon.ico, used only if no page has named an icon by
         // the time it arrives, so it never replaces a real one.
@@ -1913,6 +1924,17 @@ class IconWatcher {
                 this.dbg('static probe applied');
                 this.send(url);
             }).catch((e) => this.dbg('static probe error:', String(e)));
+        }
+    }
+
+    // Look again: the page's head changed, or it just loaded.
+    scan() {
+        try {
+            const doc = this.win?.document;
+            if (!doc) return this.dbg('no document');
+            this.apply(this.best(doc), this.win.location.href);
+        } catch (e) {
+            this.dbg('scan threw:', String(e));
         }
     }
 
@@ -2073,15 +2095,40 @@ class ContentFrame {
 
         this.hooks.loaded(iframe);
 
-        let title = '';
-        try { title = iframe.contentDocument?.title || ''; } catch (e) {}
-        setTopTitle(title || this.hooks.name() || 'BitBang');
-
-        this.icons.watch(iframe);
+        this.retitle(true);
+        this.icons.loaded(iframe);
+        // The page's title and icon are both in its head, and either can
+        // change long after load: an SPA retitles on every route, and may
+        // set its icon late. One observer, on the head only -- the whole
+        // document would fire on every change an app makes to itself. A
+        // title set through document.title on a page without one is put in
+        // the head, so is still seen. characterData is for a title whose
+        // text is edited in place, attributes for an icon's. Attached per
+        // load, so observers don't accumulate across navigations.
+        try {
+            const doc = iframe.contentDocument;
+            new MutationObserver(() => {
+                this.retitle(false);
+                this.icons.scan();
+            }).observe(doc.head || doc.documentElement, {
+                childList: true, subtree: true, characterData: true,
+                attributes: true, attributeFilter: ['href', 'rel', 'sizes'],
+            });
+        } catch (e) {}
         // Moves within the page are device-shim.js's to tell (bb-location),
         // and a document without the shim -- an image, a text file -- has
         // no moves to make.
         this.report();
+    }
+
+    // The page's title as the tab's, or the device's name for a page without
+    // one. On load always; on a change to the head only if the title moved,
+    // so the rest of the head's changes cost one comparison.
+    retitle(always) {
+        let title = '';
+        try { title = this.el.contentDocument?.title || ''; } catch (e) {}
+        title = title || this.hooks.name() || 'BitBang';
+        if (always || title !== tabTitle.page) tabTitle.setPage(title);
     }
 
     // Tell bitba.ng's page where the frame is, so the address bar follows it
@@ -2627,7 +2674,7 @@ class BitBangConnection {
     // Append one line to the connection log — a plain append-only terminal:
     // one element, one font. Never replaces or clears a message.
     _print(msg) {
-        setTopTitle(msg);
+        tabTitle.setPage(msg);
         if (!this.statusEl) return;
         const line = document.createElement('div');
         line.textContent = msg;
@@ -3384,17 +3431,13 @@ class BitBangConnection {
     // -- so one strip that changes its words beats two competing for the same
     // place at the top of the page.
     _showReconnecting(text = 'Reconnecting…') {
-        if (this._prevTitle == null) this._prevTitle = topTitle;   // restored in _hideReconnecting
         banner({ id: 'bb-reconnect-banner', level: 'trouble', text });
-        setTopTitle(text + ' - bitba.ng');
+        tabTitle.notice('reconnect', text + ' - bitba.ng');
     }
 
     _hideReconnecting() {
         removeBanner('bb-reconnect-banner');
-        if (this._prevTitle != null) {
-            setTopTitle(this._prevTitle);
-            this._prevTitle = null;
-        }
+        tabTitle.notice('reconnect', null);
     }
 
     handleDataChannelMessage(event) {
