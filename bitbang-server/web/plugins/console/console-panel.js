@@ -136,6 +136,34 @@ const STYLE = `
   .c34 { color:#3b82f6; }   /* blue */
   .c35 { color:#c678dd; }   /* magenta */
   .c36 { color:#56b6c2; }   /* cyan */
+  /* The saved-crash strip: above the log rather than in a modal, so the live
+     log stays in view; in the panel rather than a tab, so a crash is seen
+     without anyone thinking to look. device-console.md, "Where a saved crash
+     is shown". */
+  #crash { display:flex; flex-wrap:wrap; align-items:center; gap:.5rem; flex:none;
+           padding:.4rem 1rem; border-bottom:1px solid var(--line);
+           color:var(--bad); font-size:.8rem; }
+  #crash[hidden] { display:none; }
+  #crash-what { flex:1 1 auto; }
+  /* Embedded, the strip lines up with the toolbar above it, which has no
+     side padding there either. */
+  :host([data-bb-embedded]) #crash { padding:0 0 .4rem; border-bottom:none; }
+  /* The excerpt is a pane of its own, the log's sibling rather than a part of
+     the strip, so it is exactly as wide as the log and set the same way: same
+     padding, and embedded, the same border. Open, the two share the panel's
+     height half and half, each scrolling in its own half. A fixed max-height
+     ran past the bottom of an embedded console (18rem by default) and hid the
+     rest of the excerpt where it could be neither scrolled to nor selected. */
+  #crash-log { flex:1 1 0; min-height:3rem; overflow:auto; margin:0;
+               padding:.6rem 1rem; border-bottom:1px solid var(--line);
+               white-space:pre-wrap; word-break:break-word; user-select:text; }
+  :host([data-bb-embedded]) #crash-log { padding:.4rem .75rem; margin-bottom:.4rem;
+                                         border:1px solid var(--line); border-radius:6px; }
+  #crash-log[hidden] { display:none; }
+  /* Folded, only the fold button shows; the stream is closed too, and
+     unfolding brings the strip back with the console's opening reply. */
+  :host([data-bb-collapsed]) #crash,
+  :host([data-bb-collapsed]) #crash-log { display:none; }
 `;
 
 const TAIL = 65536;
@@ -231,9 +259,125 @@ export function mount(host, opts = {}) {
       <span id="ctl"></span>
       <button id="clear">Clear</button>
     </header>
+    <div id="crash" hidden>
+      <span id="crash-what"></span>
+      <button id="crash-show">Show</button>
+      <button id="crash-dl">Download</button>
+      <button id="crash-dismiss">Dismiss</button>
+    </div>
+    <pre id="crash-log" hidden></pre>
     ${noToolbar ? '<div id="status" role="status">connecting</div>' : ''}
     <div id="fold-wrap"><pre id="log"></pre></div>`;
   while (frag.firstChild) root.appendChild(frag.firstChild);
+
+  /* -- the saved crash -------------------------------------------------------
+
+     The device keeps its last crash in flash (device-console.md, "Keeping the
+     crash across a power cycle") and says so in the console's opening reply,
+     as "crash": {boot, reason, uptime_ms, in_a_row, seen}, beside this boot's
+     number. Unseen, it gets a strip: Show it here, Download it for a bug
+     report, or Dismiss it, which also ends the device's notice at boot. The
+     text itself comes from GET /__bitbang/console/crash, only when asked. */
+  const CRASH_PATH = '/__bitbang/console/crash';
+  const crashEl = root.getElementById('crash');
+  const crashWhat = root.getElementById('crash-what');
+  const crashLog = root.getElementById('crash-log');
+  const crashShow = root.getElementById('crash-show');
+  let crashInfo = null;           /* the reply's crash object, while unseen */
+  let crashText = null;           /* fetched once, on Show or Download */
+  /* The excerpt is the device's raw output, color codes included, and the
+     REPL's line editing with it: linenoise redraws the prompt line on every
+     key as CR, prompt and buffer, erase to end of line, CR again, then a
+     cursor move to the column. A terminal shows only the result, and so does
+     this, by keeping a cursor per line the same way: CR goes to column 0,
+     text overwrites from the cursor, ESC[nC and ESC[nD move it, ESC[K erases
+     to the end (ESC[2K the whole line), backspace steps back, and any other
+     escape, colors included, is dropped. A CRLF ending is a line ending. */
+  const plain = (t) => t.split('\n').map((src) => {
+    let out = '';
+    let col = 0;
+    for (let i = 0; i < src.length; i++) {
+      const c = src[i];
+      if (c === '\r') { col = 0; continue; }
+      if (c === '\b') { if (col > 0) col--; continue; }
+      if (c === '\x1b') {
+        const m = /^\x1b\[([0-9;?]*)([@-~])/.exec(src.slice(i));
+        if (!m) continue;
+        i += m[0].length - 1;
+        const n = parseInt(m[1], 10);
+        if (m[2] === 'C') col += n > 0 ? n : 1;
+        else if (m[2] === 'D') col = Math.max(0, col - (n > 0 ? n : 1));
+        else if (m[2] === 'K') out = m[1] === '2' ? '' : (m[1] === '1' ? ' '.repeat(col) + out.slice(col) : out.slice(0, col));
+        continue;
+      }
+      if (col > out.length) out += ' '.repeat(col - out.length);
+      out = out.slice(0, col) + c + out.slice(col + 1);
+      col++;
+    }
+    return out.replace(/\s+$/, '');
+  }).join('\n');
+
+  function openCrash(on) {
+    crashLog.hidden = !on;
+    crashShow.textContent = on ? 'Hide' : 'Show';
+  }
+
+  function showCrash(info, thisBoot) {
+    crashInfo = info && !info.seen ? info : null;
+    crashEl.hidden = !crashInfo;
+    if (!crashInfo) {
+      openCrash(false);
+      return;
+    }
+    const ago = thisBoot > info.boot ? thisBoot - info.boot : 0;
+    const when = ago === 1 ? 'the previous boot' : `${ago} boots ago`;
+    const up = info.uptime_ms ? ` after ${(info.uptime_ms / 60000).toFixed(1)} min` : '';
+    const row = info.in_a_row > 1 ? `, ${info.in_a_row} in a row` : '';
+    crashWhat.textContent = `Crash in boot #${info.boot}, ${when}: ${info.reason}${up}${row}`;
+  }
+
+  async function fetchCrash() {
+    if (crashText !== null) return crashText;
+    const r = await fetch(CRASH_PATH);
+    if (!r.ok) throw new Error(`HTTP ${r.status}`);
+    const j = await r.json();
+    crashText = plain(j.text || '');
+    return crashText;
+  }
+
+  crashShow.addEventListener('click', async () => {
+    if (!crashLog.hidden) {
+      openCrash(false);
+      return;
+    }
+    try {
+      crashLog.textContent = await fetchCrash();
+    } catch (e) {
+      crashLog.textContent = `could not fetch the crash: ${e.message}`;
+    }
+    openCrash(true);
+  });
+
+  root.getElementById('crash-dl').addEventListener('click', async () => {
+    let text;
+    try { text = await fetchCrash(); } catch (e) { return; }
+    const a = document.createElement('a');
+    a.href = URL.createObjectURL(new Blob([text], { type: 'text/plain' }));
+    a.download = `device-boot${crashInfo ? crashInfo.boot : ''}-crash.txt`;
+    a.click();
+    setTimeout(() => URL.revokeObjectURL(a.href), 1000);
+  });
+
+  root.getElementById('crash-dismiss').addEventListener('click', async () => {
+    try {
+      const r = await fetch(CRASH_PATH, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ seen: true }),
+      });
+      if (r.ok) showCrash(null);
+    } catch (e) {}
+  });
 
   const logEl = root.getElementById('log');
   const stateEl = root.getElementById('state');
@@ -585,8 +729,12 @@ export function mount(host, opts = {}) {
     if (e.ctrlKey) {
       const k = e.key.length === 1 ? e.key.toUpperCase() : '';
       /* Ctrl-C with text selected is a copy, not an interrupt, and Ctrl-V is
-         a paste, which arrives below. */
-      if (k === 'C' && String(document.getSelection()) !== '') return;
+         a paste, which arrives below. The shadow root's own selection first:
+         Chrome's document.getSelection() does not see one inside it, which
+         sent Ctrl-C to the device while the log or the crash excerpt was
+         selected for copying. */
+      const sel = (root.getSelection ? root.getSelection() : null) || document.getSelection();
+      if (k === 'C' && sel && String(sel) !== '') return;
       if (k === 'V') return;
       if (k >= '@' && k <= '_') s = String.fromCharCode(k.charCodeAt(0) - 64);
     } else if (e.key === 'Enter') {
@@ -692,6 +840,7 @@ export function mount(host, opts = {}) {
           const m = JSON.parse(ev.data);
           if (m.from !== undefined) {
             setTyping(m.input === true);
+            showCrash(m.crash, m.boot);
             seq = m.from;
             if (m.first_seq > m.from) {
               append(`[${m.first_seq - m.from} bytes older than the buffer are gone]\n`, 'drop');
