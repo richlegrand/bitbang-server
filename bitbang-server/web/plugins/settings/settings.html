@@ -34,7 +34,10 @@
      these two rules are the only things left that a shadow root cannot cover:
      the color scheme the document resolves Canvas against, and a background
      that reaches the corners of the viewport. */
-  html { color-scheme: light dark; }
+  /* Dark whatever the viewer's theme, like the device's own pages (decided
+     2026-11-23). On #app too: the panel's :host asks for light dark, and a
+     page's rule on the host element outranks :host. */
+  html, #app { color-scheme: dark; }
   body { margin: 0; background: Canvas; color: CanvasText; }
 </style>
 

@@ -14,7 +14,11 @@
 <style>
   /* The page's own frame: the whole viewport, with the panel filling it so the
      log is what scrolls. Everything inside the panel is the component's. */
-  html { color-scheme: light dark; height: 100%; }
+  /* Dark whatever the viewer's theme, like the device's own pages (decided
+     2026-11-23). On #app too: the panel's :host asks for light dark, and a
+     page's rule on the host element outranks :host. */
+  html, #app { color-scheme: dark; }
+  html { height: 100%; }
   body { margin: 0; height: 100%; display: flex; flex-direction: column;
          background: Canvas; color: CanvasText; }
   #app { flex: 1; min-height: 0; }

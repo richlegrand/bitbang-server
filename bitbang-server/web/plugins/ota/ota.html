@@ -19,7 +19,9 @@
 -->
 <style>
   :root {
-    color-scheme: light dark;
+    /* Dark whatever the viewer's theme, like the device's own pages (decided
+       2026-11-23). */
+    color-scheme: dark;
     --font: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto,
             "Helvetica Neue", Arial, sans-serif;
     --mono: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
@@ -31,6 +33,9 @@
     --warn: #f5a623;
     accent-color: var(--accent);
   }
+  /* Canvas on html, not body: body stops at max-width, and the dark has to
+     reach the edges of the frame. */
+  html { background: Canvas; color: CanvasText; min-height: 100%; }
   body { font:15px/1.6 var(--font); margin:0; padding:2rem 1.5rem; max-width:42rem; }
   h1 { font-size:.8rem; font-weight:600; letter-spacing:.08em; text-transform:uppercase;
        color:var(--dim); margin:0 0 1.25rem; }
