@@ -2290,6 +2290,7 @@ class BitBangConnection {
         this.streamNameMap = {};      // from offer: { "0": "webcam", ... }
         this.resolvedStreams = {};    // name -> MediaStream
         this.connectResolve = null;   // resolved when device sends 'ready'
+        this.deviceUI = null;         // the device's UI build, from 'ready'
         this.benchStreams = new Map(); // streamId -> stats, for the transport benchmark
         this.sessionId = Array.from(crypto.getRandomValues(new Uint8Array(4)), b => b.toString(16).padStart(2, '0')).join(''); // 8 hex chars
         console.log('[Connection] ctor', this.sessionId);
@@ -2896,6 +2897,7 @@ class BitBangConnection {
                 event.ports[0].postMessage({
                     type: 'connection_state',
                     connected: !!(this.swsp.open && this.deviceVerified && this._transportReady),
+                    ui: this.deviceUI || null,
                 });
             }
         });
@@ -3657,6 +3659,14 @@ class BitBangConnection {
             // The target itself came from bitba.ng's page, in this frame's
             // URL; onDataChannelReady checks the two agree.
             this.routing = msg.routing || 'direct';
+            // The build of the UI files the device serves itself under
+            // /__bitbang__/ (bitbang.js, the panels, the renderers) and of its
+            // meta-pages. The label worker asks for it (connection_state):
+            // a device that reports one is sent those requests, and its files
+            // are cached under this id; one that doesn't -- older firmware,
+            // bitbang-python, the CLI -- gets the server's copies.
+            this.deviceUI = (typeof msg.ui === 'string' && /^[A-Za-z0-9_-]{1,64}$/.test(msg.ui))
+                ? msg.ui : null;
             if (this.debug) {
                 console.log('[Connection] Device ready (server v' + this.serverVersion + ', SWSP v' + this.swsp.version + ', routing=' + this.routing + ', target=' + JSON.stringify(this.target) + ')');
             } else {

@@ -12,7 +12,14 @@
  * What it serves itself, it fetches from the network, never from storage
  * (device-origins.md, property 6): every script in this origin can write the
  * Cache API, and anything of ours served from there would be theirs on every
- * later visit. Storage holds data only -- the cookie jar.
+ * later visit. Storage holds data only -- the cookie jar -- and the device's
+ * own UI files, which are the device's and not ours (deviceUIFile).
+ *
+ * What is ours is the transport runtime (RUNTIME). The rest of /__bitbang__/
+ * -- bitbang.js, the panels, the renderers -- and the meta-pages (/*settings)
+ * are the device's, served by its firmware, so a page only ever uses code
+ * built with the firmware it talks to (local_access.md, "Where the device's UI
+ * comes from"). A device that reports no UI build gets the server's copies.
  *
  * What it refuses:
  *   - a top-level document: this origin is only ever framed. The network
@@ -511,14 +518,24 @@ function getCookieHeader(requestPath) {
 
 // -- Fetch handler -----------------------------------------------------------
 
-// Ours, from the network: the start page and the runtime under /__bitbang__/.
-// Everything else on this origin is the device's.
+// Ours, from the network: the start page and the transport runtime -- the code
+// that carries a device's pages, which has to match this worker and the
+// server, never the firmware. Everything else on this origin is the device's.
+const RUNTIME = new Set([
+    'label-sw.js', 'runtime-common.js', 'connection.js', 'device-shim.js', 'ws-shim.js',
+]);
+const ASSET_PREFIX = '/__bitbang__/';
+
 function isOurs(pathname) {
-    return pathname === START_PATH || pathname.startsWith('/__bitbang__/');
+    return pathname === START_PATH
+        || (pathname.startsWith(ASSET_PREFIX) && RUNTIME.has(pathname.slice(ASSET_PREFIX.length)));
 }
 
-// A meta-page: /*settings, /*console, /*ota. The shell is ours; what it shows
-// comes from the device, through this worker like any device page's fetches.
+// One of the device's UI files: /__bitbang__/<name>, flat, not the runtime.
+const UI_FILE = /^\/__bitbang__\/([A-Za-z0-9._-]+)$/;
+
+// A meta-page: /*settings, /*console, /*ota. The device serves it, at that
+// path; for a device that reports no UI build, the server's copy (serveMetaPage).
 const META_PATH = /^\/\*([A-Za-z0-9_-]+)$/;
 
 // The destinations a frame navigation can have.
@@ -556,16 +573,25 @@ self.addEventListener('fetch', (event) => {
     }
 
     if (req.mode === 'navigate' && FRAME_DESTINATIONS.has(req.destination)) {
-        event.respondWith(attributable(event).then((ok) => {
+        event.respondWith(attributable(event).then(async (ok) => {
             if (!ok) {
                 console.warn('[label-sw] refused a navigation from outside this origin:', url.pathname);
                 return new Response('BitBang: this page can only be opened from its own device page.',
                     { status: 403, headers: { 'Content-Type': 'text/plain; charset=utf-8' } });
             }
             const meta = url.pathname.match(META_PATH);
-            if (meta) return serveMetaPage(meta[1]);
+            if (meta) {
+                const { connection, ui } = await deviceUI();
+                return ui ? proxyToDevice(event, connection) : serveMetaPage(meta[1]);
+            }
             return proxyToDevice(event);
         }));
+        return;
+    }
+
+    const file = url.pathname.match(UI_FILE);
+    if (file && req.method === 'GET') {
+        event.respondWith(deviceUIFile(event, file[1]));
         return;
     }
 
@@ -658,32 +684,94 @@ async function pickConnection() {
     });
     if (frames.length === 0) return null;
     if (frames.length === 1) return frames[0];
-    const states = await Promise.all(frames.map(askConnected));
+    const states = await Promise.all(frames.map(askState));
     const rank = (c, connected) => (connected ? 4 : 0) + (c.focused ? 2 : 0)
         + (c.visibilityState === 'visible' ? 1 : 0);
     let best = null, bestRank = -1;
     frames.forEach((c, i) => {
-        const r = rank(c, states[i]);
+        const r = rank(c, states[i].connected);
         if (r > bestRank) { best = c; bestRank = r; }
     });
     return best;
 }
 
-// Whether a connection frame says it is connected. A frame that doesn't
-// answer -- a content frame that loaded the start page and did not start, or
-// one mid-reload -- counts as not.
-function askConnected(client) {
+// What a connection frame says of itself: whether it is connected, and the
+// device's UI build from 'ready' (null if the device reported none). A frame
+// that doesn't answer -- a content frame that loaded the start page and did
+// not start, or one mid-reload -- counts as neither.
+function askState(client) {
     return new Promise((resolve) => {
+        const none = { connected: false, ui: null };
         const ch = new MessageChannel();
-        const timer = setTimeout(() => resolve(false), 300);
-        ch.port1.onmessage = (e) => { clearTimeout(timer); resolve(!!e.data?.connected); };
+        const timer = setTimeout(() => resolve(none), 300);
+        ch.port1.onmessage = (e) => {
+            clearTimeout(timer);
+            const ui = e.data?.ui;
+            resolve({ connected: !!e.data?.connected, ui: typeof ui === 'string' && ui ? ui : null });
+        };
         try {
             client.postMessage({ type: 'connection_state' }, [ch.port2]);
         } catch {
             clearTimeout(timer);
-            resolve(false);
+            resolve(none);
         }
     });
+}
+
+// The connection to use and its device's UI build. Asked per request, not
+// remembered: this worker can be stopped at any time, and after an update the
+// next connection reports a new build.
+async function deviceUI() {
+    const connection = await pickConnection();
+    if (!connection) return { connection: null, ui: null };
+    return { connection, ui: (await askState(connection)).ui };
+}
+
+// -- The device's UI files ---------------------------------------------------
+//
+// /__bitbang__/<name> other than the runtime: from the device, which serves
+// the copy built with its firmware. Cached per UI build, since a build's files
+// never change and a device page loads several on every navigation; a device
+// updated to a new build reports a new id and fills a new cache, and the old
+// one is dropped.
+//
+// The cache is writable by any script on this origin, as the cookie jar is.
+// What it holds is the device's own files, for the device's own pages, so a
+// script that rewrote them could only have done what it already can: run in
+// this device's pages.
+const UI_CACHE_PREFIX = 'bitbang-ui-';
+
+async function deviceUIFile(event, name) {
+    const { connection, ui } = await deviceUI();
+    // No UI build: firmware older than the device serving its own UI, or a
+    // device that never will (bitbang-python, the CLI). The server's copy.
+    if (!ui) return fetch(event.request);
+
+    const cacheName = UI_CACHE_PREFIX + ui;
+    const key = ASSET_PREFIX + name;
+    try {
+        const hit = await (await caches.open(cacheName)).match(key);
+        if (hit) return hit;
+    } catch (e) {}
+
+    const resp = await proxyToDevice(event, connection);
+    // TRANSITION (before_r1.md, item 7): a device that reports a build but
+    // lacks a file gets the server's copy. Removed before R1 ships, with the
+    // server's copies.
+    if (resp.status === 404) return fetch(event.request);
+    if (resp.ok) keepAlive(event, storeUIFile(cacheName, key, resp.clone()));
+    return resp;
+}
+
+async function storeUIFile(cacheName, key, resp) {
+    try {
+        await (await caches.open(cacheName)).put(key, resp);
+        for (const name of await caches.keys()) {
+            if (name.startsWith(UI_CACHE_PREFIX) && name !== cacheName) await caches.delete(name);
+        }
+    } catch (e) {
+        // Not cached: the next load asks the device again.
+    }
 }
 
 // The response headers that decide where a device page may be framed. The
@@ -708,6 +796,9 @@ function reframe(headers) {
     return [`frame-ancestors 'self' ${PARENT_HOST}`];
 }
 
+// The server's copy of a meta-page, for a device that reports no UI build.
+// TRANSITION (before_r1.md, item 7): goes with web/plugins/settings, console
+// and ota once every R1 device serves its own.
 async function serveMetaPage(name) {
     // A fetch issued from inside a service worker does not re-enter its own
     // fetch handler, so this reaches the network normally.
@@ -761,14 +852,14 @@ async function serveMetaPage(name) {
 //   pagePreamble           the scripts put in front of a device page
 //   deviceResponseHeaders  the response's headers, reframed
 //   PulledBody             the response body, as the reader pulls it
-async function proxyToDevice(event) {
+async function proxyToDevice(event, picked = null) {
     const request = event.request;
     const url = new URL(request.url);
     const devicePath = url.pathname;
 
     // includeUncontrolled because Chrome may drop worker->client control
     // after idle, with the page still alive and its connection working.
-    const connection = await pickConnection();
+    const connection = picked || await pickConnection();
     if (config.debug) console.log(`[label-sw] ${request.method} ${devicePath} -> connection: ${!!connection}`);
     if (!connection) {
         console.warn('[label-sw] no connection frame');
@@ -838,10 +929,14 @@ async function proxyToDevice(event) {
                     || headers?.['content-disposition'] || '';
                 const isAttachment = /^\s*attachment\b/i.test(disposition);
                 const isNav = !isAttachment && request.mode === 'navigate';
-                const stream = body.stream(ct.includes('text/html') && isNav ? pagePreamble() : null);
+                const preamble = ct.includes('text/html') && isNav ? pagePreamble() : null;
 
                 // 204/304 responses must not have a body per spec
                 const nullBodyStatus = (status === 204 || status === 304);
+                const encoding = nullBodyStatus ? null : takeContentEncoding(headers);
+                const stream = encoding
+                    ? prepend(body.stream(null).pipeThrough(new DecompressionStream(encoding)), preamble)
+                    : body.stream(preamble);
                 resolve(new Response(nullBodyStatus ? null : stream,
                     { status, headers: deviceResponseHeaders(headers, isNav) }));
             } else if (type === 'proxy_chunk') {
@@ -1045,6 +1140,47 @@ function pagePreamble() {
         + eruda
         + '<script src="/__bitbang__/device-shim.js"></script>'
         + '<script src="/__bitbang__/ws-shim.js"></script>';
+}
+
+// A compressed response's encoding, taken off `headers` along with its
+// Content-Length (the length of the compressed bytes), since this worker hands
+// the page the decompressed body. A Response built here is never decoded by
+// the browser: Content-Encoding on it is only a label, and the page would get
+// the gzip bytes (measured 2026-11-23, Chromium, Firefox, WebKit). Firmware sends its UI files gzipped (before_r1.md, item 7).
+// null for an encoding there is no DecompressionStream for; such a response
+// passes as before.
+function takeContentEncoding(headers) {
+    if (!headers || typeof DecompressionStream !== 'function') return null;
+    const key = Object.keys(headers).find(k => k.toLowerCase() === 'content-encoding');
+    if (!key) return null;
+    const encoding = String(headers[key]).trim().toLowerCase();
+    if (encoding !== 'gzip' && encoding !== 'deflate') return null;
+    delete headers[key];
+    for (const k of Object.keys(headers)) {
+        if (k.toLowerCase() === 'content-length') delete headers[k];
+    }
+    return encoding;
+}
+
+// `stream` with `preamble` (a string) in front, if there is one. Pulled, so the
+// reader still sets the pace for what is behind it.
+function prepend(stream, preamble) {
+    if (!preamble) return stream;
+    const reader = stream.getReader();
+    let first = true;
+    return new ReadableStream({
+        async pull(controller) {
+            if (first) {
+                first = false;
+                controller.enqueue(new TextEncoder().encode(preamble));
+                return;
+            }
+            const { done, value } = await reader.read();
+            if (done) controller.close();
+            else controller.enqueue(value);
+        },
+        cancel(reason) { return reader.cancel(reason); },
+    }, { highWaterMark: 0 });
 }
 
 // The device's response headers, as the browser gets them.
