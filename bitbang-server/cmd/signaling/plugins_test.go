@@ -43,8 +43,10 @@ func TestGeneratedPluginImportsAreCurrent(t *testing.T) {
 func TestEveryPluginComesUpAgainstTheRealWeb(t *testing.T) {
 	log := slog.New(slog.NewTextHandler(io.Discard, nil))
 	reg := plugin.Discover(webDir, log, handler.IsCoreAsset, plugin.Registered())
+	// None is a valid server: settings, console and OTA were the plugins, and
+	// moved into the firmware (2026-11-23). The next is Telegram.
 	if len(reg.Status()) == 0 {
-		t.Fatal("no plugins found under web/plugins")
+		t.Skip("no plugins under web/plugins")
 	}
 	for _, st := range reg.Status() {
 		if !st.Up {

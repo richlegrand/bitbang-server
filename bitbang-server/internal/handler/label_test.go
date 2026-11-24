@@ -82,16 +82,18 @@ func TestLabelServesOnlyItsOwnFiles(t *testing.T) {
 		t.Errorf("label-sw.js: Service-Worker-Allowed = %q", rec.Header().Get("Service-Worker-Allowed"))
 	}
 
-	// What a device page loads, including a plugin's page.
-	for _, name := range []string{"connection.js", "device-shim.js", "ws-shim.js", "stream-shim.js", "bitbang.js", "render-mjpeg.js", "settings.html", "console-panel.js"} {
+	// The transport runtime, and a plugin's files.
+	for _, name := range []string{"connection.js", "device-shim.js", "ws-shim.js", "settings.html", "console-panel.js"} {
 		rec := labelGet(t, h, http.MethodGet, host, "/__bitbang__/"+name)
 		if rec.Code != http.StatusOK {
 			t.Errorf("%s: %d", name, rec.Code)
 		}
 	}
 
-	// Never the parent page's own runtime.
-	for _, name := range []string{"sw.js", "bootstrap.js", "xhr-shim.js", "nope.js", "a/b.js"} {
+	// Never the parent page's own runtime, and never the device's UI files,
+	// which the device serves itself (2026-11-23).
+	for _, name := range []string{"sw.js", "bootstrap.js", "xhr-shim.js", "nope.js", "a/b.js",
+		"bitbang.js", "stream-shim.js", "render-mjpeg.js", "panel-fold.js"} {
 		rec := labelGet(t, h, http.MethodGet, host, "/__bitbang__/"+name)
 		if rec.Code != http.StatusNotFound {
 			t.Errorf("%s: want 404, got %d", name, rec.Code)

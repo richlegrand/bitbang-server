@@ -65,23 +65,11 @@ var stampInputs = []string{
 	"runtime-common.js",
 	"sw.js",
 	"ws-shim.js",
-	"stream-shim.js",
-	// The loader a device page includes, which decides what else to fetch.
-	"bitbang.js",
-	// The settings, console and OTA pages are plugins' now, and reach the stamp
-	// through NewStampCache's extra inputs -- every file a plugin registers
-	// does.
+	// bitbang.js, the panels, the renderers and the settings, console and OTA
+	// pages are the device's, served by its firmware (2026-11-23), and are no
+	// part of a server build. A plugin's files still reach the stamp through
+	// NewStampCache's extra inputs.
 	//
-	// Folding, and one setting's control, which both panels import.
-	"panel-fold.js",
-	"setting-control.js",
-	// The renderers, still the core's. They belong in a plugin of their own,
-	// and not the settings or console one -- a renderer is a codec adapter, and
-	// a device sending mjpeg wants the mjpeg renderer while wanting nothing to
-	// do with any particular device's firmware.
-	"pcm-ring.js",
-	"render-mjpeg.js",
-	"render-ulaw.js",
 	// What a label host serves (label.go): its worker, its start page and
 	// the connection script that page runs, and the shim injected into every
 	// device page.
@@ -251,29 +239,12 @@ var allowedBitbangAssets = map[string]bool{
 	// What bitba.ng's page shares with a label host's (labelAssets has it
 	// too), loaded by bootstrap.html before bootstrap.js.
 	"runtime-common.js": true,
-	// The one asset a device page names. Everything behind it can be renamed or
-	// split; this cannot, because it is compiled into firmware.
-	"bitbang.js":     true,
-	"ws-shim.js":     true,
-	"stream-shim.js": true, // renders whatever a device streams, in its page
-	"favicon.ico":    true, // handler internally maps this to favicon.png
-	// The meta-pages and panels -- settings, console, OTA -- are plugins',
-	// served through PluginFiles. These two are imported by both panels, so
-	// they stay here rather than belong to either.
-	"panel-fold.js":      true, // folding
-	"setting-control.js": true, // one setting's control
-	// The renderers, one per codec, fetched by the shim the first time a
-	// channel announces that codec. Served here rather than embedded in a
-	// device page, because rendering is a property of the codec and not of any
-	// one device -- an ESP32, a Pi and a Python process sending mjpeg all want
-	// this same file, and none of them should have to carry a copy.
-	//
-	// pcm-ring.js is a level below those: an AudioWorklet module, loaded by
-	// render-ulaw.js rather than by the shim, and it needs a URL of its own
-	// because addModule cannot take a string.
-	"pcm-ring.js":     true,
-	"render-mjpeg.js": true,
-	"render-ulaw.js":  true,
+	"ws-shim.js":        true,
+	"favicon.ico":       true, // handler internally maps this to favicon.png
+	// Not bitbang.js, the panels, the renderers or the meta-pages: those are
+	// the device's, built with its firmware and served by it, so a page never
+	// runs code made for some other firmware (local_access.md, "Where the
+	// device's UI comes from"; moved 2026-11-23).
 }
 
 // IsCoreAsset reports whether the core serves name at /__bitbang__/ itself --

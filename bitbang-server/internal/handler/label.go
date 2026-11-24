@@ -11,9 +11,9 @@ package handler
 //   - the start page, at /__bb/start: the connection frame's document. It
 //     installs the label worker, holds the device connection, and frames the
 //     device's pages;
-//   - the label worker and the runtime assets a device page loads from
-//     /__bitbang__/ (the shims, bitbang.js, the renderers, the plugins'
-//     pages and panels);
+//   - the label worker and the transport runtime under /__bitbang__/ (the
+//     connection script and the shims). bitbang.js, the panels, the renderers
+//     and the meta-pages are the device's own, served by its firmware;
 //   - for every other path, the start page again. A request that reaches the
 //     server at all means no worker controls this origin yet, so the answer
 //     is to install one, then load the same path through it.
@@ -65,18 +65,13 @@ func LabelHost(host string) (parent string, ok bool) {
 // which keeps the access code. The label origin gets the connection half
 // only, which has nothing to connect with until that page sends a proof.
 var labelAssets = map[string]bool{
-	"connection.js":      true, // the connection frame's script, loaded by the start page
-	"runtime-common.js":  true, // loaded before it, and by label-sw.js; bitba.ng serves it too
-	"label-sw.js":        true, // the label worker; root scope via the header below
-	"device-shim.js":     true, // injected into every device page
-	"ws-shim.js":         true,
-	"stream-shim.js":     true,
-	"bitbang.js":         true, // compiled into firmware; this name cannot change
-	"panel-fold.js":      true,
-	"setting-control.js": true,
-	"pcm-ring.js":        true,
-	"render-mjpeg.js":    true,
-	"render-ulaw.js":     true,
+	"connection.js":     true, // the connection frame's script, loaded by the start page
+	"runtime-common.js": true, // loaded before it, and by label-sw.js; bitba.ng serves it too
+	"label-sw.js":       true, // the label worker; root scope via the header below
+	"device-shim.js":    true, // injected into every device page
+	"ws-shim.js":        true,
+	// The rest of /__bitbang__/ -- bitbang.js, the panels, the renderers -- is
+	// the device's, and the label worker asks the device for it.
 }
 
 // labelStartPage is the start page's file, and labelStartPath where a label

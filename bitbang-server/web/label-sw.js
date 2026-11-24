@@ -19,7 +19,7 @@
  * -- bitbang.js, the panels, the renderers -- and the meta-pages (/*settings)
  * are the device's, served by its firmware, so a page only ever uses code
  * built with the firmware it talks to (local_access.md, "Where the device's UI
- * comes from"). A device that reports no UI build gets the server's copies.
+ * comes from"). The server has no copies of them.
  *
  * What it refuses:
  *   - a top-level document: this origin is only ever framed. The network
@@ -534,9 +534,8 @@ function isOurs(pathname) {
 // One of the device's UI files: /__bitbang__/<name>, flat, not the runtime.
 const UI_FILE = /^\/__bitbang__\/([A-Za-z0-9._-]+)$/;
 
-// A meta-page: /*settings, /*console, /*ota. The device serves it, at that
-// path; for a device that reports no UI build, the server's copy (serveMetaPage).
-const META_PATH = /^\/\*([A-Za-z0-9_-]+)$/;
+// A meta-page (/*settings, /*console, /*ota) needs nothing here: it is a
+// device page like any other, at that path, with the shims in front.
 
 // The destinations a frame navigation can have.
 const FRAME_DESTINATIONS = new Set(['iframe', 'frame', 'object', 'embed']);
@@ -573,16 +572,11 @@ self.addEventListener('fetch', (event) => {
     }
 
     if (req.mode === 'navigate' && FRAME_DESTINATIONS.has(req.destination)) {
-        event.respondWith(attributable(event).then(async (ok) => {
+        event.respondWith(attributable(event).then((ok) => {
             if (!ok) {
                 console.warn('[label-sw] refused a navigation from outside this origin:', url.pathname);
                 return new Response('BitBang: this page can only be opened from its own device page.',
                     { status: 403, headers: { 'Content-Type': 'text/plain; charset=utf-8' } });
-            }
-            const meta = url.pathname.match(META_PATH);
-            if (meta) {
-                const { connection, ui } = await deviceUI();
-                return ui ? proxyToDevice(event, connection) : serveMetaPage(meta[1]);
             }
             return proxyToDevice(event);
         }));
@@ -733,7 +727,9 @@ async function deviceUI() {
 // the copy built with its firmware. Cached per UI build, since a build's files
 // never change and a device page loads several on every navigation; a device
 // updated to a new build reports a new id and fills a new cache, and the old
-// one is dropped.
+// one is dropped. A device that reports no build (bitbang-python, the CLI,
+// firmware older than this) is asked all the same, and not cached: these are
+// its paths, and what it answers is its own.
 //
 // The cache is writable by any script on this origin, as the cookie jar is.
 // What it holds is the device's own files, for the device's own pages, so a
@@ -743,9 +739,7 @@ const UI_CACHE_PREFIX = 'bitbang-ui-';
 
 async function deviceUIFile(event, name) {
     const { connection, ui } = await deviceUI();
-    // No UI build: firmware older than the device serving its own UI, or a
-    // device that never will (bitbang-python, the CLI). The server's copy.
-    if (!ui) return fetch(event.request);
+    if (!ui) return proxyToDevice(event, connection);
 
     const cacheName = UI_CACHE_PREFIX + ui;
     const key = ASSET_PREFIX + name;
@@ -755,10 +749,6 @@ async function deviceUIFile(event, name) {
     } catch (e) {}
 
     const resp = await proxyToDevice(event, connection);
-    // TRANSITION (before_r1.md, item 7): a device that reports a build but
-    // lacks a file gets the server's copy. Removed before R1 ships, with the
-    // server's copies.
-    if (resp.status === 404) return fetch(event.request);
     if (resp.ok) keepAlive(event, storeUIFile(cacheName, key, resp.clone()));
     return resp;
 }
@@ -794,48 +784,6 @@ function reframe(headers) {
         }
     }
     return [`frame-ancestors 'self' ${PARENT_HOST}`];
-}
-
-// The server's copy of a meta-page, for a device that reports no UI build.
-// TRANSITION (before_r1.md, item 7): goes with web/plugins/settings, console
-// and ota once every R1 device serves its own.
-async function serveMetaPage(name) {
-    // A fetch issued from inside a service worker does not re-enter its own
-    // fetch handler, so this reaches the network normally.
-    const r = await fetch(`/__bitbang__/${name}.html`, { cache: 'no-cache' });
-    if (!r.ok) {
-        /* The server's body names what it does have, and is passed through
-           rather than replaced: guessing a plausible name is how someone finds
-           out which pages are real, and this worker is no longer in a position
-           to tell them. 404 stays a 404 -- no such page -- while anything else
-           is the server failing to hand over a page that exists. */
-        const why = await r.text().catch(() => '');
-        return new Response(why.trim() || `no meta-page named "${name}"`, {
-            status: r.status === 404 ? 404 : 502,
-            headers: { 'Content-Type': 'text/plain; charset=utf-8' },
-        });
-    }
-    // ws-shim, because a service worker cannot see a WebSocket handshake at
-    // all -- the shim replaces window.WebSocket with a postMessage bridge to
-    // the connection frame, and without it a meta-page opening
-    // /__bitbang/<type> would dial this origin itself and reach nothing.
-    //
-    // fetch() needs no shim: it reaches this worker, which sends everything
-    // to the device.
-    //
-    // No cookie replay: a meta-page is ours and has no app cookies to mirror.
-    const preamble = '<!DOCTYPE html>'
-        + `<script>window.__bbJarKey=null;window.__bbDebug=${!!config.debug};</script>`
-        + '<script src="/__bitbang__/device-shim.js"></script>'
-        + '<script src="/__bitbang__/ws-shim.js"></script>';
-
-    const body = preamble + await r.text();
-    const headers = new Headers({
-        'Content-Type': 'text/html; charset=utf-8',
-        'Referrer-Policy': 'same-origin',
-    });
-    headers.append('Content-Security-Policy', `frame-ancestors 'self' ${PARENT_HOST}`);
-    return new Response(body, { status: 200, headers });
 }
 
 /**

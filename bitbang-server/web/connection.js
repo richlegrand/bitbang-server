@@ -2306,7 +2306,8 @@ class BitBangConnection {
         // Created in wireStreams, where there is finally a page to hand it to.
         this.streamPort = null;
         // The same frames on a BroadcastChannel, for debug sessions only --
-        // it is what audio-harness.html taps to run against a real device.
+        // it is what audio-harness.html (bitbang-esp32, bitbang_stream/test/)
+        // taps to run against a real device.
         // Opened on first use because debug is not parsed until below, and it
         // costs a copy of every frame, so it stays shut otherwise.
         this.videoFrameChannel = null;
