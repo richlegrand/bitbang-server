@@ -52,32 +52,26 @@
     // again. A device that logged someone out by letting a session cookie lapse
     // went on receiving it.
     //
-    // The mirror is this origin's own document.cookie, which no other device
-    // and not bitba.ng can read.
+    // The mirror is kept here, in this page, and document.cookie reads it --
+    // never the browser's own document.cookie. That one holds whatever any
+    // page on bitba.ng set with Domain=bitba.ng ("cookie tossing"): another
+    // device's page could plant a value there for this device's page to read.
+    // What this page reads comes only from this device's jar and this page's
+    // own writes. (WebKit also refuses document.cookie in a label frame until
+    // the label host has been visited top-level, which it never is; the mirror
+    // was first kept here for that.)
+    //
+    // name -> { value, path, expires }. The mirror is a convenience for app
+    // code that reads cookies itself; requests carry the jar's cookies
+    // whatever happens here.
 
     var nativeCookie = Object.getOwnPropertyDescriptor(Document.prototype, 'cookie');
-
-    // Whether this browser keeps cookies written here. WebKit can refuse
-    // document.cookie in a frame whose host differs from the top page's, even
-    // a same-site one, until that host has been visited top-level -- and a
-    // label host never is. Measured, by writing a probe and reading it back.
-    var nativeKeeps = (function() {
-        if (!nativeCookie || !nativeCookie.set || !nativeCookie.get) return false;
-        try {
-            nativeCookie.set.call(document, '__bb_probe=1;path=/');
-            var kept = /(?:^|;\s*)__bb_probe=1(?:;|$)/.test(nativeCookie.get.call(document));
-            nativeCookie.set.call(document, '__bb_probe=;path=/;expires=Thu, 01 Jan 1970 00:00:00 GMT');
-            return kept;
-        } catch (e) {
-            return false;
-        }
-    })();
-
-    // Where the browser won't keep them, the mirror is kept here instead, and
-    // document.cookie reads it: name -> { value, path, expires }. The mirror
-    // is a convenience for app code that reads cookies itself; requests carry
-    // the jar's cookies whatever happens here.
     var shadow = {};
+
+    // Whether document.cookie below reads the mirror. Where it can't be
+    // installed, document.cookie stays native and the mirror is written there,
+    // as it always was before.
+    var overridden = false;
 
     function shadowSet(str) {
         var parts = String(str).split(';');
@@ -110,12 +104,10 @@
         return out.join('; ');
     }
 
-    // Write the mirror without forwarding. Where the forwarding setter could
-    // not be installed, document.cookie is native anyway, so either path is
-    // right.
+    // Write the mirror without forwarding. Where the forwarding accessor could
+    // not be installed, document.cookie is native, so the mirror goes there.
     function mirrorCookie(str) {
-        if (!nativeKeeps) shadowSet(str);
-        else if (nativeCookie && nativeCookie.set) nativeCookie.set.call(document, str);
+        if (overridden) shadowSet(str);
         else document.cookie = str;
     }
 
@@ -134,8 +126,29 @@
         } catch (e) {}
     }
 
+    // Forward the app's own writes to the worker so the jar hears app-side
+    // changes (preferences, JS-set tokens), and answer reads from the mirror.
+    // Installed before anything fills the mirror, so mirrorCookie knows where
+    // to write.
+    try {
+        if (nativeCookie && nativeCookie.configurable) {
+            Object.defineProperty(document, 'cookie', {
+                get: function() { return shadowGet(); },
+                set: function(value) {
+                    shadowSet(value);
+                    var sw = navigator.serviceWorker && navigator.serviceWorker.controller;
+                    if (sw && window.__bbJarKey) {
+                        sw.postMessage({ type: 'cookie_write', value: String(value) });
+                    }
+                },
+                configurable: true,
+            });
+            overridden = true;
+        }
+    } catch (e) {}
+
     // The jar as it stood when this page was served, from the worker's
-    // preamble. Before the forwarding setter below, so none of it echoes back.
+    // preamble. Written with mirrorCookie, so none of it echoes back.
     var initial = window.__bbCookies;
     if (initial && initial.length) {
         for (var ci = 0; ci < initial.length; ci++) mirrorCookie(initial[ci]);
@@ -163,29 +176,6 @@
                 mirrorCookie(s);
             }
         };
-    } catch (e) {}
-
-    // Forward the app's own writes to the worker so the jar hears app-side
-    // changes (preferences, JS-set tokens). Setter-only wrap leaves reads
-    // native -- less invasive than a full getter override that some browsers
-    // reject.
-    try {
-        if (nativeCookie && nativeCookie.configurable && nativeCookie.set && nativeCookie.get) {
-            Object.defineProperty(document, 'cookie', {
-                get: function() {
-                    return nativeKeeps ? nativeCookie.get.call(document) : shadowGet();
-                },
-                set: function(value) {
-                    if (nativeKeeps) nativeCookie.set.call(document, value);
-                    else shadowSet(value);
-                    var sw = navigator.serviceWorker && navigator.serviceWorker.controller;
-                    if (sw && window.__bbJarKey) {
-                        sw.postMessage({ type: 'cookie_write', value: String(value) });
-                    }
-                },
-                configurable: true,
-            });
-        }
     } catch (e) {}
 
     // -- Patch XMLHttpRequest ------------------------------------------------
