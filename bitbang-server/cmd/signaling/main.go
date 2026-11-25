@@ -208,6 +208,15 @@ func main() {
 		http.Redirect(w, r, cfg.InstallURL, http.StatusFound)
 	})
 
+	// The web installer's page and the images it writes, when this server
+	// has them. Neither is this repository's: the page comes from its own
+	// repository at deploy, into SETUP_DIR; the images are uploaded into
+	// FIRMWARE_DIR and kept across deploys. A directory that isn't there
+	// leaves its routes to fall through to 404.
+	mux.Handle("GET /setup/", handler.Files("/setup", cfg.SetupDir, handler.SetupCache))
+	mux.Handle("GET /setup", http.RedirectHandler("/setup/", http.StatusMovedPermanently))
+	mux.Handle("GET /firmware/", handler.Files("/firmware", cfg.FirmwareDir, handler.FirmwareCache))
+
 	mux.Handle("/", handler.Static(stamps, cfg.FrontPagePath, plugins))
 
 	// A device origin, <label>.<this host>, gets only its start page and the
@@ -302,6 +311,13 @@ type config struct {
 	// snippet without restarting the service. See the package header for
 	// the contract the snippet honors.
 	FrontPagePath string
+
+	// SetupDir is served at /setup/: the web installer's page, which the
+	// deploy scripts copy in from a bitbang-installer checkout beside this
+	// repository. FirmwareDir is served at /firmware/: the images the
+	// installer writes, uploaded separately and never replaced by a deploy.
+	SetupDir    string
+	FirmwareDir string
 }
 
 func loadConfig() config {
@@ -323,6 +339,8 @@ func loadConfig() config {
 		MetricsInterval:     envOrInt("METRICS_INTERVAL", 300),
 		InstallURL:          os.Getenv("INSTALL_URL"),
 		FrontPagePath:       os.Getenv("FRONT_PAGE_PATH"),
+		SetupDir:            envOr("SETUP_DIR", "./setup"),
+		FirmwareDir:         envOr("FIRMWARE_DIR", "./firmware"),
 	}
 }
 

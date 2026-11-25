@@ -47,6 +47,27 @@ for p in ${PLUGINS_EXCLUDE//,/ }; do
     EXCLUDES+=(--exclude="web/plugins/${p}")
 done
 
+# The web installer's page, served at /setup/, from its own repository
+# beside this one (INSTALLER_DIR in production.deploy to put it elsewhere).
+# Staged outside this tree, which never holds it. In production its catalog
+# must pass --release (photos, every build published and checked): when it
+# doesn't, the page is not shipped and /setup/ stays as it was, and this says
+# so -- the server still deploys.
+INSTALLER_DIR="${INSTALLER_DIR:-${ROOT}/../../bitbang-installer}"
+SETUP=()
+STAGE=$(mktemp -d)
+trap 'rm -rf "${STAGE}"' EXIT
+if [ -d "${INSTALLER_DIR}/web" ]; then
+    if "${INSTALLER_DIR}/check.sh" --release > "${STAGE}/check.log"; then
+        echo "Installer page from ${INSTALLER_DIR}"
+        cp -r "${INSTALLER_DIR}/web" "${STAGE}/setup"
+        SETUP=(-C "${STAGE}" setup)
+    else
+        grep '^error' "${STAGE}/check.log" || cat "${STAGE}/check.log"
+        echo "WARNING: the installer's catalog isn't ready for release; /setup/ not shipped."
+    fi
+fi
+
 tar cvfz "${TARFILE}" \
     ${EXCLUDES[@]+"${EXCLUDES[@]}"} \
     signaling-go \
@@ -54,7 +75,8 @@ tar cvfz "${TARFILE}" \
     deploy/production.env \
     deploy/production.front.html \
     deploy/"${SERVICE}" \
-    web
+    web \
+    ${SETUP[@]+"${SETUP[@]}"}
 
 scp -i "${SERVER_SSH_KEY}" "${TARFILE}" "${SERVER_SSH}:${SERVER_SSH_DIR}/${TARFILE}"
 
@@ -66,6 +88,8 @@ ssh "${SERVER_SSH}" -i "${SERVER_SSH_KEY}" "
     # disappear here too -- and extracting over the old tree never deleted
     # anything, which left every moved or removed file behind.
     rm -rf web
+    # The same for the installer's page, when this deploy carries one.
+    if tar tzf ${TARFILE} | grep -q '^setup/'; then rm -rf setup; fi
     tar xvfz ${TARFILE}
 
     # Move runtime env and service file to the locations systemd expects,

@@ -39,13 +39,30 @@ for p in ${PLUGINS_EXCLUDE//,/ }; do
     EXCLUDES+=(--exclude="web/plugins/${p}")
 done
 
+# The web installer's page, served at /setup/, from its own repository
+# beside this one (INSTALLER_DIR in test.deploy to put it elsewhere). Staged
+# outside this tree, which never holds it. Its catalog's checks run first; a
+# catalog that fails them stops the deploy. Without a checkout, /setup/ is
+# left as it was.
+INSTALLER_DIR="${INSTALLER_DIR:-${ROOT}/../../bitbang-installer}"
+SETUP=()
+STAGE=$(mktemp -d)
+trap 'rm -rf "${STAGE}"' EXIT
+if [ -d "${INSTALLER_DIR}/web" ]; then
+    echo "Installer page from ${INSTALLER_DIR}"
+    "${INSTALLER_DIR}/check.sh" > "${STAGE}/check.log" || { cat "${STAGE}/check.log"; exit 1; }
+    cp -r "${INSTALLER_DIR}/web" "${STAGE}/setup"
+    SETUP=(-C "${STAGE}" setup)
+fi
+
 tar cvfz "${TARFILE}" \
     ${EXCLUDES[@]+"${EXCLUDES[@]}"} \
     signaling-go \
     deploy/test.env \
     deploy/test.front.html \
     deploy/"${SERVICE}" \
-    web
+    web \
+    ${SETUP[@]+"${SETUP[@]}"}
 
 scp -i "${SERVER_SSH_KEY}" "${TARFILE}" "${SERVER_SSH}:${SERVER_SSH_DIR}/${TARFILE}"
 
@@ -57,6 +74,8 @@ ssh "${SERVER_SSH}" -i "${SERVER_SSH_KEY}" "
     # disappear here too -- and extracting over the old tree never deleted
     # anything, which left every moved or removed file behind.
     rm -rf web
+    # The same for the installer's page, when this deploy carries one.
+    if tar tzf ${TARFILE} | grep -q '^setup/'; then rm -rf setup; fi
     tar xvfz ${TARFILE}
 
     cp deploy/test.env .env
