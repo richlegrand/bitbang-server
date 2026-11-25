@@ -448,9 +448,13 @@ function registerLabelWorker() {
 // long with no active worker is not going to get one.
 async function reregisterLabelWorker() {
     console.warn('[Connection] label worker not up after', WORKER_READY_MS, 'ms; registering again');
+    // Bounded as a whole: unregister() waits in the same queue as the
+    // register() that hung, so in Chrome it hangs behind it (seen Nov 24).
     try {
-        const regs = await withTimeout(navigator.serviceWorker.getRegistrations(), WORKER_READY_MS);
-        await Promise.all(regs.map(r => r.unregister().catch(() => false)));
+        await withTimeout((async () => {
+            const regs = await navigator.serviceWorker.getRegistrations();
+            await Promise.all(regs.map(r => r.unregister().catch(() => false)));
+        })(), WORKER_READY_MS);
     } catch { /* nothing to drop, or it hangs too: try registering anyway */ }
     try {
         const reg = await withTimeout(registerLabelWorker(), WORKER_READY_MS);
