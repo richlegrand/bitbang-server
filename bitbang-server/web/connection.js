@@ -409,6 +409,61 @@ const TURN_RENEW_RECHECK_MS = 5000;
 // keepalive, so this has to come round well inside that.
 const SW_KEEPALIVE_MS = 10000;
 
+// How long the label worker gets to register and come up before this origin's
+// registration is taken to be stuck. Chrome can keep a registration with no
+// worker in it at all (an install cut off, by a deploy or a browser closing),
+// and then register() resolves or hangs without fixing it and
+// navigator.serviceWorker.ready never resolves: the frame sat on a blank page
+// with nothing in the console. Seen Nov 24 on a real profile; incognito was
+// fine. Generous, because a slow link fetching label-sw.js is not stuck.
+const WORKER_READY_MS = 8000;
+
+// promise, or a rejection with code 'timeout' after ms.
+function withTimeout(promise, ms) {
+    let timer;
+    const late = new Promise((_, reject) => {
+        timer = setTimeout(() => {
+            const err = new Error('timeout');
+            err.code = 'timeout';
+            reject(err);
+        }, ms);
+    });
+    return Promise.race([promise, late]).finally(() => clearTimeout(timer));
+}
+
+function registerLabelWorker() {
+    // The label worker: this origin's, serving this one device. Its script is
+    // the one thing in this origin page script cannot alter -- the browser
+    // fetches it from the network, and only our server serves it here
+    // (label.go).
+    return navigator.serviceWorker.register('/__bitbang__/label-sw.js', {
+        scope: '/',
+        updateViaCache: 'none',
+    });
+}
+
+// Drop whatever registration this origin has and start over, once. Only
+// after WORKER_READY_MS without a worker: this origin is this one device's,
+// so there is nothing else here to lose, and a registration that has had that
+// long with no active worker is not going to get one.
+async function reregisterLabelWorker() {
+    console.warn('[Connection] label worker not up after', WORKER_READY_MS, 'ms; registering again');
+    try {
+        const regs = await withTimeout(navigator.serviceWorker.getRegistrations(), WORKER_READY_MS);
+        await Promise.all(regs.map(r => r.unregister().catch(() => false)));
+    } catch { /* nothing to drop, or it hangs too: try registering anyway */ }
+    try {
+        const reg = await withTimeout(registerLabelWorker(), WORKER_READY_MS);
+        await withTimeout(navigator.serviceWorker.ready, WORKER_READY_MS);
+        return reg;
+    } catch (e) {
+        if (e.code !== 'timeout') throw e;
+        const err = new Error('label worker stuck');
+        err.code = 'worker_stuck';
+        throw err;
+    }
+}
+
 // What the top strip says when the device has reset and the page is reloading
 // because of it. Shown before the reload and again on the reloaded page until
 // it has a connection, so it is one message that stays up across the reload
@@ -2824,6 +2879,9 @@ class BitBangConnection {
             case 'device_not_found': return 'Device not found';
             case 'WebSocket connection failed': return 'Could not reach server';
             case 'Service Worker not supported': return 'This browser is not supported';
+            // Registering again didn't help either. Clearing the site's data
+            // is what's left, and it's the person's to do.
+            case 'worker_stuck': return 'Could not start the page. Clear this browser\'s data for bitba.ng and try again';
             case 'offer_timeout': return 'Device not responding';
             // The device answered and refused: every session slot is taken.
             // Worth its own wording because it is the one failure here the
@@ -2845,14 +2903,16 @@ class BitBangConnection {
         // takes over — i.e. when a previous controller was already running.
         const hadController = !!navigator.serviceWorker.controller;
 
-        // The label worker: this origin's, serving this one device. Its
-        // script is the one thing in this origin page script cannot alter --
-        // the browser fetches it from the network, and only our server serves
-        // it here (label.go).
-        const reg = await navigator.serviceWorker.register('/__bitbang__/label-sw.js', {
-            scope: '/',
-            updateViaCache: 'none',
-        });
+        // A registration that is not up in WORKER_READY_MS is dropped and
+        // made again (reregisterLabelWorker), here or at the ready below.
+        let reg, redone = false;
+        try {
+            reg = await withTimeout(registerLabelWorker(), WORKER_READY_MS);
+        } catch (e) {
+            if (e.code !== 'timeout') throw e;
+            reg = await reregisterLabelWorker();
+            redone = true;
+        }
         // Force check for SW update on every page load.
         reg.update();
 
@@ -2926,7 +2986,13 @@ class BitBangConnection {
             try { if (this.pc) this.pc.close(); } catch (e) { /* already gone */ }
         });
 
-        await navigator.serviceWorker.ready;
+        if (redone) return;          // reregisterLabelWorker waited for ready
+        try {
+            await withTimeout(navigator.serviceWorker.ready, WORKER_READY_MS);
+        } catch (e) {
+            if (e.code !== 'timeout') throw e;
+            reg = await reregisterLabelWorker();   // for the half-hourly update
+        }
     }
 
     // The device ended one stream -- its target went away, or this side

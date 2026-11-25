@@ -43,8 +43,13 @@
     </style>
 </head>
 <body>
+    <!-- "Loading..." carries on what bitba.ng's page showed before this frame
+         covered it. connection.js adds its lines below it, as it did when it
+         ran in bitba.ng's page; an empty status here left the screen blank
+         until the first line, which for a missing device is the server's
+         "Device not found" after its deliberate delay. -->
     <div id="connection-ui">
-        <div id="status"></div>
+        <div id="status"><div>Loading...</div></div>
     </div>
     <script src="/__bitbang__/runtime-common.js"></script>
     <script src="/__bitbang__/connection.js"></script>
